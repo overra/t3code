@@ -1,23 +1,38 @@
 /**
- * Instance-scope pre-validation for client-dispatched commands.
+ * Provider-access pre-validation for client-dispatched commands, shared by
+ * every dispatch surface (WebSocket and HTTP).
  *
  * The project-side allowlist is enforced by the decider (it lives in the
  * orchestration read model). The instance-side `allowedProjects` scope lives
  * in `ServerSettings`, which the decider intentionally cannot see — so the
- * dispatch path (ws.ts) runs this check between normalization and engine
- * dispatch, keeping the decider pure while commands that name a scoped-out
- * instance still fail early with a typed error instead of at first turn.
+ * dispatch path runs this check before normalization and engine dispatch,
+ * keeping the decider pure while commands that name a restricted instance
+ * fail early with a typed error instead of at first provider turn. Running
+ * before normalization also means rejected image turns never persist their
+ * attachments to disk.
  *
- * This module only *collects* the (instance, project-or-thread) pairs a
- * command implies; the caller resolves thread → project through the
- * projection and applies the shared scope rule from contracts.
+ * Both rules are evaluated here through the shared contracts predicate so
+ * the error names the rule that actually blocks (project allowlist wins
+ * attribution, matching `getProviderInstanceProjectRestriction`). The
+ * decider and reactor remain the enforcement authorities; failures to read
+ * projections or settings therefore fall open here rather than blocking
+ * dispatch.
  */
-import type {
-  OrchestrationCommand,
-  ProjectId,
-  ProviderInstanceId,
-  ThreadId,
+import {
+  getProviderInstanceAllowedProjects,
+  getProviderInstanceProjectRestriction,
+  OrchestrationDispatchCommandError,
+  type ClientOrchestrationCommand,
+  type OrchestrationCommand,
+  type OrchestrationProjectShell,
+  type OrchestrationThreadShell,
+  type ProjectId,
+  type ProviderInstanceId,
+  type ServerSettings,
+  type ThreadId,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
 export type ProviderScopeCheckTarget =
   | { readonly kind: "project"; readonly projectId: ProjectId }
@@ -29,7 +44,7 @@ export interface ProviderScopeCheck {
 }
 
 export function collectProviderScopeChecks(
-  command: OrchestrationCommand,
+  command: OrchestrationCommand | ClientOrchestrationCommand,
 ): ReadonlyArray<ProviderScopeCheck> {
   switch (command.type) {
     case "thread.create":
@@ -74,3 +89,69 @@ export function collectProviderScopeChecks(
       return [];
   }
 }
+
+/**
+ * Capabilities the validator needs, passed as values rather than resolved
+ * from the Effect context so dispatch surfaces can reuse their existing
+ * service handles without growing their handlers' context requirements.
+ */
+export interface ValidateCommandProviderAccessDeps<E1 = never, E2 = never, E3 = never> {
+  readonly getSettings: Effect.Effect<ServerSettings, E1>;
+  readonly getThreadShellById: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, E2>;
+  readonly getProjectShellById: (
+    projectId: ProjectId,
+  ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E3>;
+}
+
+export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2, E3>(
+  command: OrchestrationCommand | ClientOrchestrationCommand,
+  deps: ValidateCommandProviderAccessDeps<E1, E2, E3>,
+) {
+  const checks = collectProviderScopeChecks(command);
+  if (checks.length === 0) return;
+  const providerInstances = yield* deps.getSettings.pipe(
+    Effect.map((settings) => settings.providerInstances),
+    Effect.orElseSucceed(() => undefined),
+  );
+  if (providerInstances === undefined) return;
+
+  for (const check of checks) {
+    const projectId =
+      check.target.kind === "project"
+        ? check.target.projectId
+        : yield* deps.getThreadShellById(check.target.threadId).pipe(
+            Effect.map(Option.getOrUndefined),
+            Effect.map((thread) => thread?.projectId),
+            // A missing or unreadable thread is the decider's error to
+            // report with proper context, not this gate's.
+            Effect.orElseSucceed(() => undefined),
+          );
+    if (projectId === undefined) continue;
+    const project = yield* deps.getProjectShellById(projectId).pipe(
+      Effect.map(Option.getOrUndefined),
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (project === undefined) continue;
+    const restriction = getProviderInstanceProjectRestriction({
+      instanceId: check.instanceId,
+      instanceAllowedProjects: getProviderInstanceAllowedProjects(
+        providerInstances,
+        check.instanceId,
+      ),
+      projectId,
+      projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
+    });
+    if (restriction === "project-allowlist") {
+      return yield* new OrchestrationDispatchCommandError({
+        message: `Provider instance '${check.instanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or pick another provider.`,
+      });
+    }
+    if (restriction === "instance-scope") {
+      return yield* new OrchestrationDispatchCommandError({
+        message: `Provider instance '${check.instanceId}' is limited to other projects and cannot be used in project '${project.title}'. Widen its project scope in Settings → Providers, or pick another provider.`,
+      });
+    }
+  }
+});

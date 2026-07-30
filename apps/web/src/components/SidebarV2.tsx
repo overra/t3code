@@ -1085,13 +1085,25 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
 function ProjectAllowedProvidersControl(props: {
   member: SidebarProjectGroupMember;
   providerEntries: ReadonlyArray<ProviderInstanceEntry>;
+  /** Resolves false when the server rejected the update (optimistic state rolls back). */
   onUpdate: (
     member: SidebarProjectGroupMember,
     allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
-  ) => void;
+  ) => Promise<boolean>;
 }) {
   const { member, providerEntries, onUpdate } = props;
-  const allowed = member.allowedProviderInstances ?? null;
+  // Optimistic overlay: rapid toggles must chain off the value just written,
+  // not the streamed prop (which lags a round-trip and would resurrect the
+  // previous edit). Any prop change — our own echo or an external editor —
+  // clears the overlay; a rejected write clears it explicitly.
+  const [pendingAllowed, setPendingAllowed] = useState<
+    ReadonlyArray<ProviderInstanceId> | null | undefined
+  >(undefined);
+  const propAllowed = member.allowedProviderInstances ?? null;
+  useEffect(() => {
+    setPendingAllowed(undefined);
+  }, [propAllowed]);
+  const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
   const checkedIds = useMemo(
     () =>
       allowed === null
@@ -1101,9 +1113,21 @@ function ProjectAllowedProvidersControl(props: {
   );
   const isScopeExcluded = (entry: ProviderInstanceEntry): boolean =>
     entry.allowedProjects !== null && !entry.allowedProjects.includes(member.id);
+  // "Effectively usable" additionally requires the instance to be enabled:
+  // a checked-but-disabled provider cannot start threads, so it must not
+  // satisfy the do-not-strand guard below.
+  const isEffectivelyUsable = (entry: ProviderInstanceEntry): boolean =>
+    entry.enabled && !isScopeExcluded(entry);
   const effectiveCheckedCount = providerEntries.filter(
-    (entry) => checkedIds.has(entry.instanceId) && !isScopeExcluded(entry),
+    (entry) => checkedIds.has(entry.instanceId) && isEffectivelyUsable(entry),
   ).length;
+
+  const submit = (next: ReadonlyArray<ProviderInstanceId> | null) => {
+    setPendingAllowed(next);
+    void onUpdate(member, next).then((ok) => {
+      if (!ok) setPendingAllowed(undefined);
+    });
+  };
 
   const toggle = (instanceId: ProviderInstanceId, checked: boolean) => {
     const next = new Set(checkedIds);
@@ -1112,20 +1136,22 @@ function ProjectAllowedProvidersControl(props: {
     } else {
       next.delete(instanceId);
     }
-    if (!providerEntries.some((entry) => next.has(entry.instanceId) && !isScopeExcluded(entry))) {
+    if (
+      !providerEntries.some((entry) => next.has(entry.instanceId) && isEffectivelyUsable(entry))
+    ) {
       return;
     }
     // Ids in the allowlist without a configured instance survive toggles
     // verbatim; collapsing to `null` (everything configured is checked)
     // intentionally drops them, since "all providers" supersedes the list.
     const coversAllConfigured = providerEntries.every((entry) => next.has(entry.instanceId));
-    onUpdate(member, coversAllConfigured ? null : [...next]);
+    submit(coversAllConfigured ? null : [...next]);
   };
 
   // Mixer-style solo: one click expresses "this project uses exactly this
   // provider" without unchecking every other row.
   const solo = (instanceId: ProviderInstanceId) => {
-    onUpdate(member, [instanceId]);
+    submit([instanceId]);
   };
   const isSoloed = (entry: ProviderInstanceEntry): boolean =>
     allowed !== null && allowed.length === 1 && allowed[0] === entry.instanceId;
@@ -1153,8 +1179,9 @@ function ProjectAllowedProvidersControl(props: {
         {providerEntries.map((entry) => {
           const isChecked = checkedIds.has(entry.instanceId);
           const scopeExcluded = isScopeExcluded(entry);
-          const isLastChecked = isChecked && !scopeExcluded && effectiveCheckedCount === 1;
-          const canSolo = !scopeExcluded && !isSoloed(entry);
+          const isLastChecked =
+            isChecked && isEffectivelyUsable(entry) && effectiveCheckedCount === 1;
+          const canSolo = isEffectivelyUsable(entry) && !isSoloed(entry);
           return (
             <label
               key={entry.instanceId}
@@ -1589,7 +1616,7 @@ export default function SidebarV2() {
     async (
       member: SidebarProjectGroupMember,
       allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
-    ) => {
+    ): Promise<boolean> => {
       const defaultSelection = member.defaultModelSelection ?? null;
       const defaultDisallowed =
         allowedProviderInstances !== null &&
@@ -1616,6 +1643,7 @@ export default function SidebarV2() {
           }),
         );
       }
+      return result._tag !== "Failure";
     },
     [updateProject],
   );
@@ -3086,9 +3114,7 @@ export default function SidebarV2() {
                           : entries;
                       })(),
                     )}
-                    onUpdate={(target, allowedProviderInstances) => {
-                      void updateProjectAllowedProviders(target, allowedProviderInstances);
-                    }}
+                    onUpdate={updateProjectAllowedProviders}
                   />
                   {projectActionsTarget.memberProjects.length > 1 ? (
                     <div className="flex justify-end">

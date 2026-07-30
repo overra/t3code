@@ -34,6 +34,7 @@ import * as GitHubSourceControlProvider from "../sourceControl/GitHubSourceContr
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "./GitManager.ts";
@@ -650,6 +651,17 @@ function makeManager(input?: {
     Layer.succeed(TextGeneration.TextGeneration, textGeneration),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
+    }),
+    // Empty shell snapshot = no project matches any cwd, so writer
+    // selections pass through unclamped and existing expectations hold.
+    Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+      getShellSnapshot: () =>
+        Effect.succeed({
+          snapshotSequence: 0,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
     }),
     Layer.succeed(
       ProjectSetupScriptRunner.ProjectSetupScriptRunner,

@@ -78,29 +78,29 @@ export function buildModelOptions(
   fallbackModelSelection: ModelSelection | null,
   // Filters by the project's provider access rules (project allowlist ∩
   // per-instance project scope) via the shared contracts predicate. The
-  // fallback selection is intentionally not filtered: it represents the
-  // thread's current state, which stays visible even when the project no
-  // longer allows that instance.
+  // fallback selection is filtered by the same rule: a stale draft or a
+  // thread's since-restricted selection must not resurface as a selectable
+  // option the server would reject.
   project?: ModelOptionsProjectContext | null,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
+  const usableInProject = (instanceId: ModelSelection["instanceId"]): boolean =>
+    project == null ||
+    isProviderInstanceUsableInProject({
+      instanceId,
+      instanceAllowedProjects: getProviderInstanceAllowedProjects(
+        config?.settings.providerInstances,
+        instanceId,
+      ),
+      projectId: project.id,
+      projectAllowedProviderInstances: project.allowedProviderInstances,
+    });
 
   for (const provider of config?.providers ?? []) {
     if (!provider.enabled || !provider.installed || provider.auth.status === "unauthenticated") {
       continue;
     }
-    if (
-      project != null &&
-      !isProviderInstanceUsableInProject({
-        instanceId: provider.instanceId,
-        instanceAllowedProjects: getProviderInstanceAllowedProjects(
-          config?.settings.providerInstances,
-          provider.instanceId,
-        ),
-        projectId: project.id,
-        projectAllowedProviderInstances: project.allowedProviderInstances,
-      })
-    ) {
+    if (!usableInProject(provider.instanceId)) {
       continue;
     }
 
@@ -127,7 +127,7 @@ export function buildModelOptions(
     }
   }
 
-  if (fallbackModelSelection) {
+  if (fallbackModelSelection && usableInProject(fallbackModelSelection.instanceId)) {
     const key = `${fallbackModelSelection.instanceId}:${fallbackModelSelection.model}`;
     const existing = options.get(key);
     if (existing) {

@@ -168,6 +168,7 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
   );
 }
 import { Button } from "../ui/button";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
@@ -180,6 +181,7 @@ import {
   LockIcon,
   LockOpenIcon,
   PenLineIcon,
+  SettingsIcon,
   SparklesIcon,
   XIcon,
 } from "lucide-react";
@@ -199,6 +201,8 @@ import {
   type ProviderPickerProjectContext,
 } from "../../providerInstances";
 import { type AppModelOption, getAppModelOptionsForInstance } from "../../modelSelection";
+import { RestrictedProvidersNotes } from "./RestrictedProvidersNotes";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 import type { SessionPhase, Thread } from "../../types";
 import type { PendingUserInputDraftAnswer } from "../../pendingUserInput";
@@ -749,6 +753,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const getComposerDraft = useComposerDraftStore((store) => store.getComposerDraft);
   const navigate = useNavigate();
+  // Settings routes edit the PRIMARY environment; offering the shortcut for
+  // a thread in a secondary environment would open an editor for the wrong
+  // server's providers.
+  const isPrimaryEnvironment = usePrimaryEnvironmentId() === environmentId;
   const openProviderSettings = useCallback(() => {
     void navigate({ to: "/settings/providers" });
   }, [navigate]);
@@ -830,15 +838,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const lockedInstanceId =
       activeThread.session?.providerInstanceId ?? activeThreadModelSelection?.instanceId;
     if (!lockedInstanceId) return null;
+    // Resolve against the UNFILTERED configured entries: the bound instance
+    // may have become restricted for this project (and thus filtered out of
+    // the picker), but its continuation group still constrains which
+    // instances the locked thread could switch to. Losing the key here
+    // would let the composer auto-pick an incompatible same-driver instance
+    // that the server then rejects.
     return (
-      providerInstanceEntries.find((entry) => entry.instanceId === lockedInstanceId)
+      configuredProviderInstanceEntries.find((entry) => entry.instanceId === lockedInstanceId)
         ?.continuationGroupKey ?? null
     );
   }, [
     activeThread,
     activeThreadModelSelection?.instanceId,
     lockedProvider,
-    providerInstanceEntries,
+    configuredProviderInstanceEntries,
   ]);
 
   // Resolve which configured instance the composer is currently targeting.
@@ -3180,17 +3194,58 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             >
               <div className="-m-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                 {noProviderAvailable ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled
-                    data-chat-provider-unavailable="true"
-                    className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
-                  >
-                    <CircleAlertIcon className="size-4" />
-                    No provider available
-                  </Button>
+                  restrictedProviderInstanceNotes.length > 0 ? (
+                    // Restrictions emptied the picker: keep the affordance
+                    // alive so the notes explain what happened and where to
+                    // fix it, instead of a dead "No provider available".
+                    <Popover>
+                      <PopoverTrigger
+                        render={
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            data-chat-provider-unavailable="true"
+                            className="shrink-0 gap-2 px-2 text-muted-foreground sm:px-3"
+                          />
+                        }
+                      >
+                        <CircleAlertIcon className="size-4" />
+                        No provider allowed in this project
+                      </PopoverTrigger>
+                      <PopoverPopup align="start" className="w-80 p-0">
+                        <div className="px-3 py-2">
+                          <RestrictedProvidersNotes notes={restrictedProviderInstanceNotes} />
+                        </div>
+                        {isPrimaryEnvironment ? (
+                          <div className="border-t border-border/70 p-1.5">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+                              onClick={openProviderSettings}
+                            >
+                              <SettingsIcon className="size-4" />
+                              Provider settings
+                            </Button>
+                          </div>
+                        ) : null}
+                      </PopoverPopup>
+                    </Popover>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled
+                      data-chat-provider-unavailable="true"
+                      className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
+                    >
+                      <CircleAlertIcon className="size-4" />
+                      No provider available
+                    </Button>
+                  )
                 ) : (
                   <ProviderModelPicker
                     compact={isComposerFooterCompact}
@@ -3214,7 +3269,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     }}
                     getModelDisabledReason={getModelDisabledReason}
                     restrictedProviderNotes={restrictedProviderInstanceNotes}
-                    onOpenProviderSettings={openProviderSettings}
+                    {...(isPrimaryEnvironment
+                      ? { onOpenProviderSettings: openProviderSettings }
+                      : {})}
                     onInstanceModelChange={onProviderModelSelect}
                   />
                 )}

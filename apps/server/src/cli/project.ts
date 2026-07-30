@@ -5,6 +5,7 @@ import {
   EnvironmentHttpCommonError,
   type OrchestrationReadModel,
   ProjectId,
+  ProviderInstanceId,
   type ClientOrchestrationCommand,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -568,7 +569,120 @@ const projectRenameCommand = Command.make("rename", {
   ),
 );
 
+const isProviderInstanceIdSlug = Schema.is(ProviderInstanceId);
+
+export class ProjectProvidersCliInputError extends Schema.TaggedErrorClass<ProjectProvidersCliInputError>()(
+  "ProjectProvidersCliInputError",
+  { detail: Schema.String },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+// The web editor for the project allowlist lives in the sidebar-v2 project
+// settings dialog; builds still on sidebar v1 manage it through this command
+// instead, so a restriction set elsewhere is always inspectable and
+// reversible from any build.
+const projectProvidersCommand = Command.make("providers", {
+  ...projectLocationFlags,
+  project: Argument.string("project").pipe(
+    Argument.withDescription("Project id or workspace root to update."),
+  ),
+  allow: Flag.string("allow").pipe(
+    Flag.withDescription(
+      "Comma-separated provider instance ids the project may use (e.g. codex,claudeAgent_work).",
+    ),
+    Flag.optional,
+  ),
+  all: Flag.boolean("all").pipe(
+    Flag.withDescription("Allow every provider instance (clears the restriction)."),
+    Flag.withDefault(false),
+  ),
+}).pipe(
+  Command.withDescription(
+    "Restrict which provider instances a project may use, or clear the restriction with --all.",
+  ),
+  Command.withHandler((flags) =>
+    runProjectMutation(
+      flags,
+      Effect.fn("projectProvidersMutation")(function* ({
+        snapshot,
+        dispatch,
+      }: {
+        readonly snapshot: OrchestrationReadModel;
+        readonly dispatch: (
+          command: ProjectCliDispatchCommand,
+        ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+      }) {
+        const allowFlag = Option.getOrUndefined(flags.allow);
+        if (flags.all === (allowFlag !== undefined)) {
+          return yield* new ProjectProvidersCliInputError({
+            detail: "Pass exactly one of --all or --allow <instance-ids>.",
+          });
+        }
+        const project = yield* findActiveProjectTarget({
+          snapshot,
+          identifier: flags.project,
+        });
+
+        if (flags.all) {
+          yield* dispatch({
+            type: "project.meta.update",
+            commandId: CommandId.make(yield* projectCommandUuid),
+            projectId: project.id,
+            allowedProviderInstances: null,
+          });
+          return `Project ${project.id} now allows every provider instance.`;
+        }
+
+        const allowedProviderInstances: ProviderInstanceId[] = [];
+        for (const raw of (allowFlag ?? "").split(",")) {
+          const trimmed = raw.trim();
+          if (trimmed.length === 0) continue;
+          if (!isProviderInstanceIdSlug(trimmed)) {
+            return yield* new ProjectProvidersCliInputError({
+              detail: `Invalid provider instance id '${trimmed}'.`,
+            });
+          }
+          if (!allowedProviderInstances.includes(trimmed)) {
+            allowedProviderInstances.push(trimmed);
+          }
+        }
+        if (allowedProviderInstances.length === 0) {
+          return yield* new ProjectProvidersCliInputError({
+            detail:
+              "--allow requires at least one provider instance id; use --all to clear the restriction.",
+          });
+        }
+
+        // Mirror the dialog: an allowlist that excludes the project's
+        // default selection clears the default in the same command, since
+        // the decider rejects the inconsistent pair.
+        const defaultSelection =
+          snapshot.projects.find((entry) => entry.id === project.id)?.defaultModelSelection ?? null;
+        yield* dispatch({
+          type: "project.meta.update",
+          commandId: CommandId.make(yield* projectCommandUuid),
+          projectId: project.id,
+          allowedProviderInstances,
+          ...(defaultSelection !== null &&
+          !allowedProviderInstances.includes(defaultSelection.instanceId)
+            ? { defaultModelSelection: null }
+            : {}),
+        });
+        return `Project ${project.id} now allows: ${allowedProviderInstances.join(", ")}.`;
+      }),
+    ),
+  ),
+);
+
 export const projectCommand = Command.make("project").pipe(
   Command.withDescription("Manage projects."),
-  Command.withSubcommands([projectAddCommand, projectRemoveCommand, projectRenameCommand]),
+  Command.withSubcommands([
+    projectAddCommand,
+    projectRemoveCommand,
+    projectRenameCommand,
+    projectProvidersCommand,
+  ]),
 );

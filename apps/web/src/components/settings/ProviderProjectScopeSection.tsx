@@ -21,7 +21,7 @@
  * each peer instance's scope and the project's own allowlist) and calls out
  * projects that would be left with no usable provider at all.
  */
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ProjectId, ProviderInstanceId } from "@t3tools/contracts";
 import { isProviderInstanceUsableInProject } from "@t3tools/contracts";
 import { TriangleAlertIcon } from "lucide-react";
@@ -78,7 +78,22 @@ export function ProviderProjectScopeSection(props: {
   peerInstances: ReadonlyArray<ProviderScopePeerInstance>;
   onChange: (allowedProjects: ReadonlyArray<ProjectId> | null) => void;
 }) {
-  const { allowedProjects, projects, onChange } = props;
+  const { projects, onChange } = props;
+  // Optimistic overlay: rapid toggles must chain off the value just written,
+  // not the settings prop (which lags the settings round-trip and would
+  // resurrect the previous edit). Any prop change — the write's echo or an
+  // external edit — clears the overlay.
+  const [pendingScope, setPendingScope] = useState<ReadonlyArray<ProjectId> | null | undefined>(
+    undefined,
+  );
+  useEffect(() => {
+    setPendingScope(undefined);
+  }, [props.allowedProjects]);
+  const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
+  const submit = (next: ReadonlyArray<ProjectId> | null) => {
+    setPendingScope(next);
+    onChange(next);
+  };
   const mode: "all" | "selected" = allowedProjects === null ? "all" : "selected";
   const checkedIds = useMemo(() => new Set<ProjectId>(allowedProjects ?? []), [allowedProjects]);
   const checkedProjectCount = projects.filter((project) => checkedIds.has(project.id)).length;
@@ -101,13 +116,13 @@ export function ProviderProjectScopeSection(props: {
   const setMode = (nextMode: "all" | "selected") => {
     if (nextMode === mode) return;
     if (nextMode === "all") {
-      onChange(null);
+      submit(null);
       return;
     }
     // Seed with every current project: narrowing starts from a state that
     // changes nothing, and the user unchecks from there.
     if (projects.length === 0) return;
-    onChange(projects.map((project) => project.id));
+    submit(projects.map((project) => project.id));
   };
 
   const toggle = (projectId: ProjectId, checked: boolean) => {
@@ -123,7 +138,7 @@ export function ProviderProjectScopeSection(props: {
     // Deliberately no collapse to `null` when everything is checked: the
     // user chose an explicit list, and future projects must stay outside it
     // until added by hand.
-    onChange([...next]);
+    submit([...next]);
   };
 
   return (

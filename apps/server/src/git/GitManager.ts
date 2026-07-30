@@ -27,9 +27,13 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   VcsStatusResult,
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
   ModelSelection,
+  type ProviderInstanceConfigMap,
   type SourceControlWritingStyleSettings,
 } from "@t3tools/contracts";
+import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import {
   detectSourceControlProviderFromGitRemoteUrl,
   mergeGitStatusParts,
@@ -51,6 +55,7 @@ import {
   repositoryConventionsTextGenerationPolicy,
 } from "../textGeneration/TextGenerationPresets.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -70,7 +75,13 @@ export interface GitRunStackedActionOptions {
 }
 
 interface SourceControlTextGenerationSettings {
-  readonly modelSelection: ModelSelection;
+  /**
+   * Writer selection already clamped to the target repository's project
+   * access rules. `undefined` means no usable instance exists for that
+   * project — generation call sites must fail with guidance rather than
+   * send repository content to a restricted provider.
+   */
+  readonly modelSelection: ModelSelection | undefined;
   readonly style: SourceControlWritingStyleSettings;
 }
 
@@ -584,6 +595,66 @@ export const make = Effect.gen(function* () {
 
   const sourceControlProvider = (cwd: string) => sourceControlProviders.resolve({ cwd });
   const serverSettingsService = yield* ServerSettings.ServerSettingsService;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+
+  /**
+   * Commit/PR text generation sends repository content (diffs, commit and
+   * branch summaries) to the selected instance, so the configured writer
+   * must also pass the provider access rules of the project it is writing
+   * about. `cwd` may be the project root or a thread worktree; both resolve
+   * through the shell snapshot. Falls back to the owning thread's selection,
+   * then the project default. Returns undefined when nothing usable remains;
+   * a projection read failure resolves to the unclamped candidate — the
+   * conversation gates stay authoritative, and an infra hiccup must not
+   * block commits.
+   */
+  const clampWriterSelectionToProjectAccess = Effect.fn("clampWriterSelectionToProjectAccess")(
+    function* (input: {
+      readonly cwd: string;
+      readonly candidate: ModelSelection;
+      readonly providerInstances: ProviderInstanceConfigMap;
+    }) {
+      const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("git manager could not resolve project access for writer selection", {
+            cwd: input.cwd,
+            cause,
+          }).pipe(Effect.as(undefined)),
+        ),
+      );
+      if (snapshot === undefined) return input.candidate;
+      const normalizedCwd = normalizeProjectPathForComparison(input.cwd);
+      const owningThread = snapshot.threads.find(
+        (thread) =>
+          thread.worktreePath !== null &&
+          normalizeProjectPathForComparison(thread.worktreePath) === normalizedCwd,
+      );
+      const project =
+        (owningThread
+          ? snapshot.projects.find((entry) => entry.id === owningThread.projectId)
+          : undefined) ??
+        snapshot.projects.find(
+          (entry) => normalizeProjectPathForComparison(entry.workspaceRoot) === normalizedCwd,
+        );
+      if (project === undefined) return input.candidate;
+      const usable = (selection: ModelSelection) =>
+        isProviderInstanceUsableInProject({
+          instanceId: selection.instanceId,
+          instanceAllowedProjects: getProviderInstanceAllowedProjects(
+            input.providerInstances,
+            selection.instanceId,
+          ),
+          projectId: project.id,
+          projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
+        });
+      if (usable(input.candidate)) return input.candidate;
+      if (owningThread && usable(owningThread.modelSelection)) return owningThread.modelSelection;
+      if (project.defaultModelSelection !== null && usable(project.defaultModelSelection)) {
+        return project.defaultModelSelection;
+      }
+      return undefined;
+    },
+  );
 
   const readRecentCommitSubjects = (cwd: string) =>
     gitCore
@@ -1409,6 +1480,15 @@ export const make = Effect.gen(function* () {
         };
       }
 
+      const modelSelection = input.settings.modelSelection;
+      if (modelSelection === undefined) {
+        return yield* new GitManagerError({
+          operation: "resolveCommitAndBranchSuggestion",
+          cwd: input.cwd,
+          detail:
+            "Commit message generation is unavailable: no provider is allowed for this project. Enter a commit message manually, or update the project's provider access.",
+        });
+      }
       const policy = yield* resolveStylePolicy(input.cwd, input.settings.style);
 
       const generated = yield* textGeneration
@@ -1419,7 +1499,7 @@ export const make = Effect.gen(function* () {
           stagedPatch: limitContext(context.stagedPatch, 50_000),
           ...(input.includeBranch ? { includeBranch: true } : {}),
           ...(policy ? { policy } : {}),
-          modelSelection: input.settings.modelSelection,
+          modelSelection,
         })
         .pipe(Effect.map((result) => sanitizeCommitMessage(result)));
 
@@ -1593,6 +1673,15 @@ export const make = Effect.gen(function* () {
       phase: "pr",
       label: `Generating ${terms.shortLabel} content...`,
     });
+    const modelSelection = settings.modelSelection;
+    if (modelSelection === undefined) {
+      return yield* new GitManagerError({
+        operation: "runPrStep",
+        cwd,
+        detail:
+          "Pull request generation is unavailable: no provider is allowed for this project. Update the project's provider access, or create the pull request manually.",
+      });
+    }
     const baseRangeRef = yield* resolveBaseRangeRef(cwd, baseBranch);
     const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
     const policy = yield* resolveStylePolicy(cwd, settings.style);
@@ -1610,7 +1699,7 @@ export const make = Effect.gen(function* () {
       diffPatch: limitContext(rangeContext.diffPatch, 60_000),
       ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
       ...(policy ? { policy } : {}),
-      modelSelection: settings.modelSelection,
+      modelSelection,
     });
 
     const bodyFile = path.join(
@@ -1991,23 +2080,26 @@ export const make = Effect.gen(function* () {
         let commitMessageForStep = input.commitMessage;
         let preResolvedCommitSuggestion: CommitAndBranchSuggestion | undefined = undefined;
 
-        const textGenerationSettings = yield* serverSettingsService.getSettings.pipe(
-          Effect.flatMap((settings) =>
-            settings.sourceControlWriterModelSelection === null
-              ? Effect.succeed({
-                  modelSelection: settings.textGenerationModelSelection,
-                  style: settings.sourceControlWritingStyle,
-                })
-              : providerRegistry.getProviders.pipe(
-                  Effect.map((providers) => ({
-                    modelSelection: ServerSettings.resolveSourceControlWriterModelSelection(
-                      settings,
-                      providers,
-                    ),
-                    style: settings.sourceControlWritingStyle,
-                  })),
-                ),
-          ),
+        const textGenerationSettings: SourceControlTextGenerationSettings = yield* Effect.gen(
+          function* () {
+            const settings = yield* serverSettingsService.getSettings;
+            const candidate =
+              settings.sourceControlWriterModelSelection === null
+                ? settings.textGenerationModelSelection
+                : ServerSettings.resolveSourceControlWriterModelSelection(
+                    settings,
+                    yield* providerRegistry.getProviders,
+                  );
+            return {
+              modelSelection: yield* clampWriterSelectionToProjectAccess({
+                cwd: input.cwd,
+                candidate,
+                providerInstances: settings.providerInstances,
+              }),
+              style: settings.sourceControlWritingStyle,
+            };
+          },
+        ).pipe(
           Effect.mapError(
             (cause) =>
               new GitManagerError({

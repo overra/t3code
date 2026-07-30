@@ -26,6 +26,7 @@ import {
   ensureThreadOutboxLoaded,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
+import { appendComposerDraftText } from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -145,13 +146,28 @@ export function useThreadOutboxDrain(): void {
     const completeDelivery = async (
       deliveryResult: AtomCommandResult<unknown, unknown>,
     ): Promise<boolean> => {
-      if (reportFailure(deliveryResult, "start-turn")) {
+      const failed = AsyncResult.isFailure(deliveryResult);
+      if (failed && reportFailure(deliveryResult, "start-turn")) {
         return false;
+      }
+      if (failed) {
+        // Deterministic rejection (e.g. provider access changed while the
+        // message sat in the outbox): this entry will never send, but the
+        // user's words must not vanish with it — put the text back into the
+        // thread's composer draft before dropping the poisoned entry.
+        // Image attachments are not restored; the draft store only holds
+        // local picks and the originals may no longer exist.
+        if (queuedMessage.text.trim().length > 0) {
+          appendComposerDraftText(
+            scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId),
+            queuedMessage.text,
+          );
+        }
       }
 
       try {
         await removeThreadOutboxMessage(queuedMessage);
-        return true;
+        return !failed;
       } catch (error) {
         console.warn("[thread-outbox] failed to remove delivered queued message", {
           environmentId: queuedMessage.environmentId,

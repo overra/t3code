@@ -26,6 +26,7 @@ import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
 import { cli, makeCli } from "./bin.ts";
+import { layerTest as serverSettingsLayerTest } from "./serverSettings.ts";
 import * as ServerConfig from "./config.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -119,6 +120,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(orchestrationHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
+      Layer.provide(serverSettingsLayerTest()),
     );
     const appLayer = HttpRouter.serve(routesLayer, {
       disableListenLog: true,

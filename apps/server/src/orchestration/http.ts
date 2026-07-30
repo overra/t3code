@@ -9,6 +9,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
 import { normalizeDispatchCommand } from "./Normalizer.ts";
+import { validateCommandProviderAccess } from "./providerScopeChecks.ts";
 import {
   annotateEnvironmentRequest,
   failEnvironmentInternal,
@@ -18,6 +19,7 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -25,6 +27,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const serverSettings = yield* ServerSettingsService;
 
     return handlers
       .handle(
@@ -78,6 +81,13 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.dispatch")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          // Before normalization: a denied image turn must not persist its
+          // attachments, and the typed denial beats a first-turn failure.
+          yield* validateCommandProviderAccess(args.payload, {
+            getSettings: serverSettings.getSettings,
+            getThreadShellById: projectionSnapshotQuery.getThreadShellById,
+            getProjectShellById: projectionSnapshotQuery.getProjectShellById,
+          }).pipe(Effect.catch(() => failEnvironmentInvalidRequest("provider_access_denied")));
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );

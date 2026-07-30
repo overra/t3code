@@ -4,6 +4,7 @@ import {
   EventId,
   getProviderInstanceAllowedProjects,
   getProviderInstanceProjectRestriction,
+  isProviderInstanceUsableInProject,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -382,6 +383,36 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  /**
+   * Auxiliary text generation (thread titles, branch names) sends project
+   * content to the selected instance, so the globally configured selection
+   * must also pass the thread's project access rules. Falls back to the
+   * thread's own selection when the global one is restricted; returns
+   * undefined when neither is usable — callers skip generation entirely (a
+   * seed title or temporary branch name is an acceptable outcome, a
+   * restricted provider receiving the prompt is not).
+   */
+  const resolveProjectScopedTextGenerationSelection = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly candidate: ModelSelection;
+  }) {
+    const thread = yield* resolveThread(input.threadId);
+    if (!thread) return input.candidate;
+    const project = yield* resolveProject(thread.projectId);
+    if (project === undefined) return input.candidate;
+    const providerInstances = (yield* serverSettingsService.getSettings).providerInstances;
+    const usable = (instanceId: ModelSelection["instanceId"]) =>
+      isProviderInstanceUsableInProject({
+        instanceId,
+        instanceAllowedProjects: getProviderInstanceAllowedProjects(providerInstances, instanceId),
+        projectId: thread.projectId,
+        projectAllowedProviderInstances: project.allowedProviderInstances,
+      });
+    if (usable(input.candidate.instanceId)) return input.candidate;
+    if (usable(thread.modelSelection.instanceId)) return thread.modelSelection;
+    return undefined;
+  });
+
   const rejectStartedThreadModelChangeIfRequired = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly currentModelSelection: ModelSelection;
@@ -551,14 +582,28 @@ const make = Effect.gen(function* () {
     // Final gate for both provider-access rules. The decider (project
     // allowlist) and the dispatch path (instance scope) reject commands that
     // carry an explicit disallowed selection; this covers selections that
-    // arrive from persisted thread state (e.g. a thread created before
-    // either restriction existed).
+    // arrive from persisted thread or session state (e.g. a thread created
+    // before either restriction existed).
+    //
+    // The gated instance is the one this turn will actually run on: an
+    // explicit request wins (subject to the switch-compatibility checks
+    // above), otherwise a live session keeps serving turns regardless of the
+    // persisted thread selection — so a since-restricted active session must
+    // be gated even when `thread.modelSelection` still names an allowed
+    // instance, while an explicit switch AWAY from a restricted session must
+    // stay possible.
     if (project !== undefined) {
+      const effectiveInstanceId =
+        requestedModelSelection === undefined &&
+        activeThreadSession !== null &&
+        activeSession !== undefined
+          ? currentInstanceId
+          : desiredInstanceId;
       const restriction = getProviderInstanceProjectRestriction({
-        instanceId: desiredInstanceId,
+        instanceId: effectiveInstanceId,
         instanceAllowedProjects: getProviderInstanceAllowedProjects(
           (yield* serverSettingsService.getSettings).providerInstances,
-          desiredInstanceId,
+          effectiveInstanceId,
         ),
         projectId: thread.projectId,
         projectAllowedProviderInstances: project.allowedProviderInstances,
@@ -567,14 +612,14 @@ const make = Effect.gen(function* () {
         return yield* new ProviderAdapterRequestError({
           provider: preferredProvider,
           method: "thread.turn.start",
-          detail: `Provider instance '${desiredInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+          detail: `Provider instance '${effectiveInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
         });
       }
       if (restriction === "instance-scope") {
         return yield* new ProviderAdapterRequestError({
           provider: preferredProvider,
           method: "thread.turn.start",
-          detail: `Provider instance '${desiredInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
+          detail: `Provider instance '${effectiveInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
         });
       }
     }
@@ -779,13 +824,18 @@ const make = Effect.gen(function* () {
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
       const settings = yield* serverSettingsService.getSettings;
-      const modelSelection =
+      const candidate =
         settings.sourceControlWriterModelSelection === null
           ? settings.textGenerationModelSelection
           : resolveSourceControlWriterModelSelection(
               settings,
               yield* providerRegistry.getProviders,
             );
+      const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+        threadId: input.threadId,
+        candidate,
+      });
+      if (modelSelection === undefined) return;
 
       const generated = yield* textGeneration.generateBranchName({
         cwd,
@@ -829,8 +879,12 @@ const make = Effect.gen(function* () {
     }) {
       const attachments = input.attachments ?? [];
       yield* Effect.gen(function* () {
-        const { textGenerationModelSelection: modelSelection } =
-          yield* serverSettingsService.getSettings;
+        const { textGenerationModelSelection } = yield* serverSettingsService.getSettings;
+        const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+          threadId: input.threadId,
+          candidate: textGenerationModelSelection,
+        });
+        if (modelSelection === undefined) return;
 
         const generated = yield* textGeneration.generateThreadTitle({
           cwd: input.cwd,
@@ -892,8 +946,14 @@ const make = Effect.gen(function* () {
         thread,
         projects: project ? [project] : [],
       }) ?? process.cwd();
-    const { textGenerationModelSelection: modelSelection } =
-      yield* serverSettingsService.getSettings;
+    const { textGenerationModelSelection } = yield* serverSettingsService.getSettings;
+    const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+      threadId: event.payload.threadId,
+      candidate: textGenerationModelSelection,
+    });
+    if (modelSelection === undefined) {
+      return { _tag: "Completed", title: undefined } as const;
+    }
     const generated = yield* textGeneration.generateThreadTitle({
       cwd,
       message,
