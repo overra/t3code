@@ -1122,6 +1122,14 @@ function ProjectAllowedProvidersControl(props: {
     onUpdate(member, coversAllConfigured ? null : [...next]);
   };
 
+  // Mixer-style solo: one click expresses "this project uses exactly this
+  // provider" without unchecking every other row.
+  const solo = (instanceId: ProviderInstanceId) => {
+    onUpdate(member, [instanceId]);
+  };
+  const isSoloed = (entry: ProviderInstanceEntry): boolean =>
+    allowed !== null && allowed.length === 1 && allowed[0] === entry.instanceId;
+
   if (providerEntries.length === 0) {
     return (
       <div className="grid min-w-0 gap-1.5">
@@ -1146,11 +1154,12 @@ function ProjectAllowedProvidersControl(props: {
           const isChecked = checkedIds.has(entry.instanceId);
           const scopeExcluded = isScopeExcluded(entry);
           const isLastChecked = isChecked && !scopeExcluded && effectiveCheckedCount === 1;
+          const canSolo = !scopeExcluded && !isSoloed(entry);
           return (
             <label
               key={entry.instanceId}
               className={cn(
-                "flex min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border/60 px-2.5 py-1.5 transition-colors hover:bg-muted/40",
+                "group/provider-row flex min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border/60 px-2.5 py-1.5 transition-colors hover:bg-muted/40",
                 scopeExcluded && "cursor-default opacity-60 hover:bg-transparent",
               )}
               title={
@@ -1182,6 +1191,23 @@ function ProjectAllowedProvidersControl(props: {
                   </span>
                 ) : null}
               </span>
+              {canSolo ? (
+                <button
+                  type="button"
+                  className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-xs text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none group-hover/provider-row:opacity-100"
+                  title={`Allow only ${entry.displayName} in this project`}
+                  aria-label={`Allow only ${entry.displayName} in this project`}
+                  onClick={(event) => {
+                    // Inside the row label: without these, the click also
+                    // activates the label and toggles the checkbox.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    solo(entry.instanceId);
+                  }}
+                >
+                  Only
+                </button>
+              ) : null}
             </label>
           );
         })}
