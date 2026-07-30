@@ -1,10 +1,14 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ServerSettings,
+  ServerSettingsPatch,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 import { resolveServerBackgroundActivitySettings } from "./backgroundActivitySettings.ts";
 import { createModelSelection } from "./model.ts";
@@ -511,5 +515,54 @@ describe("serverSettings helpers", () => {
     });
 
     expect(resolved.pauseWhenOnBattery).toBe(false);
+  });
+});
+
+describe("provider instance project scope wire round-trip", () => {
+  it("preserves allowedProjects through patch decode, apply, and settings re-encode", () => {
+    const workProject = ProjectId.make("project-work");
+    const rawPatch = {
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          enabled: true,
+          allowedProjects: [workProject],
+        },
+        claudeAgent: {
+          driver: "claudeAgent",
+        },
+      },
+    };
+    // The exact wire pipeline: client encodes ServerSettingsPatch, server
+    // decodes it, applies it, and persists via the ServerSettings schema.
+    // A stale schema on either side of this pipeline silently drops the
+    // envelope field (Struct decode discards unknown keys), so this test
+    // pins the current schema round-trip end to end.
+    const decodedPatch = Schema.decodeUnknownSync(ServerSettingsPatch)(rawPatch);
+    const next = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, decodedPatch);
+    expect(
+      next.providerInstances[ProviderInstanceId.make("claudeAgent_work")]?.allowedProjects,
+    ).toEqual([workProject]);
+    expect(
+      next.providerInstances[ProviderInstanceId.make("claudeAgent")]?.allowedProjects,
+    ).toBeUndefined();
+
+    const persisted = Schema.encodeUnknownSync(ServerSettings)(next);
+    const reloaded = Schema.decodeUnknownSync(ServerSettings)(persisted);
+    expect(
+      reloaded.providerInstances[ProviderInstanceId.make("claudeAgent_work")]?.allowedProjects,
+    ).toEqual([workProject]);
+  });
+
+  it("rejects an empty allowedProjects list at the schema layer", () => {
+    const result = Schema.decodeUnknownExit(ServerSettingsPatch)({
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          allowedProjects: [],
+        },
+      },
+    });
+    expect(result._tag).toBe("Failure");
   });
 });

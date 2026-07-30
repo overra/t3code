@@ -35,7 +35,7 @@
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const PROVIDER_SLUG_MAX_CHARS = 64;
 /**
@@ -113,6 +113,19 @@ export const ProviderInstanceEnvironment = Schema.Array(ProviderInstanceEnvironm
 export type ProviderInstanceEnvironment = typeof ProviderInstanceEnvironment.Type;
 
 /**
+ * Per-instance project scope. `null` — and absent, on envelopes written
+ * before this field existed — means the instance is usable in every project.
+ * A non-empty list limits the instance to those project ids. The empty list
+ * is rejected: "usable nowhere" is what `enabled: false` expresses.
+ *
+ * Ids of since-deleted projects may linger in the list; they match nothing
+ * and are harmless. Enforcement intersects this with the project-side
+ * `allowedProviderInstances` via {@link isProviderInstanceUsableInProject}.
+ */
+export const ProviderInstanceAllowedProjects = Schema.Array(ProjectId).check(Schema.isMinLength(1));
+export type ProviderInstanceAllowedProjects = typeof ProviderInstanceAllowedProjects.Type;
+
+/**
  * Envelope shape for a provider instance configuration in `ServerSettings`.
  *
  * `driver` is intentionally accepted as any well-formed slug (see module
@@ -127,9 +140,26 @@ export const ProviderInstanceConfig = Schema.Struct({
   accentColor: Schema.optional(TrimmedNonEmptyString),
   environment: Schema.optionalKey(ProviderInstanceEnvironment),
   enabled: Schema.optionalKey(Schema.Boolean),
+  allowedProjects: Schema.optionalKey(Schema.NullOr(ProviderInstanceAllowedProjects)),
   config: Schema.optionalKey(Schema.Unknown),
 });
 export type ProviderInstanceConfig = typeof ProviderInstanceConfig.Type;
+
+/**
+ * Read an instance's project scope out of the `ServerSettings.providerInstances`
+ * map. Instances without an envelope (built-in defaults synthesized from the
+ * legacy per-driver settings) have no scope: usable everywhere.
+ *
+ * This is the ONLY sanctioned way to resolve the scope — server enforcement
+ * and every client picker read the same settings map through this function,
+ * so the rule cannot drift between surfaces.
+ */
+export function getProviderInstanceAllowedProjects(
+  providerInstances: ProviderInstanceConfigMap | undefined,
+  instanceId: ProviderInstanceId,
+): ProviderInstanceAllowedProjects | null {
+  return providerInstances?.[instanceId]?.allowedProjects ?? null;
+}
 
 /**
  * Map shape for `ServerSettings.providerInstances`. Keyed by
