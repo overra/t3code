@@ -376,9 +376,24 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     [selectedEnvironmentServerConfig, selectedProject, selectedProjectDraft.modelSelection],
   );
 
+  // The draft and project default are only candidates while their instance
+  // survives access filtering — `modelOptions` is already restricted to the
+  // project's rules, so membership is the usability test. Without this, the
+  // menu filter changes what is DISPLAYED but a stale draft would still be
+  // the value dispatched.
+  const usableInstanceIds = useMemo(
+    () => new Set(modelOptions.map((option) => option.selection.instanceId)),
+    [modelOptions],
+  );
+  const draftSelection = selectedProjectDraft.modelSelection ?? null;
+  const projectDefaultSelection = selectedProject?.defaultModelSelection ?? null;
   const selectedModel =
-    selectedProjectDraft.modelSelection ??
-    selectedProject?.defaultModelSelection ??
+    (draftSelection !== null && usableInstanceIds.has(draftSelection.instanceId)
+      ? draftSelection
+      : null) ??
+    (projectDefaultSelection !== null && usableInstanceIds.has(projectDefaultSelection.instanceId)
+      ? projectDefaultSelection
+      : null) ??
     modelOptions.find((option) => option.isDefault)?.selection ??
     modelOptions[0]?.selection ??
     null;

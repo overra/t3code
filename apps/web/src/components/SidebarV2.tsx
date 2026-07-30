@@ -1069,6 +1069,16 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
 });
 
+function providerAllowlistsEqual(
+  a: ReadonlyArray<ProviderInstanceId> | null,
+  b: ReadonlyArray<ProviderInstanceId> | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.length !== b.length) return false;
+  const ids = new Set<ProviderInstanceId>(a);
+  return b.every((id) => ids.has(id));
+}
+
 /**
  * Per-project provider allowlist editor in the project settings dialog.
  * Every checkbox reflects one configured provider instance of the member's
@@ -1094,15 +1104,24 @@ function ProjectAllowedProvidersControl(props: {
   const { member, providerEntries, onUpdate } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the streamed prop (which lags a round-trip and would resurrect the
-  // previous edit). Any prop change — our own echo or an external editor —
-  // clears the overlay; a rejected write clears it explicitly.
+  // previous edit). The overlay clears only when the prop CATCHES UP to the
+  // pending value — an intermediate echo from an earlier write must not
+  // expose stale state underneath a newer pending edit. A rejected write
+  // clears it explicitly, and a timeout backstops a lost echo.
   const [pendingAllowed, setPendingAllowed] = useState<
     ReadonlyArray<ProviderInstanceId> | null | undefined
   >(undefined);
   const propAllowed = member.allowedProviderInstances ?? null;
   useEffect(() => {
-    setPendingAllowed(undefined);
-  }, [propAllowed]);
+    if (pendingAllowed !== undefined && providerAllowlistsEqual(propAllowed, pendingAllowed)) {
+      setPendingAllowed(undefined);
+    }
+  }, [propAllowed, pendingAllowed]);
+  useEffect(() => {
+    if (pendingAllowed === undefined) return;
+    const timer = window.setTimeout(() => setPendingAllowed(undefined), 5000);
+    return () => window.clearTimeout(timer);
+  }, [pendingAllowed]);
   const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
   const checkedIds = useMemo(
     () =>
@@ -1113,11 +1132,12 @@ function ProjectAllowedProvidersControl(props: {
   );
   const isScopeExcluded = (entry: ProviderInstanceEntry): boolean =>
     entry.allowedProjects !== null && !entry.allowedProjects.includes(member.id);
-  // "Effectively usable" additionally requires the instance to be enabled:
-  // a checked-but-disabled provider cannot start threads, so it must not
+  // "Effectively usable" additionally requires the instance to be enabled
+  // AND available: a checked-but-disabled provider (or an unavailable
+  // shadow for a missing fork driver) cannot start threads, so neither may
   // satisfy the do-not-strand guard below.
   const isEffectivelyUsable = (entry: ProviderInstanceEntry): boolean =>
-    entry.enabled && !isScopeExcluded(entry);
+    entry.enabled && entry.isAvailable && !isScopeExcluded(entry);
   const effectiveCheckedCount = providerEntries.filter(
     (entry) => checkedIds.has(entry.instanceId) && isEffectivelyUsable(entry),
   ).length;

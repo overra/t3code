@@ -3217,7 +3217,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         <div className="px-3 py-2">
                           <RestrictedProvidersNotes notes={restrictedProviderInstanceNotes} />
                         </div>
-                        {isPrimaryEnvironment ? (
+                        {isPrimaryEnvironment &&
+                        restrictedProviderInstanceNotes.some(
+                          (note) => note.cause === "instance-scope",
+                        ) ? (
                           <div className="border-t border-border/70 p-1.5">
                             <Button
                               type="button"
@@ -3230,7 +3233,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               Provider settings
                             </Button>
                           </div>
-                        ) : null}
+                        ) : (
+                          // Every blocker is the project's own allowlist;
+                          // provider settings cannot change that rule.
+                          <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                            Change this in the project&apos;s settings (project row → Project
+                            settings).
+                          </p>
+                        )}
                       </PopoverPopup>
                     </Popover>
                   ) : (

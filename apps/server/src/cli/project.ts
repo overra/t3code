@@ -31,7 +31,6 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
-import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
 import {
   clearPersistedServerRuntimeState,
   readPersistedServerRuntimeState,
@@ -480,7 +479,10 @@ const projectAddCommand = Command.make("add", {
           projectId,
           title,
           workspaceRoot,
-          defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(),
+          // No hardcoded default: clients resolve a usable selection from
+          // the project's provider access rules on first use, whereas a
+          // fixed codex default could land outside codex's project scope.
+          defaultModelSelection: null,
           createdAt: DateTime.formatIso(yield* DateTime.now),
         });
         return `Added project ${projectId} (${title}) at ${workspaceRoot}.`;
@@ -601,7 +603,7 @@ const projectProvidersCommand = Command.make("providers", {
   ),
 }).pipe(
   Command.withDescription(
-    "Restrict which provider instances a project may use, or clear the restriction with --all.",
+    "Show or restrict which provider instances a project may use. With no flags, prints the current allowlist; --allow sets one; --all clears it.",
   ),
   Command.withHandler((flags) =>
     runProjectMutation(
@@ -616,15 +618,24 @@ const projectProvidersCommand = Command.make("providers", {
         ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
       }) {
         const allowFlag = Option.getOrUndefined(flags.allow);
-        if (flags.all === (allowFlag !== undefined)) {
+        if (flags.all && allowFlag !== undefined) {
           return yield* new ProjectProvidersCliInputError({
-            detail: "Pass exactly one of --all or --allow <instance-ids>.",
+            detail: "--all and --allow are mutually exclusive.",
           });
         }
         const project = yield* findActiveProjectTarget({
           snapshot,
           identifier: flags.project,
         });
+
+        if (!flags.all && allowFlag === undefined) {
+          const current =
+            snapshot.projects.find((entry) => entry.id === project.id)?.allowedProviderInstances ??
+            null;
+          return current === null
+            ? `Project ${project.id} allows every provider instance.`
+            : `Project ${project.id} allows: ${current.join(", ")}.`;
+        }
 
         if (flags.all) {
           yield* dispatch({

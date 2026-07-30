@@ -83,11 +83,17 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
           // Before normalization: a denied image turn must not persist its
           // attachments, and the typed denial beats a first-turn failure.
+          // The validator's message carries which rule blocked (project
+          // allowlist vs instance scope) and the recovery surface.
           yield* validateCommandProviderAccess(args.payload, {
             getSettings: serverSettings.getSettings,
             getThreadShellById: projectionSnapshotQuery.getThreadShellById,
             getProjectShellById: projectionSnapshotQuery.getProjectShellById,
-          }).pipe(Effect.catch(() => failEnvironmentInvalidRequest("provider_access_denied")));
+          }).pipe(
+            Effect.catch((cause) =>
+              failEnvironmentInvalidRequest("provider_access_denied", cause.message),
+            ),
+          );
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );

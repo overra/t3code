@@ -795,7 +795,16 @@ export function NewTaskDraftScreen(props: {
       return;
     }
     const draft = getComposerDraftSnapshot(draftKey);
-    const modelSelection = draft.modelSelection ?? flow.selectedModel;
+    // The raw draft snapshot may hold a selection the project's provider
+    // access rules no longer admit; accept it only while its instance is
+    // still among the (filtered) options, otherwise use the flow's clamped
+    // resolution.
+    const draftSelection = draft.modelSelection;
+    const modelSelection =
+      draftSelection &&
+      flow.modelOptions.some((option) => option.selection.instanceId === draftSelection.instanceId)
+        ? draftSelection
+        : flow.selectedModel;
     const workspaceMode = draft.workspaceSelection?.mode ?? flow.workspaceMode;
     const selectedBranchName = draft.workspaceSelection?.branch ?? flow.selectedBranchName;
     const selectedWorktreePath =

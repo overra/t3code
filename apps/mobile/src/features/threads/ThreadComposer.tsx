@@ -1,12 +1,14 @@
 import { isLiquidGlassSupported, LiquidGlassView } from "@callstack/liquid-glass";
-import type {
-  EnvironmentId,
-  MessageId,
-  ModelSelection,
-  OrchestrationThreadShell,
-  ProviderInteractionMode,
-  RuntimeMode,
-  ServerConfig as T3ServerConfig,
+import {
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
+  type EnvironmentId,
+  type MessageId,
+  type ModelSelection,
+  type OrchestrationThreadShell,
+  type ProviderInteractionMode,
+  type RuntimeMode,
+  type ServerConfig as T3ServerConfig,
 } from "@t3tools/contracts";
 import {
   detectComposerTrigger,
@@ -285,7 +287,23 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
-  const canSend = hasContent;
+  // A thread whose persisted selection the project's provider access rules
+  // no longer admit must not send (or queue) — the server rejects the turn,
+  // and a queued one would poison the outbox. The model menu only offers
+  // allowed instances, so picking any model clears this.
+  const currentSelectionRestricted = useMemo(() => {
+    if (props.project === null || !props.serverConfig) return false;
+    return !isProviderInstanceUsableInProject({
+      instanceId: props.selectedThread.modelSelection.instanceId,
+      instanceAllowedProjects: getProviderInstanceAllowedProjects(
+        props.serverConfig.settings.providerInstances,
+        props.selectedThread.modelSelection.instanceId,
+      ),
+      projectId: props.project.id,
+      projectAllowedProviderInstances: props.project.allowedProviderInstances,
+    });
+  }, [props.project, props.serverConfig, props.selectedThread.modelSelection.instanceId]);
+  const canSend = hasContent && !currentSelectionRestricted;
 
   const onPressImage = useCallback(
     (uri: string) => {
@@ -914,6 +932,16 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 showChevron={false}
               />
             </ComposerToolbarRow>
+          </Animated.View>
+        ) : null}
+
+        {/* Provider restricted for this project */}
+        {currentSelectionRestricted ? (
+          <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
+            <Text className="pt-2 text-xs text-foreground-muted">
+              This thread&apos;s provider is not allowed in this project. Pick another model to
+              continue.
+            </Text>
           </Animated.View>
         ) : null}
 

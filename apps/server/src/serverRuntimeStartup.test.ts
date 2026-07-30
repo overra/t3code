@@ -15,6 +15,7 @@ import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngi
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+import { layerTest as serverSettingsLayerTest } from "./serverSettings.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -173,6 +174,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
       Effect.provide(NodeServices.layer),
+      Effect.provide(serverSettingsLayerTest()),
     );
 
     assert.deepStrictEqual(targets, {
@@ -218,6 +220,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
       Effect.provide(NodeServices.layer),
+      Effect.provide(serverSettingsLayerTest()),
     );
 
     assert.equal(typeof targets.bootstrapProjectId, "string");
@@ -277,5 +280,5 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
 
     assert.strictEqual(error, uuidError);
     assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
-  }).pipe(Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.provide(NodeServices.layer), Effect.provide(serverSettingsLayerTest())),
 );

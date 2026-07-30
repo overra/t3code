@@ -16,12 +16,13 @@ import { expect } from "vite-plus/test";
 import type {
   GitActionProgressEvent,
   GitPreparePullRequestThreadInput,
+  OrchestrationShellSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
-
 import {
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   TextGenerationError,
@@ -618,6 +619,7 @@ function makeManager(input?: {
   textGeneration?: Partial<FakeGitTextGeneration>;
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
+  shellSnapshot?: OrchestrationShellSnapshot;
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
   const textGeneration = createTextGeneration(input?.textGeneration);
@@ -652,16 +654,18 @@ function makeManager(input?: {
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
     }),
-    // Empty shell snapshot = no project matches any cwd, so writer
+    // Default empty shell snapshot = no project matches any cwd, so writer
     // selections pass through unclamped and existing expectations hold.
     Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
       getShellSnapshot: () =>
-        Effect.succeed({
-          snapshotSequence: 0,
-          projects: [],
-          threads: [],
-          updatedAt: "2026-01-01T00:00:00.000Z",
-        }),
+        Effect.succeed(
+          input?.shellSnapshot ?? {
+            snapshotSequence: 0,
+            projects: [],
+            threads: [],
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ),
     }),
     Layer.succeed(
       ProjectSetupScriptRunner.ProjectSetupScriptRunner,
@@ -1601,6 +1605,71 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toBe("Implement stacked git actions");
+    }),
+  );
+
+  it.effect("blocks commit generation when the project's rules exclude the writer", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\nworld\n");
+      const subDir = NodePath.join(repoDir, "sub");
+      NodeFS.mkdirSync(subDir);
+      // Match the project on git's resolved repository root so temp-dir
+      // symlinks (/var vs /private/var) cannot skew the comparison.
+      const repositoryRoot = yield* runGit(repoDir, ["rev-parse", "--show-toplevel"]).pipe(
+        Effect.map((result) => result.stdout.trim()),
+      );
+      let generateCalls = 0;
+
+      const { manager } = yield* makeManager({
+        textGeneration: {
+          generateCommitMessage: () => {
+            generateCalls += 1;
+            return Effect.succeed({ subject: "Should never be generated", body: "" });
+          },
+        },
+        shellSnapshot: {
+          snapshotSequence: 1,
+          projects: [
+            {
+              id: ProjectId.make("project-writer-restricted"),
+              title: "Writer Restricted",
+              workspaceRoot: repositoryRoot,
+              defaultModelSelection: null,
+              // The default writer (codex) is not in the allowlist.
+              allowedProviderInstances: [ProviderInstanceId.make("claudeAgent")],
+              scripts: [],
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+
+      // A repository SUBDIRECTORY must resolve to the same project — an
+      // exact-cwd match would silently fall back to the unclamped writer.
+      const error = yield* runStackedAction(manager, {
+        cwd: subDir,
+        action: "commit",
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({ _tag: "GitManagerError" });
+      expect(String((error as { detail?: string }).detail)).toContain(
+        "Commit message generation is unavailable",
+      );
+      expect(generateCalls).toBe(0);
+
+      // An explicit commit message bypasses generation and still works.
+      const result = yield* runStackedAction(manager, {
+        cwd: repoDir,
+        action: "commit",
+        commitMessage: "chore: manual message",
+      });
+      expect(result.commit.status).toBe("created");
+      expect(generateCalls).toBe(0);
     }),
   );
 

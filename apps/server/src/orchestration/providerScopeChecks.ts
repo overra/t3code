@@ -13,10 +13,12 @@
  *
  * Both rules are evaluated here through the shared contracts predicate so
  * the error names the rule that actually blocks (project allowlist wins
- * attribution, matching `getProviderInstanceProjectRestriction`). The
- * decider and reactor remain the enforcement authorities; failures to read
- * projections or settings therefore fall open here rather than blocking
- * dispatch.
+ * attribution, matching `getProviderInstanceProjectRestriction`). Read
+ * FAILURES fail closed — "cannot verify access" must not admit a command
+ * that verification would have denied (and must not let a denied image turn
+ * reach the attachment store). A cleanly MISSING thread or project record
+ * passes through instead: the decider owns that error and reports it with
+ * proper context.
  */
 import {
   getProviderInstanceAllowedProjects,
@@ -111,11 +113,14 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
 ) {
   const checks = collectProviderScopeChecks(command);
   if (checks.length === 0) return;
+  const verificationFailure = (what: string) =>
+    new OrchestrationDispatchCommandError({
+      message: `Provider access could not be verified (${what} unavailable). Try again.`,
+    });
   const providerInstances = yield* deps.getSettings.pipe(
     Effect.map((settings) => settings.providerInstances),
-    Effect.orElseSucceed(() => undefined),
+    Effect.mapError(() => verificationFailure("server settings")),
   );
-  if (providerInstances === undefined) return;
 
   for (const check of checks) {
     const projectId =
@@ -124,14 +129,14 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
         : yield* deps.getThreadShellById(check.target.threadId).pipe(
             Effect.map(Option.getOrUndefined),
             Effect.map((thread) => thread?.projectId),
-            // A missing or unreadable thread is the decider's error to
-            // report with proper context, not this gate's.
-            Effect.orElseSucceed(() => undefined),
+            Effect.mapError(() => verificationFailure("thread state")),
           );
+    // A cleanly missing thread is the decider's error to report with
+    // proper context, not this gate's.
     if (projectId === undefined) continue;
     const project = yield* deps.getProjectShellById(projectId).pipe(
       Effect.map(Option.getOrUndefined),
-      Effect.orElseSucceed(() => undefined),
+      Effect.mapError(() => verificationFailure("project state")),
     );
     if (project === undefined) continue;
     const restriction = getProviderInstanceProjectRestriction({

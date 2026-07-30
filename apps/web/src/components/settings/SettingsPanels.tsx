@@ -13,6 +13,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   defaultInstanceIdForDriver,
+  isProviderAvailable,
   type BackgroundActivityProfile,
   type BackgroundActivitySettings,
   type DesktopUpdateChannel,
@@ -1913,12 +1914,19 @@ export function ProviderSettingsPanel() {
     }
   }
 
-  // Effective enabled/scope state of every configured instance, fed to each
-  // card's Projects control so narrowing one instance's scope can warn about
-  // projects that would be left with no usable provider at all.
+  // Effective enabled/availability/scope state of every configured instance,
+  // fed to each card's Projects control so narrowing one instance's scope
+  // can warn about projects that would be left with no usable provider at
+  // all. Availability comes from the live snapshots; an instance with no
+  // snapshot yet counts as unavailable — an unprobed provider must not be
+  // the one thing standing between a project and zero usable providers.
+  const providerAvailabilityByInstanceId = new Map(
+    serverProviders.map((snapshot) => [snapshot.instanceId, isProviderAvailable(snapshot)]),
+  );
   const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.map((row) => ({
     instanceId: row.instanceId,
     enabled: row.instance.enabled ?? true,
+    available: providerAvailabilityByInstanceId.get(row.instanceId) ?? false,
     allowedProjects: row.instance.allowedProjects ?? null,
   }));
 

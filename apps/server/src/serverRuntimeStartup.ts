@@ -1,10 +1,15 @@
 import {
   CommandId,
   DEFAULT_MODEL,
+  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
   type ModelSelection,
+  type OrchestrationProject,
   ProjectId,
   ProviderInstanceId,
+  type ServerSettings as ServerSettingsShape,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -166,6 +171,46 @@ export const getAutoBootstrapDefaultModelSelection = (): ModelSelection => ({
   model: DEFAULT_MODEL,
 });
 
+/**
+ * Bootstrap default that respects provider access rules. A brand-new
+ * project can never appear in an instance's explicit `allowedProjects`
+ * list, so every scoped instance is unusable there; for an existing
+ * project both its allowlist and each instance's scope apply. Prefers the
+ * canonical codex default, then any enabled unscoped-for-this-target
+ * envelope; `null` when nothing qualifies (project.create accepts a null
+ * default, and callers skip bootstrap thread creation).
+ */
+export const resolveScopedAutoBootstrapModelSelection = (input: {
+  readonly settings: ServerSettingsShape;
+  /** Undefined = the project is being created by this same bootstrap. */
+  readonly project?: OrchestrationProject | undefined;
+}): ModelSelection | null => {
+  const usable = (instanceId: ProviderInstanceId): boolean => {
+    const scope = getProviderInstanceAllowedProjects(input.settings.providerInstances, instanceId);
+    if (input.project === undefined) {
+      return scope === null;
+    }
+    return isProviderInstanceUsableInProject({
+      instanceId,
+      instanceAllowedProjects: scope,
+      projectId: input.project.id,
+      projectAllowedProviderInstances: input.project.allowedProviderInstances ?? null,
+    });
+  };
+  const candidate = getAutoBootstrapDefaultModelSelection();
+  if (usable(candidate.instanceId)) return candidate;
+  for (const [rawInstanceId, envelope] of Object.entries(input.settings.providerInstances)) {
+    const instanceId = rawInstanceId as ProviderInstanceId;
+    if ((envelope.enabled ?? true) && usable(instanceId)) {
+      return {
+        instanceId,
+        model: DEFAULT_MODEL_BY_PROVIDER[envelope.driver] ?? DEFAULT_MODEL,
+      };
+    }
+  }
+  return null;
+};
+
 export const resolveWelcomeBase = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const segments = serverConfig.cwd.split(/[/\\]/).filter(Boolean);
@@ -183,6 +228,7 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const projectionReadModelQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+  const serverSettingsService = yield* ServerSettings.ServerSettingsService;
   const path = yield* Path.Path;
 
   let bootstrapProjectId: ProjectId | undefined;
@@ -190,17 +236,18 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
 
   if (serverConfig.autoBootstrapProjectFromCwd) {
     yield* Effect.gen(function* () {
+      const settings = yield* serverSettingsService.getSettings;
       const existingProject = yield* projectionReadModelQuery.getActiveProjectByWorkspaceRoot(
         serverConfig.cwd,
       );
       let nextProjectId: ProjectId;
-      let nextProjectDefaultModelSelection: ModelSelection;
+      let nextProjectDefaultModelSelection: ModelSelection | null;
 
       if (Option.isNone(existingProject)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         nextProjectId = ProjectId.make(yield* randomUUID);
         const bootstrapProjectTitle = path.basename(serverConfig.cwd) || "project";
-        nextProjectDefaultModelSelection = getAutoBootstrapDefaultModelSelection();
+        nextProjectDefaultModelSelection = resolveScopedAutoBootstrapModelSelection({ settings });
         yield* orchestrationEngine.dispatch({
           type: "project.create",
           commandId: CommandId.make(yield* randomUUID),
@@ -213,7 +260,24 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
       } else {
         nextProjectId = existingProject.value.id;
         nextProjectDefaultModelSelection =
-          existingProject.value.defaultModelSelection ?? getAutoBootstrapDefaultModelSelection();
+          existingProject.value.defaultModelSelection ??
+          resolveScopedAutoBootstrapModelSelection({
+            settings,
+            project: existingProject.value,
+          });
+      }
+
+      // No usable provider for this target (every configured instance is
+      // scoped elsewhere or excluded by the project's allowlist): create
+      // the project without a default and skip the bootstrap thread — the
+      // decider would reject its selection anyway.
+      if (nextProjectDefaultModelSelection === null) {
+        yield* Effect.logWarning(
+          "auto-bootstrap skipped thread creation: no provider instance is usable here",
+          { projectId: nextProjectId },
+        );
+        bootstrapProjectId = nextProjectId;
+        return;
       }
 
       const existingThreadId =

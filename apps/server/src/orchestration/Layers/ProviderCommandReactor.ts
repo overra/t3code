@@ -410,6 +410,12 @@ const make = Effect.gen(function* () {
       });
     if (usable(input.candidate.instanceId)) return input.candidate;
     if (usable(thread.modelSelection.instanceId)) return thread.modelSelection;
+    if (
+      project.defaultModelSelection !== null &&
+      usable(project.defaultModelSelection.instanceId)
+    ) {
+      return project.defaultModelSelection;
+    }
     return undefined;
   });
 
@@ -585,42 +591,48 @@ const make = Effect.gen(function* () {
     // arrive from persisted thread or session state (e.g. a thread created
     // before either restriction existed).
     //
-    // The gated instance is the one this turn will actually run on: an
-    // explicit request wins (subject to the switch-compatibility checks
-    // above), otherwise a live session keeps serving turns regardless of the
-    // persisted thread selection — so a since-restricted active session must
-    // be gated even when `thread.modelSelection` still names an allowed
-    // instance, while an explicit switch AWAY from a restricted session must
-    // stay possible.
+    // Gate every instance this invocation could run the turn on. An explicit
+    // request wins (subject to the switch-compatibility checks above), so
+    // only the requested instance is gated — an explicit switch AWAY from a
+    // restricted session must stay possible. Without an explicit request the
+    // turn normally rides the active session (`currentInstanceId`), but a
+    // runtime/cwd mismatch can restart the session on the persisted
+    // `desiredInstanceId` within this same invocation — so BOTH are gated
+    // when they differ, rather than predicting which path executes.
     if (project !== undefined) {
-      const effectiveInstanceId =
-        requestedModelSelection === undefined &&
-        activeThreadSession !== null &&
-        activeSession !== undefined
-          ? currentInstanceId
-          : desiredInstanceId;
-      const restriction = getProviderInstanceProjectRestriction({
-        instanceId: effectiveInstanceId,
-        instanceAllowedProjects: getProviderInstanceAllowedProjects(
-          (yield* serverSettingsService.getSettings).providerInstances,
-          effectiveInstanceId,
-        ),
-        projectId: thread.projectId,
-        projectAllowedProviderInstances: project.allowedProviderInstances,
-      });
-      if (restriction === "project-allowlist") {
-        return yield* new ProviderAdapterRequestError({
-          provider: preferredProvider,
-          method: "thread.turn.start",
-          detail: `Provider instance '${effectiveInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+      const gatedInstanceIds =
+        requestedModelSelection !== undefined
+          ? [desiredInstanceId]
+          : activeThreadSession !== null && activeSession !== undefined
+            ? currentInstanceId === desiredInstanceId
+              ? [currentInstanceId]
+              : [currentInstanceId, desiredInstanceId]
+            : [desiredInstanceId];
+      const providerInstances = (yield* serverSettingsService.getSettings).providerInstances;
+      for (const gatedInstanceId of gatedInstanceIds) {
+        const restriction = getProviderInstanceProjectRestriction({
+          instanceId: gatedInstanceId,
+          instanceAllowedProjects: getProviderInstanceAllowedProjects(
+            providerInstances,
+            gatedInstanceId,
+          ),
+          projectId: thread.projectId,
+          projectAllowedProviderInstances: project.allowedProviderInstances,
         });
-      }
-      if (restriction === "instance-scope") {
-        return yield* new ProviderAdapterRequestError({
-          provider: preferredProvider,
-          method: "thread.turn.start",
-          detail: `Provider instance '${effectiveInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
-        });
+        if (restriction === "project-allowlist") {
+          return yield* new ProviderAdapterRequestError({
+            provider: preferredProvider,
+            method: "thread.turn.start",
+            detail: `Provider instance '${gatedInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+          });
+        }
+        if (restriction === "instance-scope") {
+          return yield* new ProviderAdapterRequestError({
+            provider: preferredProvider,
+            method: "thread.turn.start",
+            detail: `Provider instance '${gatedInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
+          });
+        }
       }
     }
     const effectiveCwd = resolveThreadWorkspaceCwd({

@@ -614,6 +614,25 @@ export const make = Effect.gen(function* () {
       readonly candidate: ModelSelection;
       readonly providerInstances: ProviderInstanceConfigMap;
     }) {
+      // Git accepts any repository subdirectory as cwd; project and worktree
+      // records store the repository root, so match on the resolved toplevel
+      // rather than the literal cwd. When resolution fails, the literal cwd
+      // is still tried — it may itself be the root.
+      const repositoryRoot = yield* gitCore
+        .execute({
+          operation: "GitManager.resolveWriterRepositoryRoot",
+          cwd: input.cwd,
+          args: ["rev-parse", "--show-toplevel"],
+        })
+        .pipe(
+          Effect.map((result) => result.stdout.trim()),
+          Effect.map((root) => (root.length > 0 ? root : input.cwd)),
+          Effect.orElseSucceed(() => input.cwd),
+        );
+      // Fail CLOSED on projection failures: this clamp protects repository
+      // content from restricted providers, so "cannot verify" must block
+      // generation (callers surface guidance; manual messages still work)
+      // rather than fall back to the unclamped global writer.
       const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("git manager could not resolve project access for writer selection", {
@@ -622,8 +641,8 @@ export const make = Effect.gen(function* () {
           }).pipe(Effect.as(undefined)),
         ),
       );
-      if (snapshot === undefined) return input.candidate;
-      const normalizedCwd = normalizeProjectPathForComparison(input.cwd);
+      if (snapshot === undefined) return undefined;
+      const normalizedCwd = normalizeProjectPathForComparison(repositoryRoot);
       const owningThread = snapshot.threads.find(
         (thread) =>
           thread.worktreePath !== null &&

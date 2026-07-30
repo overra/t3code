@@ -41,7 +41,19 @@ export interface ProviderScopeProjectOption {
 export interface ProviderScopePeerInstance {
   readonly instanceId: ProviderInstanceId;
   readonly enabled: boolean;
+  /** From the live snapshot: false for unavailable shadows (missing fork drivers, invalid config). */
+  readonly available: boolean;
   readonly allowedProjects: ReadonlyArray<ProjectId> | null;
+}
+
+function projectScopesEqual(
+  a: ReadonlyArray<ProjectId> | null,
+  b: ReadonlyArray<ProjectId> | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.length !== b.length) return false;
+  const ids = new Set<ProjectId>(a);
+  return b.every((id) => ids.has(id));
 }
 
 function strandedProjectTitles(input: {
@@ -53,7 +65,7 @@ function strandedProjectTitles(input: {
   const titles: string[] = [];
   for (const project of input.projects) {
     const hasUsableProvider = input.peerInstances.some((peer) => {
-      if (!peer.enabled) return false;
+      if (!peer.enabled || !peer.available) return false;
       const scope =
         peer.instanceId === input.instanceId ? input.candidateScope : peer.allowedProjects;
       return isProviderInstanceUsableInProject({
@@ -81,14 +93,23 @@ export function ProviderProjectScopeSection(props: {
   const { projects, onChange } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the settings prop (which lags the settings round-trip and would
-  // resurrect the previous edit). Any prop change — the write's echo or an
-  // external edit — clears the overlay.
+  // resurrect the previous edit). The overlay clears only when the prop
+  // catches up to the pending value — an intermediate echo from an earlier
+  // write must not expose stale state under a newer edit — with a timeout
+  // backstop for rejected writes and lost echoes.
   const [pendingScope, setPendingScope] = useState<ReadonlyArray<ProjectId> | null | undefined>(
     undefined,
   );
   useEffect(() => {
-    setPendingScope(undefined);
-  }, [props.allowedProjects]);
+    if (pendingScope !== undefined && projectScopesEqual(props.allowedProjects, pendingScope)) {
+      setPendingScope(undefined);
+    }
+  }, [props.allowedProjects, pendingScope]);
+  useEffect(() => {
+    if (pendingScope === undefined) return;
+    const timer = window.setTimeout(() => setPendingScope(undefined), 5000);
+    return () => window.clearTimeout(timer);
+  }, [pendingScope]);
   const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
   const submit = (next: ReadonlyArray<ProjectId> | null) => {
     setPendingScope(next);

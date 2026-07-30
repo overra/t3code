@@ -15,7 +15,7 @@ import * as Cause from "effect/Cause";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { scopedThreadKey } from "../lib/scopedEntities";
+import { scopedProjectKey, scopedThreadKey } from "../lib/scopedEntities";
 import { buildProjectThreadStartTurnInput } from "../lib/projectThreadStartTurn";
 import { toUploadChatImageAttachments } from "../lib/composerImages";
 import { randomHex } from "../lib/uuid";
@@ -26,7 +26,7 @@ import {
   ensureThreadOutboxLoaded,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
-import { appendComposerDraftText } from "./use-composer-drafts";
+import { appendComposerDraftAttachments, appendComposerDraftText } from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -143,31 +143,54 @@ export function useThreadOutboxDrain(): void {
       });
       return retry;
     };
+    /**
+     * A deterministic rejection (e.g. provider access changed while the
+     * entry sat in the outbox) means this entry will never send — but the
+     * user's content must not vanish with it. Text and attachments are
+     * restored into the composer draft the entry came from: the thread's
+     * draft for a message on an existing thread, the project's new-task
+     * draft for a queued creation (that thread was never created). The
+     * poisoned entry is then removed so it stops blocking the FIFO.
+     */
+    const discardPoisonedEntry = async (): Promise<void> => {
+      // Mirrors the new-task flow's draft key shape
+      // (`new-task:${scopedProjectKey(...)}` in new-task-flow-provider).
+      const restoreDraftKey =
+        queuedMessage.creation !== undefined
+          ? `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`
+          : scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId);
+      if (queuedMessage.text.trim().length > 0) {
+        appendComposerDraftText(restoreDraftKey, queuedMessage.text);
+      }
+      if (queuedMessage.attachments.length > 0) {
+        appendComposerDraftAttachments(restoreDraftKey, queuedMessage.attachments);
+      }
+      try {
+        await removeThreadOutboxMessage(queuedMessage);
+      } catch (error) {
+        console.warn("[thread-outbox] failed to remove poisoned queued message", {
+          environmentId: queuedMessage.environmentId,
+          threadId: queuedMessage.threadId,
+          messageId: queuedMessage.messageId,
+          error,
+        });
+      }
+    };
     const completeDelivery = async (
       deliveryResult: AtomCommandResult<unknown, unknown>,
     ): Promise<boolean> => {
       const failed = AsyncResult.isFailure(deliveryResult);
-      if (failed && reportFailure(deliveryResult, "start-turn")) {
-        return false;
-      }
       if (failed) {
-        // Deterministic rejection (e.g. provider access changed while the
-        // message sat in the outbox): this entry will never send, but the
-        // user's words must not vanish with it — put the text back into the
-        // thread's composer draft before dropping the poisoned entry.
-        // Image attachments are not restored; the draft store only holds
-        // local picks and the originals may no longer exist.
-        if (queuedMessage.text.trim().length > 0) {
-          appendComposerDraftText(
-            scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId),
-            queuedMessage.text,
-          );
+        if (reportFailure(deliveryResult, "start-turn")) {
+          return false;
         }
+        await discardPoisonedEntry();
+        return false;
       }
 
       try {
         await removeThreadOutboxMessage(queuedMessage);
-        return !failed;
+        return true;
       } catch (error) {
         console.warn("[thread-outbox] failed to remove delivered queued message", {
           environmentId: queuedMessage.environmentId,
@@ -178,13 +201,27 @@ export function useThreadOutboxDrain(): void {
         return false;
       }
     };
-    return { reportFailure, completeDelivery };
+    return { reportFailure, completeDelivery, discardPoisonedEntry };
   }, []);
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage, thread: EnvironmentThreadShell) => {
       const settings = resolveQueuedThreadSettings(queuedMessage, thread);
-      const { reportFailure, completeDelivery } = makeDeliveryHelpers(queuedMessage);
+      const { reportFailure, completeDelivery, discardPoisonedEntry } =
+        makeDeliveryHelpers(queuedMessage);
+      // A deterministic settings-sync rejection (e.g. the queued selection
+      // is no longer allowed in this project) can never succeed on retry;
+      // leaving the entry queued would invisibly block every later message
+      // in this thread's FIFO. Restore the content and drop the entry, same
+      // as a deterministic start-turn failure.
+      const failSettingsSync = async (
+        result: AtomCommandResult<unknown, unknown>,
+      ): Promise<false> => {
+        if (!reportFailure(result, "settings-sync")) {
+          await discardPoisonedEntry();
+        }
+        return false;
+      };
 
       if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
         const updateResult = await updateThreadMetadata({
@@ -196,8 +233,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(updateResult)) {
-          reportFailure(updateResult, "settings-sync");
-          return false;
+          return failSettingsSync(updateResult);
         }
       }
 
@@ -212,8 +248,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(runtimeResult)) {
-          reportFailure(runtimeResult, "settings-sync");
-          return false;
+          return failSettingsSync(runtimeResult);
         }
       }
 
@@ -228,8 +263,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(interactionResult)) {
-          reportFailure(interactionResult, "settings-sync");
-          return false;
+          return failSettingsSync(interactionResult);
         }
       }
 
