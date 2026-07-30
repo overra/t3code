@@ -366,12 +366,14 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       buildModelOptions(
         selectedEnvironmentServerConfig,
         selectedProjectDraft.modelSelection ?? selectedProject?.defaultModelSelection ?? null,
+        selectedProject
+          ? {
+              id: selectedProject.id,
+              allowedProviderInstances: selectedProject.allowedProviderInstances ?? null,
+            }
+          : null,
       ),
-    [
-      selectedEnvironmentServerConfig,
-      selectedProject?.defaultModelSelection,
-      selectedProjectDraft.modelSelection,
-    ],
+    [selectedEnvironmentServerConfig, selectedProject, selectedProjectDraft.modelSelection],
   );
 
   const selectedModel =

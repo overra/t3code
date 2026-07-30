@@ -12,7 +12,11 @@ import {
   scopeThreadRef,
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, SidebarProjectGroupingMode } from "@t3tools/contracts";
+import type {
+  ProviderInstanceId,
+  ScopedThreadRef,
+  SidebarProjectGroupingMode,
+} from "@t3tools/contracts";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
@@ -138,12 +142,18 @@ import {
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";
-import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../providerInstances";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  sortProviderInstanceEntries,
+  type ProviderInstanceEntry,
+} from "../providerInstances";
 import { primaryServerProvidersAtom } from "../state/server";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { CommandDialogTrigger } from "./ui/command";
 import { Button } from "./ui/button";
+import { Checkbox } from "./ui/checkbox";
 import {
   Dialog,
   DialogDescription,
@@ -1059,6 +1069,127 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
 });
 
+/**
+ * Per-project provider allowlist editor in the project settings dialog.
+ * Every checkbox reflects one configured provider instance of the member's
+ * environment. All-checked is stored as `null` (unrestricted, so instances
+ * added later are allowed automatically); any partial selection is stored as
+ * an explicit instance-id list. The last effectively-usable instance cannot
+ * be unchecked — an empty effective set would leave the project unable to
+ * start threads, and the server rejects an empty allowlist.
+ *
+ * Rows for instances whose own project scope (Settings → Providers) excludes
+ * this project render disabled with that verdict, so the dialog always shows
+ * the *effective* policy even though it only edits the project's half.
+ */
+function ProjectAllowedProvidersControl(props: {
+  member: SidebarProjectGroupMember;
+  providerEntries: ReadonlyArray<ProviderInstanceEntry>;
+  onUpdate: (
+    member: SidebarProjectGroupMember,
+    allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
+  ) => void;
+}) {
+  const { member, providerEntries, onUpdate } = props;
+  const allowed = member.allowedProviderInstances ?? null;
+  const checkedIds = useMemo(
+    () =>
+      allowed === null
+        ? new Set<ProviderInstanceId>(providerEntries.map((entry) => entry.instanceId))
+        : new Set<ProviderInstanceId>(allowed),
+    [allowed, providerEntries],
+  );
+  const isScopeExcluded = (entry: ProviderInstanceEntry): boolean =>
+    entry.allowedProjects !== null && !entry.allowedProjects.includes(member.id);
+  const effectiveCheckedCount = providerEntries.filter(
+    (entry) => checkedIds.has(entry.instanceId) && !isScopeExcluded(entry),
+  ).length;
+
+  const toggle = (instanceId: ProviderInstanceId, checked: boolean) => {
+    const next = new Set(checkedIds);
+    if (checked) {
+      next.add(instanceId);
+    } else {
+      next.delete(instanceId);
+    }
+    if (!providerEntries.some((entry) => next.has(entry.instanceId) && !isScopeExcluded(entry))) {
+      return;
+    }
+    // Ids in the allowlist without a configured instance survive toggles
+    // verbatim; collapsing to `null` (everything configured is checked)
+    // intentionally drops them, since "all providers" supersedes the list.
+    const coversAllConfigured = providerEntries.every((entry) => next.has(entry.instanceId));
+    onUpdate(member, coversAllConfigured ? null : [...next]);
+  };
+
+  if (providerEntries.length === 0) {
+    return (
+      <div className="grid min-w-0 gap-1.5">
+        <span className="font-medium text-foreground">Allowed providers</span>
+        <p className="text-base text-muted-foreground sm:text-sm">
+          Provider list unavailable for this environment.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid min-w-0 gap-1.5">
+      <span className="font-medium text-foreground">Allowed providers</span>
+      <p className="text-base text-pretty text-muted-foreground sm:text-sm">
+        {allowed === null
+          ? "New threads in this project can use any provider."
+          : "New threads in this project can only use the checked providers."}
+      </p>
+      <div className="grid gap-1 sm:grid-cols-2">
+        {providerEntries.map((entry) => {
+          const isChecked = checkedIds.has(entry.instanceId);
+          const scopeExcluded = isScopeExcluded(entry);
+          const isLastChecked = isChecked && !scopeExcluded && effectiveCheckedCount === 1;
+          return (
+            <label
+              key={entry.instanceId}
+              className={cn(
+                "flex min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border/60 px-2.5 py-1.5 transition-colors hover:bg-muted/40",
+                scopeExcluded && "cursor-default opacity-60 hover:bg-transparent",
+              )}
+              title={
+                scopeExcluded
+                  ? `${entry.displayName} is limited to other projects. Change its project scope in Settings → Providers.`
+                  : isLastChecked
+                    ? "At least one provider must stay allowed."
+                    : entry.displayName
+              }
+            >
+              <Checkbox
+                checked={isChecked}
+                disabled={scopeExcluded || isLastChecked}
+                onCheckedChange={(checked) => toggle(entry.instanceId, checked === true)}
+                aria-label={`Allow ${entry.displayName} in this project`}
+              />
+              <ProviderInstanceIcon
+                driverKind={entry.driverKind}
+                displayName={entry.displayName}
+                accentColor={entry.accentColor}
+                className="size-4"
+                iconClassName="size-4"
+              />
+              <span className="grid min-w-0 gap-0">
+                <span className="min-w-0 truncate text-base sm:text-sm">{entry.displayName}</span>
+                {scopeExcluded ? (
+                  <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    Excluded by provider setting
+                  </span>
+                ) : null}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function latestTurnDiff(
   thread: SidebarThreadSummary,
 ): { insertions: number; deletions: number } | null {
@@ -1420,6 +1551,41 @@ export default function SidebarV2() {
           stackedThreadToast({
             type: "error",
             title: "Failed to rename project",
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+        );
+      }
+    },
+    [updateProject],
+  );
+
+  const updateProjectAllowedProviders = useCallback(
+    async (
+      member: SidebarProjectGroupMember,
+      allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
+    ) => {
+      const defaultSelection = member.defaultModelSelection ?? null;
+      const defaultDisallowed =
+        allowedProviderInstances !== null &&
+        defaultSelection !== null &&
+        !allowedProviderInstances.includes(defaultSelection.instanceId);
+      const result = await updateProject({
+        environmentId: member.environmentId,
+        input: {
+          projectId: member.id,
+          allowedProviderInstances,
+          // The server rejects an allowlist that excludes the project's
+          // default model selection; dropping the default in the same
+          // command keeps the pair consistent.
+          ...(defaultDisallowed ? { defaultModelSelection: null } : {}),
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Failed to update allowed providers",
             description: error instanceof Error ? error.message : "An error occurred.",
           }),
         );
@@ -2867,6 +3033,37 @@ export default function SidebarV2() {
                       </Select>
                     </label>
                   </div>
+                  <ProjectAllowedProvidersControl
+                    // `projectActionsTarget` is a snapshot from dialog-open;
+                    // overlay the live project record so the allowlist
+                    // checkboxes track the shell stream instead of freezing
+                    // at their open-time state.
+                    member={(() => {
+                      const liveProject = projects.find(
+                        (project) =>
+                          project.environmentId === member.environmentId &&
+                          project.id === member.id,
+                      );
+                      return liveProject ? { ...member, ...liveProject } : member;
+                    })()}
+                    providerEntries={sortProviderInstanceEntries(
+                      (() => {
+                        const memberServerConfig = serverConfigs.get(member.environmentId);
+                        const entries = deriveProviderInstanceEntries(
+                          memberServerConfig?.providers ?? [],
+                        );
+                        // The settings overlay stamps each entry's project
+                        // scope (and authoritative enabled state) so the
+                        // control can render cross-rule verdicts.
+                        return memberServerConfig
+                          ? applyProviderInstanceSettings(entries, memberServerConfig.settings)
+                          : entries;
+                      })(),
+                    )}
+                    onUpdate={(target, allowedProviderInstances) => {
+                      void updateProjectAllowedProviders(target, allowedProviderInstances);
+                    }}
+                  />
                   {projectActionsTarget.memberProjects.length > 1 ? (
                     <div className="flex justify-end">
                       <Button

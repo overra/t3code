@@ -769,6 +769,14 @@ function ThreadRouteContent(
           activeThreadBusy={composer.activeThreadBusy}
           environmentId={selectedThread.environmentId}
           projectWorkspaceRoot={selectedThreadProject?.workspaceRoot ?? null}
+          project={
+            selectedThreadProject
+              ? {
+                  id: selectedThreadProject.id,
+                  allowedProviderInstances: selectedThreadProject.allowedProviderInstances ?? null,
+                }
+              : null
+          }
           threadCwd={selectedThreadCwd}
           selectedThreadQueueCount={composer.selectedThreadQueueCount}
           layoutVariant={layout.variant}

@@ -5936,6 +5936,10 @@ function ChatViewContent(props: ChatViewProps) {
                             activeProjectDefaultModelSelection={
                               activeProject?.defaultModelSelection
                             }
+                            activeProjectId={activeProject?.id}
+                            activeProjectAllowedProviderInstances={
+                              activeProject?.allowedProviderInstances
+                            }
                             activeThreadModelSelection={activeThread?.modelSelection}
                             activeThreadActivities={activeThread?.activities}
                             resolvedTheme={resolvedTheme}

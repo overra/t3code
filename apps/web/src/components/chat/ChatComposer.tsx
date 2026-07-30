@@ -3,6 +3,7 @@ import type {
   EnvironmentId,
   ModelSelection,
   PreviewAnnotationPayload,
+  ProjectId,
   ProviderApprovalDecision,
   ProviderInteractionMode,
   ResolvedKeybindingsConfig,
@@ -19,6 +20,7 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
+import { useNavigate } from "@tanstack/react-router";
 import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import {
@@ -186,11 +188,15 @@ import { getProviderDisplayName, getProviderInteractionModeToggle } from "../../
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  filterProviderInstanceEntriesForProject,
+  getProviderInstanceProjectRestrictionForEntry,
+  isProviderInstancePickerVisible,
   NO_PROVIDER_MODEL_SELECTION,
   resolveProviderDriverKindForInstanceSelection,
   resolveSelectableProviderInstanceEntry,
   sortProviderInstanceEntries,
   type ProviderInstanceEntry,
+  type ProviderPickerProjectContext,
 } from "../../providerInstances";
 import { type AppModelOption, getAppModelOptionsForInstance } from "../../modelSelection";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
@@ -566,6 +572,8 @@ export interface ChatComposerProps {
   lockedProvider: ProviderDriverKind | null;
   providerStatuses: ServerProvider[];
   activeProjectDefaultModelSelection: ModelSelection | null | undefined;
+  activeProjectId: ProjectId | null | undefined;
+  activeProjectAllowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null | undefined;
   activeThreadModelSelection: ModelSelection | null | undefined;
 
   // Context window
@@ -661,6 +669,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     lockedProvider,
     providerStatuses,
     activeProjectDefaultModelSelection,
+    activeProjectId,
+    activeProjectAllowedProviderInstances,
     activeThreadModelSelection,
     activeThreadActivities,
     resolvedTheme,
@@ -738,6 +748,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (store) => store.syncPersistedAttachments,
   );
   const getComposerDraft = useComposerDraftStore((store) => store.getComposerDraft);
+  const navigate = useNavigate();
+  const openProviderSettings = useCallback(() => {
+    void navigate({ to: "/settings/providers" });
+  }, [navigate]);
 
   // ------------------------------------------------------------------
   // Model state
@@ -745,13 +759,55 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Instance-aware projection of the wire provider list. One entry per
   // configured instance (default built-in + any custom `providerInstances.*`),
   // sorted default-first per driver kind for a stable picker order.
-  const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
+  // Restricted projects narrow the entries here, at the source, so every
+  // downstream selection fallback stays inside the project's provider access
+  // rules (project allowlist ∩ per-instance project scope).
+  const activeProjectProviderContext = useMemo<ProviderPickerProjectContext | null>(
+    () =>
+      activeProjectId == null
+        ? null
+        : { id: activeProjectId, allowedProviderInstances: activeProjectAllowedProviderInstances },
+    [activeProjectAllowedProviderInstances, activeProjectId],
+  );
+  const configuredProviderInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
     () =>
       sortProviderInstanceEntries(
         applyProviderInstanceSettings(deriveProviderInstanceEntries(providerStatuses), settings),
       ),
     [providerStatuses, settings],
   );
+  const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
+    () =>
+      filterProviderInstanceEntriesForProject(
+        configuredProviderInstanceEntries,
+        activeProjectProviderContext,
+      ),
+    [activeProjectProviderContext, configuredProviderInstanceEntries],
+  );
+  // Enabled instances hidden by a project rule, with the rule that hid them —
+  // rendered as an explanatory picker footer so restrictions never read as a
+  // provider silently vanishing.
+  const restrictedProviderInstanceNotes = useMemo<
+    ReadonlyArray<{
+      readonly entry: ProviderInstanceEntry;
+      readonly cause: "project-allowlist" | "instance-scope";
+    }>
+  >(() => {
+    if (activeProjectProviderContext === null) return [];
+    const notes: Array<{
+      entry: ProviderInstanceEntry;
+      cause: "project-allowlist" | "instance-scope";
+    }> = [];
+    for (const entry of configuredProviderInstanceEntries) {
+      if (!isProviderInstancePickerVisible(entry)) continue;
+      const cause = getProviderInstanceProjectRestrictionForEntry(
+        entry,
+        activeProjectProviderContext,
+      );
+      if (cause !== null) notes.push({ entry, cause });
+    }
+    return notes;
+  }, [activeProjectProviderContext, configuredProviderInstanceEntries]);
   const selectedProviderByThreadId = composerDraft.activeProvider ?? null;
   const threadProvider =
     activeThread?.session?.providerInstanceId ??
@@ -3157,6 +3213,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       setIsComposerModelPickerOpen(open);
                     }}
                     getModelDisabledReason={getModelDisabledReason}
+                    restrictedProviderNotes={restrictedProviderInstanceNotes}
+                    onOpenProviderSettings={openProviderSettings}
                     onInstanceModelChange={onProviderModelSelect}
                   />
                 )}

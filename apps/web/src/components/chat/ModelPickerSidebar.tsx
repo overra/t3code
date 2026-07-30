@@ -1,6 +1,6 @@
 import { type ProviderInstanceId } from "@t3tools/contracts";
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { SparklesIcon, StarIcon } from "lucide-react";
+import { SettingsIcon, SparklesIcon, StarIcon } from "lucide-react";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
@@ -57,6 +57,12 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
    * instances are never flagged — the user just made them).
    */
   newBadgeInstanceIds?: ReadonlySet<ProviderInstanceId>;
+  /**
+   * When set, a gear entry pinned below the rail jumps to Settings →
+   * Providers — the fix-it path for anything the rail shows as disabled,
+   * unavailable, or restricted.
+   */
+  onOpenProviderSettings?: () => void;
 }) {
   const handleSelect = (instanceId: ProviderInstanceId | "favorites") => {
     props.onSelectInstance(instanceId);
@@ -89,8 +95,11 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
   }, [props.instanceEntries, props.selectedInstanceId, showFavorites]);
 
   return (
-    <div className="w-11 shrink-0 overflow-hidden bg-muted/30" data-model-picker-sidebar="true">
-      <div className="h-full overflow-y-auto overscroll-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div
+      className="flex w-11 shrink-0 flex-col overflow-hidden bg-muted/30"
+      data-model-picker-sidebar="true"
+    >
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         <div ref={sidebarContentRef} className="relative flex min-h-full flex-col gap-1 p-1">
           {selectedIndicatorTop !== null ? (
             <div
@@ -234,6 +243,32 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
           })}
         </div>
       </div>
+      {props.onOpenProviderSettings ? (
+        <div className="shrink-0 border-t border-border/70 p-1">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  className="relative isolate flex w-full cursor-pointer aspect-square items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[color-mix(in_srgb,var(--popover)_90%,var(--foreground))] hover:text-foreground focus-visible:bg-[color-mix(in_srgb,var(--popover)_90%,var(--foreground))] focus-visible:outline-none"
+                  onClick={props.onOpenProviderSettings}
+                  type="button"
+                  aria-label="Provider settings"
+                >
+                  <SettingsIcon className="size-4.5 shrink-0" aria-hidden />
+                </button>
+              }
+            />
+            <TooltipPopup
+              side={PICKER_TOOLTIP_SIDE}
+              sideOffset={PICKER_TOOLTIP_SIDE_OFFSET}
+              align="center"
+              className={PICKER_TOOLTIP_CLASS}
+            >
+              Provider settings
+            </TooltipPopup>
+          </Tooltip>
+        </div>
+      ) : null}
     </div>
   );
 });

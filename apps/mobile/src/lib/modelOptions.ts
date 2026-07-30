@@ -1,12 +1,27 @@
 import type {
   ModelCapabilities,
   ModelSelection,
+  ProjectId,
+  ProviderInstanceId,
   ServerConfig as T3ServerConfig,
+} from "@t3tools/contracts";
+import {
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
 } from "@t3tools/contracts";
 import {
   buildProviderOptionSelectionsFromDescriptors,
   getProviderOptionDescriptors,
 } from "@t3tools/shared/model";
+
+/**
+ * Project context for provider-access filtering: identity plus the project's
+ * own allowlist. `null` = no project context = unfiltered.
+ */
+export type ModelOptionsProjectContext = {
+  readonly id: ProjectId;
+  readonly allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null;
+};
 
 export type ModelOption = {
   readonly key: string;
@@ -61,11 +76,31 @@ function normalizeSelectionOptions(
 export function buildModelOptions(
   config: T3ServerConfig | null | undefined,
   fallbackModelSelection: ModelSelection | null,
+  // Filters by the project's provider access rules (project allowlist ∩
+  // per-instance project scope) via the shared contracts predicate. The
+  // fallback selection is intentionally not filtered: it represents the
+  // thread's current state, which stays visible even when the project no
+  // longer allows that instance.
+  project?: ModelOptionsProjectContext | null,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
 
   for (const provider of config?.providers ?? []) {
     if (!provider.enabled || !provider.installed || provider.auth.status === "unauthenticated") {
+      continue;
+    }
+    if (
+      project != null &&
+      !isProviderInstanceUsableInProject({
+        instanceId: provider.instanceId,
+        instanceAllowedProjects: getProviderInstanceAllowedProjects(
+          config?.settings.providerInstances,
+          provider.instanceId,
+        ),
+        projectId: project.id,
+        projectAllowedProviderInstances: project.allowedProviderInstances,
+      })
+    ) {
       continue;
     }
 

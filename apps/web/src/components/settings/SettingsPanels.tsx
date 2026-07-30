@@ -117,6 +117,10 @@ import {
   type ProviderUpdateCandidate,
 } from "../ProviderUpdateLaunchNotification.logic";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
+import type {
+  ProviderScopePeerInstance,
+  ProviderScopeProjectOption,
+} from "./ProviderProjectScopeSection";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import {
   backgroundActivitySharedPolicySettings,
@@ -1694,6 +1698,23 @@ export function ProviderSettingsPanel() {
   const updateSettings = useUpdatePrimarySettings();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
   const primaryEnvironment = usePrimaryEnvironment();
+  const allProjects = useProjects();
+  // Project options for the per-instance "Projects" scope control. Provider
+  // settings edit the primary environment's settings, so only its projects
+  // are meaningful scope targets.
+  const scopeProjectOptions = useMemo<ReadonlyArray<ProviderScopeProjectOption>>(
+    () =>
+      primaryEnvironment === null
+        ? []
+        : allProjects
+            .filter((project) => project.environmentId === primaryEnvironment.environmentId)
+            .map((project) => ({
+              id: project.id,
+              title: project.title,
+              allowedProviderInstances: project.allowedProviderInstances ?? null,
+            })),
+    [allProjects, primaryEnvironment],
+  );
   const refreshServerProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
@@ -1891,6 +1912,15 @@ export function ProviderSettingsPanel() {
       });
     }
   }
+
+  // Effective enabled/scope state of every configured instance, fed to each
+  // card's Projects control so narrowing one instance's scope can warn about
+  // projects that would be left with no usable provider at all.
+  const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.map((row) => ({
+    instanceId: row.instanceId,
+    enabled: row.instance.enabled ?? true,
+    allowedProjects: row.instance.allowedProjects ?? null,
+  }));
 
   const updateProviderInstance = (
     row: InstanceRow,
@@ -2193,6 +2223,8 @@ export function ProviderSettingsPanel() {
                   : undefined
               }
               isUpdating={showInlineUpdateButton ? isDriverUpdateRunning : undefined}
+              projects={scopeProjectOptions}
+              peerInstances={scopePeerInstances}
             />
           );
         })}

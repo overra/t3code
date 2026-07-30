@@ -15,6 +15,7 @@ import * as Result from "effect/Result";
 import { useState, type ReactNode } from "react";
 import {
   isProviderDriverKind,
+  type ProjectId,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   type ProviderInstanceId,
@@ -26,6 +27,11 @@ import {
 import { cn } from "../../lib/utils";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { normalizeProviderAccentColor } from "../../providerInstances";
+import {
+  ProviderProjectScopeSection,
+  type ProviderScopePeerInstance,
+  type ProviderScopeProjectOption,
+} from "./ProviderProjectScopeSection";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
@@ -349,6 +355,14 @@ interface ProviderInstanceCardProps {
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
   readonly onRunUpdate?: (() => void) | undefined;
   readonly isUpdating?: boolean | undefined;
+  /**
+   * Projects of the environment this settings surface edits, for the
+   * per-instance project scope control. Omitted (together with
+   * `peerInstances`) the Projects row is not rendered.
+   */
+  readonly projects?: ReadonlyArray<ProviderScopeProjectOption> | undefined;
+  /** Every configured instance's effective enabled/scope state, this one included. */
+  readonly peerInstances?: ReadonlyArray<ProviderScopePeerInstance> | undefined;
 }
 
 /**
@@ -393,6 +407,8 @@ export function ProviderInstanceCard({
   onModelOrderChange,
   onRunUpdate,
   isUpdating = false,
+  projects,
+  peerInstances,
 }: ProviderInstanceCardProps) {
   const enabled = instance.enabled ?? true;
   // The server-reported status wins when present; otherwise fall back to
@@ -464,6 +480,15 @@ export function ProviderInstanceCard({
 
   const updateEnabled = (value: boolean) => {
     onUpdate({ ...instance, enabled: value });
+  };
+
+  const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) => {
+    const { allowedProjects: _omit, ...rest } = instance;
+    onUpdate(
+      value !== null
+        ? ({ ...rest, allowedProjects: value } as ProviderInstanceConfig)
+        : (rest as ProviderInstanceConfig),
+    );
   };
 
   const updateAccentColor = (value: string) => {
@@ -756,6 +781,17 @@ export function ProviderInstanceCard({
                 description="Used to distinguish this instance in picker rails and model lists."
               />
             </div>
+
+            {projects !== undefined && peerInstances !== undefined ? (
+              <ProviderProjectScopeSection
+                displayName={displayName}
+                allowedProjects={instance.allowedProjects ?? null}
+                projects={projects}
+                instanceId={instanceId}
+                peerInstances={peerInstances}
+                onChange={updateAllowedProjects}
+              />
+            ) : null}
 
             <div>
               <ProviderEnvironmentSection
