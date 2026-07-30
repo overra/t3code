@@ -1,10 +1,12 @@
-import type {
-  OrchestrationCommand,
-  OrchestrationProject,
-  OrchestrationReadModel,
-  OrchestrationThread,
-  ProjectId,
-  ThreadId,
+import {
+  isProviderInstanceAllowedForProject,
+  type OrchestrationCommand,
+  type OrchestrationProject,
+  type OrchestrationReadModel,
+  type OrchestrationThread,
+  type ProjectId,
+  type ProviderInstanceId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
@@ -92,6 +94,30 @@ export function requireActiveProjectWorkspaceRootAbsent(input: {
     invariantError(
       input.command.type,
       `Active project '${existingProject.id}' already exists for workspace root '${normalizedWorkspaceRoot}'.`,
+    ),
+  );
+}
+
+/**
+ * Reject a provider instance the project's `allowedProviderInstances` list
+ * does not include. Projects without a list (null/undefined) accept every
+ * instance. Callers pass the already-loaded project so a single command
+ * validates against one consistent read-model view.
+ */
+export function requireProviderInstanceAllowedForProject(input: {
+  readonly command: OrchestrationCommand;
+  readonly project: OrchestrationProject;
+  readonly instanceId: ProviderInstanceId;
+}): Effect.Effect<void, OrchestrationCommandInvariantError> {
+  if (
+    isProviderInstanceAllowedForProject(input.project.allowedProviderInstances, input.instanceId)
+  ) {
+    return Effect.void;
+  }
+  return Effect.fail(
+    invariantError(
+      input.command.type,
+      `Provider instance '${input.instanceId}' is not allowed for project '${input.project.id}'.`,
     ),
   );
 }

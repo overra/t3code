@@ -2,6 +2,8 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  getProviderInstanceAllowedProjects,
+  getProviderInstanceProjectRestriction,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -546,6 +548,36 @@ const make = Effect.gen(function* () {
       }
     }
     const project = yield* resolveProject(thread.projectId);
+    // Final gate for both provider-access rules. The decider (project
+    // allowlist) and the dispatch path (instance scope) reject commands that
+    // carry an explicit disallowed selection; this covers selections that
+    // arrive from persisted thread state (e.g. a thread created before
+    // either restriction existed).
+    if (project !== undefined) {
+      const restriction = getProviderInstanceProjectRestriction({
+        instanceId: desiredInstanceId,
+        instanceAllowedProjects: getProviderInstanceAllowedProjects(
+          (yield* serverSettingsService.getSettings).providerInstances,
+          desiredInstanceId,
+        ),
+        projectId: thread.projectId,
+        projectAllowedProviderInstances: project.allowedProviderInstances,
+      });
+      if (restriction === "project-allowlist") {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Provider instance '${desiredInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+        });
+      }
+      if (restriction === "instance-scope") {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Provider instance '${desiredInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
+        });
+      }
+    }
     const effectiveCwd = resolveThreadWorkspaceCwd({
       thread,
       projects: project ? [project] : [],

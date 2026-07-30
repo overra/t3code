@@ -18,6 +18,7 @@ import {
   CommandId,
   type DiscoveredLocalServerList,
   EventId,
+  getProviderInstanceAllowedProjects,
   type OrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
@@ -71,6 +72,7 @@ import {
   projectThreadDetailSnapshot,
 } from "./orchestration/ActivityPayloadProjection.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
+import { collectProviderScopeChecks } from "./orchestration/providerScopeChecks.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
@@ -969,6 +971,40 @@ const makeWsRpcLayer = (
           );
       };
 
+      // Instance-scope pre-validation (mirror of the decider's project-side
+      // allowlist invariant, which cannot see ServerSettings). Runs between
+      // normalization and engine dispatch so a scoped-out selection fails at
+      // command time with a typed error rather than at first provider turn.
+      const validateProviderScopeForDispatch = (command: OrchestrationCommand) =>
+        Effect.gen(function* () {
+          const checks = collectProviderScopeChecks(command);
+          if (checks.length === 0) return;
+          const providerInstances = (yield* serverSettings.getSettings).providerInstances;
+          for (const check of checks) {
+            const allowedProjects = getProviderInstanceAllowedProjects(
+              providerInstances,
+              check.instanceId,
+            );
+            if (allowedProjects === null) continue;
+            const projectId =
+              check.target.kind === "project"
+                ? check.target.projectId
+                : yield* projectionSnapshotQuery.getThreadShellById(check.target.threadId).pipe(
+                    Effect.map(Option.getOrUndefined),
+                    Effect.map((thread) => thread?.projectId),
+                    // An unreadable or missing thread is the decider's error
+                    // to report with proper context, not this gate's.
+                    Effect.orElseSucceed(() => undefined),
+                  );
+            if (projectId === undefined) continue;
+            if (!allowedProjects.includes(projectId)) {
+              return yield* new OrchestrationDispatchCommandError({
+                message: `Provider instance '${check.instanceId}' is limited to other projects and cannot be used in this project. Widen its project scope in Settings → Providers, or pick another provider.`,
+              });
+            }
+          }
+        });
+
       const loadServerConfig = Effect.gen(function* () {
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const providers = yield* providerRegistry.getProviders;
@@ -1016,6 +1052,7 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
               const normalizedCommand = yield* normalizeDispatchCommand(command);
+              yield* validateProviderScopeForDispatch(normalizedCommand);
               const shouldStopSessionAfterArchive =
                 normalizedCommand.type === "thread.archive"
                   ? yield* projectionSnapshotQuery

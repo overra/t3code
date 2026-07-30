@@ -15,6 +15,7 @@ import {
   requireActiveProjectWorkspaceRootAbsent,
   requireProject,
   requireProjectAbsent,
+  requireProviderInstanceAllowedForProject,
   requireThread,
   requireThreadArchived,
   requireThreadAbsent,
@@ -236,6 +237,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         workspaceRoot: command.workspaceRoot,
         exceptProjectId: command.projectId,
       });
+      const allowedProviderInstances = command.allowedProviderInstances ?? null;
+      const defaultModelSelection = command.defaultModelSelection ?? null;
+      if (
+        allowedProviderInstances !== null &&
+        defaultModelSelection !== null &&
+        !allowedProviderInstances.includes(defaultModelSelection.instanceId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Default provider instance '${defaultModelSelection.instanceId}' is not in the project's allowed provider instances.`,
+        });
+      }
 
       return {
         ...(yield* withEventBase({
@@ -249,7 +262,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           projectId: command.projectId,
           title: command.title,
           workspaceRoot: command.workspaceRoot,
-          defaultModelSelection: command.defaultModelSelection ?? null,
+          defaultModelSelection,
+          allowedProviderInstances,
           scripts: [],
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
@@ -258,7 +272,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "project.meta.update": {
-      yield* requireProject({
+      const project = yield* requireProject({
         readModel,
         command,
         projectId: command.projectId,
@@ -269,6 +283,27 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           command,
           workspaceRoot: command.workspaceRoot,
           exceptProjectId: command.projectId,
+        });
+      }
+      // Validate the post-update pair, not the command fields in isolation:
+      // either field may arrive alone and must stay consistent with the
+      // other's current value.
+      const nextAllowedProviderInstances =
+        command.allowedProviderInstances !== undefined
+          ? command.allowedProviderInstances
+          : (project.allowedProviderInstances ?? null);
+      const nextDefaultModelSelection =
+        command.defaultModelSelection !== undefined
+          ? command.defaultModelSelection
+          : project.defaultModelSelection;
+      if (
+        nextAllowedProviderInstances !== null &&
+        nextDefaultModelSelection !== null &&
+        !nextAllowedProviderInstances.includes(nextDefaultModelSelection.instanceId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Default provider instance '${nextDefaultModelSelection.instanceId}' is not in the project's allowed provider instances.`,
         });
       }
       const occurredAt = yield* nowIso;
@@ -286,6 +321,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           ...(command.workspaceRoot !== undefined ? { workspaceRoot: command.workspaceRoot } : {}),
           ...(command.defaultModelSelection !== undefined
             ? { defaultModelSelection: command.defaultModelSelection }
+            : {}),
+          ...(command.allowedProviderInstances !== undefined
+            ? { allowedProviderInstances: command.allowedProviderInstances }
             : {}),
           ...(command.scripts !== undefined ? { scripts: command.scripts } : {}),
           updatedAt: occurredAt,
@@ -345,7 +383,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.create": {
-      yield* requireProject({
+      const project = yield* requireProject({
         readModel,
         command,
         projectId: command.projectId,
@@ -354,6 +392,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         readModel,
         command,
         threadId: command.threadId,
+      });
+      yield* requireProviderInstanceAllowedForProject({
+        command,
+        project,
+        instanceId: command.modelSelection.instanceId,
       });
       return {
         ...(yield* withEventBase({
@@ -636,6 +679,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (command.modelSelection !== undefined) {
+        const project = yield* requireProject({
+          readModel,
+          command,
+          projectId: thread.projectId,
+        });
+        yield* requireProviderInstanceAllowedForProject({
+          command,
+          project,
+          instanceId: command.modelSelection.instanceId,
+        });
+      }
       const branch =
         command.branch !== undefined &&
         command.expectedBranch !== undefined &&
@@ -754,6 +809,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (command.modelSelection !== undefined) {
+        const project = yield* requireProject({
+          readModel,
+          command,
+          projectId: targetThread.projectId,
+        });
+        yield* requireProviderInstanceAllowedForProject({
+          command,
+          project,
+          instanceId: command.modelSelection.instanceId,
+        });
+      }
       const sourceProposedPlan = command.sourceProposedPlan;
       const sourceThread = sourceProposedPlan
         ? yield* requireThread({
