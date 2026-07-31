@@ -85,15 +85,27 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           // attachments, and the typed denial beats a first-turn failure.
           // The validator's message carries which rule blocked (project
           // allowlist vs instance scope) and the recovery surface.
-          yield* validateCommandProviderAccess(args.payload, {
-            getSettings: serverSettings.getSettings,
-            getThreadShellById: projectionSnapshotQuery.getThreadShellById,
-            getProjectShellById: projectionSnapshotQuery.getProjectShellById,
-          }).pipe(
-            Effect.catch((cause) =>
-              failEnvironmentInvalidRequest("provider_access_denied", cause.message),
-            ),
+          const providerAccess = yield* Effect.result(
+            validateCommandProviderAccess(args.payload, {
+              getSettings: serverSettings.getSettings,
+              getThreadShellById: projectionSnapshotQuery.getThreadShellById,
+              getProjectShellById: projectionSnapshotQuery.getProjectShellById,
+            }),
           );
+          if (providerAccess._tag === "Failure") {
+            // A verification outage is transient — surface it as a 500 so
+            // clients retry, not as a 400 policy denial they would obey.
+            if (providerAccess.failure.retryable === true) {
+              return yield* failEnvironmentInternal(
+                "orchestration_dispatch_failed",
+                providerAccess.failure,
+              );
+            }
+            return yield* failEnvironmentInvalidRequest(
+              "provider_access_denied",
+              providerAccess.failure.message,
+            );
+          }
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );

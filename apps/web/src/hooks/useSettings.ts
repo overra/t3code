@@ -294,9 +294,13 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
     (patch: UnifiedSettingsPatch) => {
       const { serverPatch, clientPatch } = splitPatch(patch);
 
+      // Returned so callers with optimistic UI (e.g. the provider project
+      // scope editor) can await the persist outcome and roll back on
+      // rejection. Fire-and-forget callers simply ignore the return value.
+      let serverPersist: Promise<unknown> | undefined;
       if (Object.keys(serverPatch).length > 0) {
         if (environmentId) {
-          void persistServerSettings({
+          serverPersist = persistServerSettings({
             environmentId,
             input: { patch: serverPatch },
           });
@@ -308,6 +312,7 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
           ...clientPatch,
         });
       }
+      return serverPersist;
     },
     [environmentId, persistServerSettings],
   );

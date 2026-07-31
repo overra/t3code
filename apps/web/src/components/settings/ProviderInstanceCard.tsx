@@ -331,7 +331,12 @@ interface ProviderInstanceCardProps {
   readonly liveProvider: ServerProvider | undefined;
   readonly isExpanded: boolean;
   readonly onExpandedChange: (open: boolean) => void;
-  readonly onUpdate: (nextInstance: ProviderInstanceConfig) => void;
+  /**
+   * May return the settings-persist promise so optimistic controls (the
+   * project scope popover) can roll back on rejection; other callers ignore
+   * the return value.
+   */
+  readonly onUpdate: (nextInstance: ProviderInstanceConfig) => unknown;
   /**
    * Pass `undefined` to hide the delete button entirely. Built-in default
    * instance slots use `undefined` — they can't be deleted without losing
@@ -484,7 +489,7 @@ export function ProviderInstanceCard({
 
   const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) => {
     const { allowedProjects: _omit, ...rest } = instance;
-    onUpdate(
+    return onUpdate(
       value !== null
         ? ({ ...rest, allowedProjects: value } as ProviderInstanceConfig)
         : (rest as ProviderInstanceConfig),

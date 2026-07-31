@@ -692,7 +692,15 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
       const draft = getComposerDraftSnapshot(selectedProjectDraftKey);
       const text = draft.text.trim();
-      const draftModelSelection = draft.modelSelection ?? selectedModel;
+      // Same clamp as the online path: the raw draft selection is only
+      // trusted while its instance survives the project's access filtering
+      // (membership in the already-filtered options); otherwise the flow's
+      // clamped resolution queues instead of a revoked selection.
+      const rawDraftSelection = draft.modelSelection;
+      const draftModelSelection =
+        (rawDraftSelection && usableInstanceIds.has(rawDraftSelection.instanceId)
+          ? rawDraftSelection
+          : null) ?? selectedModel;
       if (text.length === 0 || !draftModelSelection) {
         return null;
       }
@@ -743,6 +751,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       selectedProject,
       selectedProjectDraftKey,
       startFromOrigin,
+      usableInstanceIds,
     ],
   );
 

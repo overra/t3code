@@ -1104,22 +1104,34 @@ function ProjectAllowedProvidersControl(props: {
   const { member, providerEntries, onUpdate } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the streamed prop (which lags a round-trip and would resurrect the
-  // previous edit). The overlay clears only when the prop CATCHES UP to the
-  // pending value — an intermediate echo from an earlier write must not
-  // expose stale state underneath a newer pending edit. A rejected write
-  // clears it explicitly, and a timeout backstops a lost echo.
+  // previous edit). The overlay clears when the prop CATCHES UP to the
+  // pending value while no write is in flight — an intermediate echo from an
+  // earlier write must not expose stale state underneath a newer pending
+  // edit. A rejected write rolls back (generation-guarded so an older
+  // rejection cannot clear a newer edit), and a generation-guarded timeout
+  // backstops lost echoes.
   const [pendingAllowed, setPendingAllowed] = useState<
     ReadonlyArray<ProviderInstanceId> | null | undefined
   >(undefined);
+  const [settledTick, setSettledTick] = useState(0);
+  const generationRef = useRef(0);
+  const inflightRef = useRef(0);
   const propAllowed = member.allowedProviderInstances ?? null;
   useEffect(() => {
-    if (pendingAllowed !== undefined && providerAllowlistsEqual(propAllowed, pendingAllowed)) {
+    if (
+      pendingAllowed !== undefined &&
+      inflightRef.current === 0 &&
+      providerAllowlistsEqual(propAllowed, pendingAllowed)
+    ) {
       setPendingAllowed(undefined);
     }
-  }, [propAllowed, pendingAllowed]);
+  }, [propAllowed, pendingAllowed, settledTick]);
   useEffect(() => {
     if (pendingAllowed === undefined) return;
-    const timer = window.setTimeout(() => setPendingAllowed(undefined), 5000);
+    const generation = generationRef.current;
+    const timer = window.setTimeout(() => {
+      if (generationRef.current === generation) setPendingAllowed(undefined);
+    }, 5000);
     return () => window.clearTimeout(timer);
   }, [pendingAllowed]);
   const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
@@ -1143,10 +1155,18 @@ function ProjectAllowedProvidersControl(props: {
   ).length;
 
   const submit = (next: ReadonlyArray<ProviderInstanceId> | null) => {
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    inflightRef.current += 1;
     setPendingAllowed(next);
-    void onUpdate(member, next).then((ok) => {
-      if (!ok) setPendingAllowed(undefined);
-    });
+    void onUpdate(member, next)
+      .then((ok) => {
+        if (!ok && generationRef.current === generation) setPendingAllowed(undefined);
+      })
+      .finally(() => {
+        inflightRef.current -= 1;
+        setSettledTick((tick) => tick + 1);
+      });
   };
 
   const toggle = (instanceId: ProviderInstanceId, checked: boolean) => {
@@ -1192,8 +1212,8 @@ function ProjectAllowedProvidersControl(props: {
       <span className="font-medium text-foreground">Allowed providers</span>
       <p className="text-base text-pretty text-muted-foreground sm:text-sm">
         {allowed === null
-          ? "New threads in this project can use any provider."
-          : "New threads in this project can only use the checked providers."}
+          ? "Threads in this project can use any provider."
+          : "Threads in this project can only use the checked providers. Existing conversations on an unchecked provider pause until it is re-allowed."}
       </p>
       <div className="grid gap-1 sm:grid-cols-2">
         {providerEntries.map((entry) => {

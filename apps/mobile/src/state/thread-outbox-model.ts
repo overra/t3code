@@ -211,17 +211,48 @@ export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
 export type ThreadOutboxCommandStage = "settings-sync" | "start-turn";
 export type ThreadOutboxFailureAction = "retry" | "discard";
 
+function isDispatchRejection(error: unknown): error is { readonly retryable?: boolean } {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    error._tag === "OrchestrationDispatchCommandError"
+  );
+}
+
+/**
+ * A typed command rejection the server will repeat on every retry — e.g. a
+ * provider-access denial for a selection revoked while the entry sat in the
+ * outbox. Dispatch errors explicitly marked `retryable` (verification
+ * outages) are NOT deterministic and are retried in both stages.
+ */
+function isDeterministicCommandRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) {
+    return false;
+  }
+  if (error._tag === "OrchestrationCommandInvariantError") {
+    return true;
+  }
+  return isDispatchRejection(error) && error.retryable !== true;
+}
+
 export function resolveThreadOutboxFailureAction(input: {
   readonly stage: ThreadOutboxCommandStage;
   readonly error: unknown;
   readonly interrupted: boolean;
 }): ThreadOutboxFailureAction {
-  if (
-    input.stage === "settings-sync" ||
-    input.interrupted ||
-    shouldRetryThreadOutboxDelivery(input.error)
-  ) {
+  if (input.interrupted || shouldRetryThreadOutboxDelivery(input.error)) {
     return "retry";
   }
-  return "discard";
+  if (isDispatchRejection(input.error) && input.error.retryable === true) {
+    return "retry";
+  }
+  // Deterministic rejections poison the queue in EITHER stage: a revoked
+  // model selection fails settings-sync forever and would otherwise pin the
+  // FIFO head. Unknown settings-sync failures keep their historical retry
+  // bias; unknown start-turn failures keep their historical discard bias.
+  if (isDeterministicCommandRejection(input.error)) {
+    return "discard";
+  }
+  return input.stage === "settings-sync" ? "retry" : "discard";
 }

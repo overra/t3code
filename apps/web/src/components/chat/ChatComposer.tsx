@@ -3217,30 +3217,43 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         <div className="px-3 py-2">
                           <RestrictedProvidersNotes notes={restrictedProviderInstanceNotes} />
                         </div>
-                        {isPrimaryEnvironment &&
-                        restrictedProviderInstanceNotes.some(
+                        {restrictedProviderInstanceNotes.some(
+                          (note) => note.cause === "project-allowlist",
+                        ) ? (
+                          // Provider settings cannot change the project's own
+                          // allowlist — point at the surfaces that can.
+                          <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                            Allowed providers are set in the project&apos;s settings (project row →
+                            Project settings), or from a terminal with{" "}
+                            <code>t3 project providers</code>.
+                          </p>
+                        ) : null}
+                        {restrictedProviderInstanceNotes.some(
                           (note) => note.cause === "instance-scope",
                         ) ? (
-                          <div className="border-t border-border/70 p-1.5">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
-                              onClick={openProviderSettings}
-                            >
-                              <SettingsIcon className="size-4" />
-                              Provider settings
-                            </Button>
-                          </div>
-                        ) : (
-                          // Every blocker is the project's own allowlist;
-                          // provider settings cannot change that rule.
-                          <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
-                            Change this in the project&apos;s settings (project row → Project
-                            settings).
-                          </p>
-                        )}
+                          isPrimaryEnvironment ? (
+                            <div className="border-t border-border/70 p-1.5">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+                                onClick={openProviderSettings}
+                              >
+                                <SettingsIcon className="size-4" />
+                                Provider settings
+                              </Button>
+                            </div>
+                          ) : (
+                            // Settings routes edit the primary environment;
+                            // a secondary environment's scope is changed on
+                            // that server.
+                            <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                              Provider project scope is set in that environment&apos;s own provider
+                              settings.
+                            </p>
+                          )
+                        ) : null}
                       </PopoverPopup>
                     </Popover>
                   ) : (

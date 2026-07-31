@@ -1546,6 +1546,13 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedErrorClass<O
   "OrchestrationDispatchCommandError",
   {
     message: TrimmedNonEmptyString,
+    /**
+     * True when the rejection reflects a transient condition (e.g. provider
+     * access could not be VERIFIED because a settings/projection read
+     * failed) rather than a policy decision. Clients with retry queues must
+     * not discard commands rejected with `retryable: true`.
+     */
+    retryable: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

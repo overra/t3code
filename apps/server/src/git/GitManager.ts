@@ -596,6 +596,7 @@ export const make = Effect.gen(function* () {
   const sourceControlProvider = (cwd: string) => sourceControlProviders.resolve({ cwd });
   const serverSettingsService = yield* ServerSettings.ServerSettingsService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const fileSystem = yield* FileSystem.FileSystem;
 
   /**
    * Commit/PR text generation sends repository content (diffs, commit and
@@ -642,34 +643,59 @@ export const make = Effect.gen(function* () {
         ),
       );
       if (snapshot === undefined) return undefined;
-      const normalizedCwd = normalizeProjectPathForComparison(repositoryRoot);
-      const owningThread = snapshot.threads.find(
-        (thread) =>
-          thread.worktreePath !== null &&
-          normalizeProjectPathForComparison(thread.worktreePath) === normalizedCwd,
-      );
-      const project =
-        (owningThread
-          ? snapshot.projects.find((entry) => entry.id === owningThread.projectId)
-          : undefined) ??
-        snapshot.projects.find(
-          (entry) => normalizeProjectPathForComparison(entry.workspaceRoot) === normalizedCwd,
+      // Compare canonical (symlink-resolved) paths, and treat containment in
+      // EITHER direction as ownership: a project rooted at a monorepo
+      // subdirectory is covered by a git action at the repository root, and
+      // a nested repository under a project directory is that project's
+      // content. Multiple owners (several projects in one monorepo) all
+      // constrain the writer. A repository related to NO project stays
+      // unrestricted on purpose — no project means no project rules.
+      const canonicalize = (value: string) =>
+        fileSystem.realPath(value).pipe(
+          Effect.orElseSucceed(() => value),
+          Effect.map(normalizeProjectPathForComparison),
         );
-      if (project === undefined) return input.candidate;
+      const canonicalRoot = yield* canonicalize(repositoryRoot);
+      const isRelated = (a: string, b: string) =>
+        a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+      const owningThreads: Array<(typeof snapshot.threads)[number]> = [];
+      for (const thread of snapshot.threads) {
+        if (thread.worktreePath === null) continue;
+        if (isRelated(yield* canonicalize(thread.worktreePath), canonicalRoot)) {
+          owningThreads.push(thread);
+        }
+      }
+      const owningProjectIds = new Set(owningThreads.map((thread) => thread.projectId));
+      const owningProjects: Array<(typeof snapshot.projects)[number]> = [];
+      for (const entry of snapshot.projects) {
+        if (
+          owningProjectIds.has(entry.id) ||
+          isRelated(yield* canonicalize(entry.workspaceRoot), canonicalRoot)
+        ) {
+          owningProjects.push(entry);
+        }
+      }
+      if (owningProjects.length === 0) return input.candidate;
       const usable = (selection: ModelSelection) =>
-        isProviderInstanceUsableInProject({
-          instanceId: selection.instanceId,
-          instanceAllowedProjects: getProviderInstanceAllowedProjects(
-            input.providerInstances,
-            selection.instanceId,
-          ),
-          projectId: project.id,
-          projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
-        });
+        owningProjects.every((project) =>
+          isProviderInstanceUsableInProject({
+            instanceId: selection.instanceId,
+            instanceAllowedProjects: getProviderInstanceAllowedProjects(
+              input.providerInstances,
+              selection.instanceId,
+            ),
+            projectId: project.id,
+            projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
+          }),
+        );
       if (usable(input.candidate)) return input.candidate;
-      if (owningThread && usable(owningThread.modelSelection)) return owningThread.modelSelection;
-      if (project.defaultModelSelection !== null && usable(project.defaultModelSelection)) {
-        return project.defaultModelSelection;
+      for (const owningThread of owningThreads) {
+        if (usable(owningThread.modelSelection)) return owningThread.modelSelection;
+      }
+      for (const project of owningProjects) {
+        if (project.defaultModelSelection !== null && usable(project.defaultModelSelection)) {
+          return project.defaultModelSelection;
+        }
       }
       return undefined;
     },
@@ -913,7 +939,6 @@ export const make = Effect.gen(function* () {
           ),
       ),
     );
-  const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
   const tempDir = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";

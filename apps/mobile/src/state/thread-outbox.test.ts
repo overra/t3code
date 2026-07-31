@@ -581,22 +581,65 @@ describe("thread outbox", () => {
     expect(shouldRetryThreadOutboxDelivery(new Error("Thread no longer exists"))).toBe(false);
   });
 
-  it("retains queued messages when settings synchronization fails before startTurn", () => {
-    const deterministicFailure = new Error("Thread no longer exists");
+  it("retains queued messages when settings synchronization fails ambiguously", () => {
+    const ambiguousFailure = new Error("Thread no longer exists");
 
     expect(
       resolveThreadOutboxFailureAction({
         stage: "settings-sync",
-        error: deterministicFailure,
+        error: ambiguousFailure,
         interrupted: false,
       }),
     ).toBe("retry");
     expect(
       resolveThreadOutboxFailureAction({
         stage: "start-turn",
-        error: deterministicFailure,
+        error: ambiguousFailure,
         interrupted: false,
       }),
     ).toBe("discard");
+  });
+
+  it("drops typed deterministic rejections in BOTH stages so they cannot pin the FIFO", () => {
+    const accessDenied = {
+      _tag: "OrchestrationDispatchCommandError",
+      message: "Provider instance 'claudeAgent' is not allowed for project 'work'.",
+    };
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: accessDenied,
+        interrupted: false,
+      }),
+    ).toBe("discard");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: { _tag: "OrchestrationCommandInvariantError", detail: "not allowed" },
+        interrupted: false,
+      }),
+    ).toBe("discard");
+  });
+
+  it("retries dispatch rejections marked retryable (verification outages)", () => {
+    const verificationOutage = {
+      _tag: "OrchestrationDispatchCommandError",
+      message: "Provider access could not be verified (server settings unavailable). Try again.",
+      retryable: true,
+    };
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: verificationOutage,
+        interrupted: false,
+      }),
+    ).toBe("retry");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: verificationOutage,
+        interrupted: false,
+      }),
+    ).toBe("retry");
   });
 });

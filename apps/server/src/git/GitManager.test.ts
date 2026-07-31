@@ -1615,11 +1615,12 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\nworld\n");
       const subDir = NodePath.join(repoDir, "sub");
       NodeFS.mkdirSync(subDir);
-      // Match the project on git's resolved repository root so temp-dir
-      // symlinks (/var vs /private/var) cannot skew the comparison.
-      const repositoryRoot = yield* runGit(repoDir, ["rev-parse", "--show-toplevel"]).pipe(
-        Effect.map((result) => result.stdout.trim()),
-      );
+      // The project is rooted at a MONOREPO SUBDIRECTORY and stored with the
+      // unresolved temp path (macOS /var symlinks to /private/var, while git
+      // reports the resolved root) — the clamp must relate the paths through
+      // canonicalization and containment, not exact string equality.
+      const projectRoot = NodePath.join(repoDir, "packages", "app");
+      NodeFS.mkdirSync(projectRoot, { recursive: true });
       let generateCalls = 0;
 
       const { manager } = yield* makeManager({
@@ -1635,7 +1636,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
             {
               id: ProjectId.make("project-writer-restricted"),
               title: "Writer Restricted",
-              workspaceRoot: repositoryRoot,
+              workspaceRoot: projectRoot,
               defaultModelSelection: null,
               // The default writer (codex) is not in the allowlist.
               allowedProviderInstances: [ProviderInstanceId.make("claudeAgent")],

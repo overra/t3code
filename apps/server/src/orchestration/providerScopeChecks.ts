@@ -116,6 +116,9 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
   const verificationFailure = (what: string) =>
     new OrchestrationDispatchCommandError({
       message: `Provider access could not be verified (${what} unavailable). Try again.`,
+      // A read outage is not a policy denial: retry queues must keep the
+      // command instead of discarding it as deterministically rejected.
+      retryable: true,
     });
   const providerInstances = yield* deps.getSettings.pipe(
     Effect.map((settings) => settings.providerInstances),

@@ -1938,7 +1938,7 @@ export function ProviderSettingsPanel() {
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
     },
-  ) => {
+  ) =>
     updateSettings(
       buildProviderInstanceUpdatePatch({
         settings,
@@ -1949,7 +1949,6 @@ export function ProviderSettingsPanel() {
         textGenerationModelSelection: options?.textGenerationModelSelection,
       }),
     );
-  };
 
   const deleteProviderInstance = (id: ProviderInstanceId) => {
     updateSettings({
@@ -2192,13 +2191,12 @@ export function ProviderSettingsPanel() {
                 const isDisabling = next.enabled === false && wasEnabled;
                 const shouldClearTextGen = isDisabling && textGenInstanceId === row.instanceId;
                 if (shouldClearTextGen) {
-                  updateProviderInstance(row, next, {
+                  return updateProviderInstance(row, next, {
                     textGenerationModelSelection:
                       DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
                   });
-                } else {
-                  updateProviderInstance(row, next);
                 }
+                return updateProviderInstance(row, next);
               }}
               onDelete={row.isDefault ? undefined : () => deleteProviderInstance(row.instanceId)}
               headerAction={headerAction}

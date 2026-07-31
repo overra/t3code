@@ -292,15 +292,21 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   // and a queued one would poison the outbox. The model menu only offers
   // allowed instances, so picking any model clears this.
   const currentSelectionRestricted = useMemo(() => {
-    if (props.project === null || !props.serverConfig) return false;
+    if (props.project === null) return false;
+    const instanceId = props.selectedThread.modelSelection.instanceId;
+    // The project's own allowlist is decisive even before serverConfig has
+    // loaded; instance scope additionally applies once settings arrive.
+    const allowlist = props.project.allowedProviderInstances;
+    if (allowlist !== null && !allowlist.includes(instanceId)) return true;
+    if (!props.serverConfig) return false;
     return !isProviderInstanceUsableInProject({
-      instanceId: props.selectedThread.modelSelection.instanceId,
+      instanceId,
       instanceAllowedProjects: getProviderInstanceAllowedProjects(
         props.serverConfig.settings.providerInstances,
-        props.selectedThread.modelSelection.instanceId,
+        instanceId,
       ),
       projectId: props.project.id,
-      projectAllowedProviderInstances: props.project.allowedProviderInstances,
+      projectAllowedProviderInstances: allowlist,
     });
   }, [props.project, props.serverConfig, props.selectedThread.modelSelection.instanceId]);
   const canSend = hasContent && !currentSelectionRestricted;
@@ -539,6 +545,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const { onChangeDraftMessage, onUpdateInteractionMode, draftMessage, onSendMessage } = props;
 
   const handleSend = useCallback(async () => {
+    // Guard the ACTION, not just the button: the editor's submit handler
+    // (hardware keyboard Cmd+Return) calls this directly, bypassing the
+    // disabled Send affordance.
+    if (currentSelectionRestricted) return;
     const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
     if (inFlightThreadIdsRef.current.has(threadKey)) return;
     inFlightThreadIdsRef.current.add(threadKey);
@@ -556,6 +566,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       inFlightThreadIdsRef.current.delete(threadKey);
     }
   }, [
+    currentSelectionRestricted,
     onSendMessage,
     props.environmentId,
     props.environmentLabel,

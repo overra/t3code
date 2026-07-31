@@ -21,7 +21,7 @@
  * each peer instance's scope and the project's own allowlist) and calls out
  * projects that would be left with no usable provider at all.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProjectId, ProviderInstanceId } from "@t3tools/contracts";
 import { isProviderInstanceUsableInProject } from "@t3tools/contracts";
 import { TriangleAlertIcon } from "lucide-react";
@@ -88,32 +88,62 @@ export function ProviderProjectScopeSection(props: {
   projects: ReadonlyArray<ProviderScopeProjectOption>;
   instanceId: ProviderInstanceId;
   peerInstances: ReadonlyArray<ProviderScopePeerInstance>;
-  onChange: (allowedProjects: ReadonlyArray<ProjectId> | null) => void;
+  /** May return the settings-persist promise; used to roll back a rejected edit. */
+  onChange: (allowedProjects: ReadonlyArray<ProjectId> | null) => unknown;
 }) {
   const { projects, onChange } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the settings prop (which lags the settings round-trip and would
-  // resurrect the previous edit). The overlay clears only when the prop
-  // catches up to the pending value — an intermediate echo from an earlier
-  // write must not expose stale state under a newer edit — with a timeout
-  // backstop for rejected writes and lost echoes.
+  // resurrect the previous edit). The overlay clears when the prop catches
+  // up to the pending value while no write is in flight — an intermediate
+  // echo from an earlier write must not expose stale state under a newer
+  // edit. A rejected persist rolls back (generation-guarded so an older
+  // rejection cannot clear a newer edit), and a generation-guarded timeout
+  // backstops lost echoes.
   const [pendingScope, setPendingScope] = useState<ReadonlyArray<ProjectId> | null | undefined>(
     undefined,
   );
+  const [settledTick, setSettledTick] = useState(0);
+  const generationRef = useRef(0);
+  const inflightRef = useRef(0);
   useEffect(() => {
-    if (pendingScope !== undefined && projectScopesEqual(props.allowedProjects, pendingScope)) {
+    if (
+      pendingScope !== undefined &&
+      inflightRef.current === 0 &&
+      projectScopesEqual(props.allowedProjects, pendingScope)
+    ) {
       setPendingScope(undefined);
     }
-  }, [props.allowedProjects, pendingScope]);
+  }, [props.allowedProjects, pendingScope, settledTick]);
   useEffect(() => {
     if (pendingScope === undefined) return;
-    const timer = window.setTimeout(() => setPendingScope(undefined), 5000);
+    const generation = generationRef.current;
+    const timer = window.setTimeout(() => {
+      if (generationRef.current === generation) setPendingScope(undefined);
+    }, 5000);
     return () => window.clearTimeout(timer);
   }, [pendingScope]);
   const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
   const submit = (next: ReadonlyArray<ProjectId> | null) => {
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    inflightRef.current += 1;
     setPendingScope(next);
-    onChange(next);
+    void Promise.resolve(onChange(next))
+      .then((settled) => {
+        const failed =
+          typeof settled === "object" &&
+          settled !== null &&
+          "_tag" in settled &&
+          settled._tag === "Failure";
+        if (failed && generationRef.current === generation) {
+          setPendingScope(undefined);
+        }
+      })
+      .finally(() => {
+        inflightRef.current -= 1;
+        setSettledTick((tick) => tick + 1);
+      });
   };
   const mode: "all" | "selected" = allowedProjects === null ? "all" : "selected";
   const checkedIds = useMemo(() => new Set<ProjectId>(allowedProjects ?? []), [allowedProjects]);

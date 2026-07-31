@@ -26,7 +26,7 @@ import {
   ensureThreadOutboxLoaded,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
-import { appendComposerDraftAttachments, appendComposerDraftText } from "./use-composer-drafts";
+import { mergeComposerDraftContent, updateComposerDraftSettings } from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -159,11 +159,50 @@ export function useThreadOutboxDrain(): void {
         queuedMessage.creation !== undefined
           ? `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`
           : scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId);
-      if (queuedMessage.text.trim().length > 0) {
-        appendComposerDraftText(restoreDraftKey, queuedMessage.text);
-      }
-      if (queuedMessage.attachments.length > 0) {
-        appendComposerDraftAttachments(restoreDraftKey, queuedMessage.attachments);
+      try {
+        // Durable, idempotent restore FIRST: the merge awaits its persisted
+        // write and dedupes via the receipt (this message id), so a crash
+        // between restore and removal — or a failed removal retried on the
+        // next drain pass — cannot lose or duplicate the content.
+        await mergeComposerDraftContent(restoreDraftKey, {
+          text: queuedMessage.text,
+          attachments: queuedMessage.attachments,
+          sourceShareId: `thread-outbox:${queuedMessage.messageId}`,
+        });
+        if (queuedMessage.creation !== undefined) {
+          // A queued creation also carries its task shape; restoring it
+          // means the recovered draft resubmits as the same kind of task
+          // instead of an unrelated default-local one. The revoked model
+          // selection is deliberately NOT restored — the flow's clamp picks
+          // a usable one.
+          updateComposerDraftSettings(restoreDraftKey, {
+            workspaceSelection: {
+              mode: queuedMessage.creation.workspaceMode,
+              branch: queuedMessage.creation.branch,
+              worktreePath: queuedMessage.creation.worktreePath,
+              ...(queuedMessage.creation.startFromOrigin !== undefined
+                ? { startFromOrigin: queuedMessage.creation.startFromOrigin }
+                : {}),
+            },
+            ...(queuedMessage.runtimeMode !== undefined
+              ? { runtimeMode: queuedMessage.runtimeMode }
+              : {}),
+            ...(queuedMessage.interactionMode !== undefined
+              ? { interactionMode: queuedMessage.interactionMode }
+              : {}),
+          });
+        }
+      } catch (error) {
+        // Content is NOT saved; keep the outbox entry rather than lose the
+        // message. The FIFO stays blocked until storage recovers, which is
+        // the correct trade for a durability failure.
+        console.warn("[thread-outbox] failed to restore poisoned queued message to draft", {
+          environmentId: queuedMessage.environmentId,
+          threadId: queuedMessage.threadId,
+          messageId: queuedMessage.messageId,
+          error,
+        });
+        return;
       }
       try {
         await removeThreadOutboxMessage(queuedMessage);
