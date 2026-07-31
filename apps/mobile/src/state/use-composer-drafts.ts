@@ -514,19 +514,83 @@ export function restoreComposerDraftSnapshotOnceState(
   if (existing.importedShareIds?.includes(receiptId)) {
     return { next: current, restored: true };
   }
-  // ANY user state blocks the restore — including a settings-only draft: a
-  // model/workspace/branch/mode the user picked must not be silently
-  // replaced by the queued task's shape.
-  if (!isEmptyDraft(existing)) {
+  // User CONTENT blocks the restore. A settings-only draft accepts it — but
+  // the user's explicit picks (model/workspace/modes) WIN over the queued
+  // task's shape, so nothing they chose is silently replaced. Deferring on
+  // settings-only occupancy instead would deadlock: settings survive
+  // ordinary content clearing, so such a draft may never free up.
+  if (existing.text.length > 0 || existing.attachments.length > 0) {
     return { next: current, restored: false };
   }
   return {
     next: restoreComposerDraftSnapshotState(current, draftKey, {
       ...snapshot,
+      ...(existing.modelSelection !== undefined ? { modelSelection: existing.modelSelection } : {}),
+      ...(existing.runtimeMode !== undefined ? { runtimeMode: existing.runtimeMode } : {}),
+      ...(existing.interactionMode !== undefined
+        ? { interactionMode: existing.interactionMode }
+        : {}),
+      ...(existing.workspaceSelection !== undefined
+        ? { workspaceSelection: existing.workspaceSelection }
+        : {}),
       importedShareIds: [...(snapshot.importedShareIds ?? []), receiptId],
     }),
     restored: true,
   };
+}
+
+export function retractComposerDraftRestoreState(
+  current: Record<string, ComposerDraft>,
+  draftKey: string,
+  snapshot: Pick<ComposerDraft, "text" | "attachments">,
+  receiptId: string,
+): { readonly next: Record<string, ComposerDraft>; readonly retracted: boolean } {
+  const existing = current[draftKey];
+  if (existing === undefined || !existing.importedShareIds?.includes(receiptId)) {
+    return { next: current, retracted: false };
+  }
+  const attachmentIds = existing.attachments.map((attachment) => attachment.id);
+  const wantIds = snapshot.attachments.map((attachment) => attachment.id);
+  const untouched =
+    existing.text === snapshot.text &&
+    attachmentIds.length === wantIds.length &&
+    attachmentIds.every((id, index) => id === wantIds[index]);
+  // The user edited the restored content — it is theirs now; keep it.
+  if (!untouched) {
+    return { next: current, retracted: false };
+  }
+  // Remove exactly what the restore added (content + receipt), leaving any
+  // preserved user settings behind.
+  return { next: clearComposerDraftContentState(current, draftKey), retracted: true };
+}
+
+/**
+ * Undoes a restore whose recovery could not be completed (the outbox entry
+ * was deleted concurrently, or its content changed mid-recovery). Only
+ * retracts a draft still holding EXACTLY the restored content under our
+ * receipt — a user edit keeps their copy.
+ */
+export async function retractComposerDraftRestore(
+  draftKey: string,
+  snapshot: Pick<ComposerDraft, "text" | "attachments">,
+  receiptId: string,
+): Promise<boolean> {
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) {
+    await loadPromise;
+  }
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const { next, retracted } = retractComposerDraftRestoreState(
+    current,
+    draftKey,
+    snapshot,
+    receiptId,
+  );
+  if (!retracted) {
+    return false;
+  }
+  await commitComposerDraftState(next);
+  return true;
 }
 
 /**

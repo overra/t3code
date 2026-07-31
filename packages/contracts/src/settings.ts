@@ -530,6 +530,12 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  // SERVER-MANAGED monotonic write counter, bumped on every applied settings
+  // patch and never patchable by clients. The update RPC returns the new
+  // settings (including this), and config echoes carry it — so an optimistic
+  // editor can hold its overlay until the streamed state provably reflects
+  // its own acknowledged write, instead of guessing with elapsed time.
+  settingsRevision: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 

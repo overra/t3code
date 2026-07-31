@@ -81,10 +81,18 @@ export function ProviderProjectScopeSection(props: {
   /** May return the settings-persist promise; used to roll back a rejected edit. */
   onChange: (allowedProjects: ReadonlyArray<ProjectId> | null) => unknown;
   /**
+   * The environment's `settingsRevision` as currently streamed to this
+   * client. Every write's acknowledgment returns the revision it produced;
+   * the overlay holds until the streamed revision has caught up to the
+   * highest acknowledged one — an authoritative signal, not elapsed time.
+   */
+  settingsRevision: number;
+  /**
    * Reports this editor's pending (submitted, not yet echoed) scope so
    * SIBLING cards' stranded-project warnings see local intent instead of
    * lagging echoes. `undefined` clears the report (overlay resolved or the
-   * editor unmounted).
+   * editor unmounted). Called imperatively at each transition, not from a
+   * render-phase effect.
    */
   onPendingScopeChange?:
     | ((instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => void)
@@ -93,59 +101,63 @@ export function ProviderProjectScopeSection(props: {
   const { projects, onChange, onPendingScopeChange } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the settings prop (which lags the settings round-trip and would
-  // resurrect the previous edit). There is deliberately NO
-  // clear-on-value-equality: echoes carry no version, so "prop equals
-  // pending" cannot distinguish the final echo from the pre-write value or
-  // an intermediate one (an A→B→A sequence makes them identical), and
-  // clearing early exposes a stale echo and lets the next edit chain from
-  // the wrong state. While the overlay equals the prop it renders
-  // identically anyway, so holding it is free. It clears only on rejection
-  // rollback (generation-guarded) or after a quiet period — no write in
-  // flight, re-armed on every settle — by which time every echo for our
-  // writes has long landed.
+  // resurrect the previous edit). The overlay resolves against an
+  // AUTHORITATIVE acknowledgment: each persist returns the settings
+  // revision its write produced, and the overlay clears only once the
+  // STREAMED revision has caught up to the highest acknowledged one with no
+  // write in flight — never on value equality (ambiguous under A→B→A) and
+  // never on elapsed time (a delayed or reconnect-replayed echo after an
+  // elapsed-time clear would expose stale policy that the next toggle then
+  // composes from and persists). A rejected write rolls back immediately,
+  // generation-guarded.
   const [pendingScope, setPendingScope] = useState<ReadonlyArray<ProjectId> | null | undefined>(
     undefined,
   );
   const [settledTick, setSettledTick] = useState(0);
   const generationRef = useRef(0);
   const inflightRef = useRef(0);
+  const ackRevisionRef = useRef(0);
   useEffect(() => {
     if (pendingScope === undefined) return;
-    const generation = generationRef.current;
-    // The quiet period must observe STREAMED ECHOES, not just request
-    // settlement: `props.allowedProjects` in the deps re-arms the window on
-    // every incoming echo, so a delayed intermediate echo landing just
-    // before expiry restarts the clock instead of being exposed by an early
-    // clear.
-    const timer = window.setTimeout(() => {
-      if (generationRef.current === generation && inflightRef.current === 0) {
-        setPendingScope(undefined);
-      }
-    }, 5000);
-    return () => window.clearTimeout(timer);
-  }, [pendingScope, settledTick, props.allowedProjects]);
-  // Mirror this editor's pending scope to the panel for cross-card stranded
-  // warnings; cleared on resolution and on unmount.
-  useEffect(() => {
-    if (onPendingScopeChange === undefined) return;
-    onPendingScopeChange(props.instanceId, pendingScope);
-    return () => onPendingScopeChange(props.instanceId, undefined);
-  }, [onPendingScopeChange, pendingScope, props.instanceId]);
+    if (inflightRef.current !== 0) return;
+    if (props.settingsRevision >= ackRevisionRef.current) {
+      setPendingScope(undefined);
+      onPendingScopeChange?.(props.instanceId, undefined);
+    }
+  }, [pendingScope, settledTick, props.settingsRevision, onPendingScopeChange, props.instanceId]);
+  // Clear the panel-side report if this editor unmounts mid-flight.
+  useEffect(
+    () => () => onPendingScopeChange?.(props.instanceId, undefined),
+    [onPendingScopeChange, props.instanceId],
+  );
   const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
   const submit = (next: ReadonlyArray<ProjectId> | null) => {
     generationRef.current += 1;
     const generation = generationRef.current;
     inflightRef.current += 1;
     setPendingScope(next);
+    onPendingScopeChange?.(props.instanceId, next);
     void Promise.resolve(onChange(next))
       .then((settled) => {
-        const failed =
+        const succeeded =
           typeof settled === "object" &&
           settled !== null &&
           "_tag" in settled &&
-          settled._tag === "Failure";
-        if (failed && generationRef.current === generation) {
+          settled._tag === "Success";
+        if (succeeded) {
+          const revision = (settled as { value?: { settingsRevision?: unknown } }).value
+            ?.settingsRevision;
+          if (typeof revision === "number") {
+            ackRevisionRef.current = Math.max(ackRevisionRef.current, revision);
+          }
+          return;
+        }
+        // Rejected — or unroutable (`undefined`, no primary environment):
+        // roll back, generation-guarded so an older rejection cannot clear
+        // a newer edit.
+        if (generationRef.current === generation) {
           setPendingScope(undefined);
+          onPendingScopeChange?.(props.instanceId, undefined);
         }
       })
       .finally(() => {

@@ -24,12 +24,16 @@ import { useProjects, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
+  getThreadOutboxMessageById,
   markThreadOutboxMessageRecovery,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
+import { environmentProjects } from "./projects";
 import {
+  getComposerDraftSnapshot,
   mergeComposerDraftContentIfFits,
   restoreComposerDraftSnapshotOnce,
+  retractComposerDraftRestore,
 } from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
@@ -174,60 +178,106 @@ export function useThreadOutboxDrain(): void {
      * for a later pass with backoff.
      */
     const discardPoisonedEntry = async (): Promise<boolean> => {
-      const receiptId = `thread-outbox:${queuedMessage.messageId}`;
-      if (queuedMessage.restoredAt === undefined) {
-        if (queuedMessage.recoveryStartedAt === undefined) {
-          let committed: boolean;
+      const warnContext = {
+        environmentId: queuedMessage.environmentId,
+        threadId: queuedMessage.threadId,
+        messageId: queuedMessage.messageId,
+      };
+      // Operate on the CURRENT stored entry, never the captured dispatch
+      // snapshot: an edit can land while the rejection round-trips, and
+      // restoring the stale capture would silently discard the correction.
+      const entry = await getThreadOutboxMessageById(queuedMessage.messageId);
+      if (entry === undefined) {
+        // Deleted concurrently — the deletion wins; nothing is restored.
+        return true;
+      }
+      const receiptId = `thread-outbox:${entry.messageId}`;
+      const expectedContent = {
+        text: entry.text,
+        attachmentIds: entry.attachments.map((attachment) => attachment.id),
+      };
+      if (entry.restoredAt === undefined) {
+        if (entry.creation !== undefined) {
+          // A creation whose project no longer exists has no reachable
+          // destination draft — restoring there would strand the content
+          // behind a key no UI can open, and removing the entry would erase
+          // the only record that can still present it. Keep it queued and
+          // visible (it blocks only its own never-created thread's queue).
+          const projectExists = appAtomRegistry
+            .get(environmentProjects.projectsAtom)
+            .some(
+              (project) =>
+                project.environmentId === entry.environmentId &&
+                project.id === entry.creation?.projectId,
+            );
+          if (!projectExists) {
+            console.warn(
+              "[thread-outbox] kept poisoned pending task; its project no longer exists",
+              warnContext,
+            );
+            return false;
+          }
+          // Best-effort occupancy check BEFORE committing to recovery, so a
+          // content-occupied destination defers with the entry still whole,
+          // deliverable-if-policy-changes, and editable. (The restore itself
+          // re-checks atomically; entries committed past this point remain
+          // VISIBLE in the pending-task list until restoredAt.)
+          const destination = getComposerDraftSnapshot(
+            `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`,
+          );
+          if (
+            entry.recoveryStartedAt === undefined &&
+            (destination.text.length > 0 || destination.attachments.length > 0)
+          ) {
+            console.warn(
+              "[thread-outbox] deferred poisoned pending-task recovery; the new-task draft has content",
+              warnContext,
+            );
+            return false;
+          }
+        }
+        if (entry.recoveryStartedAt === undefined) {
+          let commit: "marked" | "missing" | "stale";
           try {
-            committed = await markThreadOutboxMessageRecovery(queuedMessage.messageId, {
+            commit = await markThreadOutboxMessageRecovery(entry.messageId, {
               recoveryStartedAt: new Date().toISOString(),
             });
           } catch (error) {
-            // Not committed: nothing was restored, the entry stays whole and
-            // deliverable-after-retry semantics are unchanged.
+            // Not committed: nothing was restored, the entry stays whole.
             console.warn("[thread-outbox] failed to commit poisoned queued message recovery", {
-              environmentId: queuedMessage.environmentId,
-              threadId: queuedMessage.threadId,
-              messageId: queuedMessage.messageId,
+              ...warnContext,
               error,
             });
             return false;
           }
-          if (!committed) {
-            // Deleted concurrently by the user before recovery began — the
-            // deletion wins and nothing is restored into the composer.
+          if (commit === "missing") {
+            // Deleted concurrently before recovery began — deletion wins.
             return true;
           }
         }
         try {
-          if (queuedMessage.creation !== undefined) {
-            // A queued creation restores into the project's new-task draft
-            // (mirrors the flow's `new-task:${scopedProjectKey(...)}` key)
-            // as ONE durable snapshot write: content plus its task shape —
-            // workspace selection with startFromOrigin pinned to the value
-            // the task would have sent with, runtime and interaction modes —
-            // so the recovered draft resubmits as the same kind of task. The
-            // revoked model selection is deliberately NOT restored; the
-            // flow's clamp picks a usable one. The restore refuses to touch
-            // a draft holding ANY user state (content or settings), keeping
-            // the entry queued instead of clobbering their work.
-            const restoreDraftKey = `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`;
+          if (entry.creation !== undefined) {
+            // ONE durable snapshot write: content plus task shape (workspace
+            // selection with startFromOrigin pinned, runtime and interaction
+            // modes) — while any settings the user already picked in the
+            // destination draft WIN over the task's shape. The revoked model
+            // selection is deliberately NOT restored; the flow's clamp picks
+            // a usable one.
+            const restoreDraftKey = `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`;
             const { restored } = await restoreComposerDraftSnapshotOnce(
               restoreDraftKey,
               {
-                text: queuedMessage.text,
-                attachments: queuedMessage.attachments,
+                text: entry.text,
+                attachments: entry.attachments,
                 workspaceSelection: {
-                  mode: queuedMessage.creation.workspaceMode,
-                  branch: queuedMessage.creation.branch,
-                  worktreePath: queuedMessage.creation.worktreePath,
-                  startFromOrigin: queuedMessage.creation.startFromOrigin ?? false,
+                  mode: entry.creation.workspaceMode,
+                  branch: entry.creation.branch,
+                  worktreePath: entry.creation.worktreePath,
+                  startFromOrigin: entry.creation.startFromOrigin ?? false,
                 },
-                ...(queuedMessage.runtimeMode !== undefined
-                  ? { runtimeMode: queuedMessage.runtimeMode }
-                  : {}),
-                ...(queuedMessage.interactionMode !== undefined
-                  ? { interactionMode: queuedMessage.interactionMode }
+                ...(entry.runtimeMode !== undefined ? { runtimeMode: entry.runtimeMode } : {}),
+                ...(entry.interactionMode !== undefined
+                  ? { interactionMode: entry.interactionMode }
                   : {}),
               },
               receiptId,
@@ -235,11 +285,7 @@ export function useThreadOutboxDrain(): void {
             if (!restored) {
               console.warn(
                 "[thread-outbox] deferred poisoned pending-task restore; the new-task draft is in use",
-                {
-                  environmentId: queuedMessage.environmentId,
-                  threadId: queuedMessage.threadId,
-                  messageId: queuedMessage.messageId,
-                },
+                warnContext,
               );
               return false;
             }
@@ -250,69 +296,84 @@ export function useThreadOutboxDrain(): void {
             // alongside the retained full original. Once the draft has room
             // — the user sends or trims it — a later pass merges the whole
             // message in one durable write.
-            const restoreDraftKey = scopedThreadKey(
-              queuedMessage.environmentId,
-              queuedMessage.threadId,
-            );
+            const restoreDraftKey = scopedThreadKey(entry.environmentId, entry.threadId);
             const { merged } = await mergeComposerDraftContentIfFits(restoreDraftKey, {
-              text: queuedMessage.text,
-              attachments: queuedMessage.attachments,
+              text: entry.text,
+              attachments: entry.attachments,
               sourceShareId: receiptId,
             });
             if (!merged) {
               console.warn(
                 "[thread-outbox] deferred poisoned queued message restore; the thread draft cannot fit its attachments",
-                {
-                  environmentId: queuedMessage.environmentId,
-                  threadId: queuedMessage.threadId,
-                  messageId: queuedMessage.messageId,
-                },
+                warnContext,
               );
               return false;
             }
           }
         } catch (error) {
           // Content is NOT durably saved; keep the outbox entry rather than
-          // lose the message. The FIFO stays blocked until storage recovers,
-          // which is the correct trade for a durability failure.
+          // lose the message.
           console.warn("[thread-outbox] failed to restore poisoned queued message to draft", {
-            environmentId: queuedMessage.environmentId,
-            threadId: queuedMessage.threadId,
-            messageId: queuedMessage.messageId,
+            ...warnContext,
             error,
           });
           return false;
         }
-        // The restore is durable — record that ON THE ENTRY before removal.
-        // A failed marker write keeps the entry in the recovery phase (the
-        // restore above is idempotent on retry); a false result means the
-        // entry was deleted concurrently mid-restore, and the deletion wins.
-        let marked: boolean;
+        // Record completion ON THE ENTRY before removal, CAS-guarded on the
+        // content we just restored: if an edit landed mid-restore ("stale")
+        // or the user deleted the entry ("missing"), the restored copy is
+        // RETRACTED (creations only, and only while untouched) so a
+        // superseded or unwanted restore never lingers in the composer. A
+        // failed marker write also retracts, closing the window where
+        // restored content is actionable without a durable completion
+        // marker.
+        const retractRestore = async () => {
+          if (entry.creation === undefined) return;
+          try {
+            await retractComposerDraftRestore(
+              `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`,
+              { text: entry.text, attachments: entry.attachments },
+              receiptId,
+            );
+          } catch (error) {
+            console.warn("[thread-outbox] failed to retract superseded draft restore", {
+              ...warnContext,
+              error,
+            });
+          }
+        };
+        let marked: "marked" | "missing" | "stale";
         try {
-          marked = await markThreadOutboxMessageRecovery(queuedMessage.messageId, {
-            restoredAt: new Date().toISOString(),
-          });
+          marked = await markThreadOutboxMessageRecovery(
+            entry.messageId,
+            { restoredAt: new Date().toISOString() },
+            expectedContent,
+          );
         } catch (error) {
           console.warn("[thread-outbox] failed to mark poisoned queued message restored", {
-            environmentId: queuedMessage.environmentId,
-            threadId: queuedMessage.threadId,
-            messageId: queuedMessage.messageId,
+            ...warnContext,
             error,
           });
+          await retractRestore();
           return false;
         }
-        if (!marked) {
+        if (marked === "missing") {
+          await retractRestore();
           return true;
+        }
+        if (marked === "stale") {
+          // The entry's content changed while we restored the old copy:
+          // retract it and retry against the fresh content next pass.
+          await retractRestore();
+          return false;
         }
       }
       try {
-        await removeThreadOutboxMessage(queuedMessage);
+        await removeThreadOutboxMessage(entry);
         return true;
       } catch (error) {
         console.warn("[thread-outbox] failed to remove poisoned queued message", {
-          environmentId: queuedMessage.environmentId,
-          threadId: queuedMessage.threadId,
-          messageId: queuedMessage.messageId,
+          ...warnContext,
           error,
         });
         return false;

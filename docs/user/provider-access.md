@@ -20,6 +20,12 @@ work such as thread titles, branch names, and commit/PR message generation
 rule under "Not available in this project" with the rule that hid each
 one.
 
+Both editors require a server that advertises the `providerProjectScopes`
+capability. Against an older server the editors are hidden (an older
+server would silently ignore the fields), and existing scopes are
+preserved server-side even when an older client re-sends provider
+settings without them.
+
 ## From the terminal
 
 Builds using the classic sidebar do not have the project-settings editor;

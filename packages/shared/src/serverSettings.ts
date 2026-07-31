@@ -122,10 +122,35 @@ function mergeModelSelectionOptionsById(input: {
 }
 
 /**
+ * Preserves an instance's ACCESS SCOPE across writes that do not explicitly
+ * carry one. `allowedProjects` is security policy: an incoming instance
+ * value lacking the key (a stale render capture editing another field, or an
+ * older client whose schema strips the unknown field entirely) must not
+ * silently widen access by dropping the stored scope. Scope changes flow
+ * only through values that INCLUDE the key — the scope editor always sends
+ * it explicitly, `null` included.
+ */
+function withPreservedInstanceScope(
+  currentInstance:
+    | ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+    | undefined,
+  incoming: NonNullable<
+    NonNullable<ServerSettingsPatch["providerInstancesPatch"]>[keyof NonNullable<
+      ServerSettingsPatch["providerInstancesPatch"]
+    >]
+  >,
+) {
+  if ("allowedProjects" in incoming) return incoming;
+  if (currentInstance === undefined || !("allowedProjects" in currentInstance)) return incoming;
+  return { ...incoming, allowedProjects: currentInstance.allowedProjects };
+}
+
+/**
  * Applies per-instance upserts/deletes onto a provider-instances map. `null`
- * deletes the entry; a config value replaces that entry whole. Runs against
- * the map the SERVER holds at apply time (under its settings write lock), so
- * two clients editing different instances can never revert each other.
+ * deletes the entry; a config value replaces that entry whole (except the
+ * preserved scope, above). Runs against the map the SERVER holds at apply
+ * time (under its settings write lock), so two clients editing different
+ * instances can never revert each other.
  */
 export function applyProviderInstancesPatch(
   current: ServerSettings["providerInstances"],
@@ -141,8 +166,34 @@ export function applyProviderInstancesPatch(
     if (value === null) {
       delete next[instanceId];
     } else {
-      next[instanceId] = value;
+      next[instanceId] = withPreservedInstanceScope(current[instanceId], value);
     }
+  }
+  return next;
+}
+
+/**
+ * Whole-map replacement with the same scope preservation per entry: an
+ * older client re-sending the entire map (its schema having stripped the
+ * unknown `allowedProjects` field from every entry) must not erase stored
+ * scopes as a side effect of an ordinary provider edit.
+ */
+export function replaceProviderInstancesPreservingScopes(
+  current: ServerSettings["providerInstances"],
+  incoming: ServerSettings["providerInstances"],
+): ServerSettings["providerInstances"] {
+  const next = {} as Record<
+    keyof ServerSettings["providerInstances"],
+    ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+  >;
+  for (const [instanceId, value] of Object.entries(incoming) as Array<
+    [
+      keyof ServerSettings["providerInstances"],
+      ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]],
+    ]
+  >) {
+    next[instanceId] =
+      value === undefined ? value : withPreservedInstanceScope(current[instanceId], value);
   }
   return next;
 }
@@ -212,14 +263,24 @@ export function applyServerSettingsPatch(
       ? { backgroundActivity: backgroundActivityPatch }
       : {}),
     ...(patch.providerInstances !== undefined
-      ? { providerInstances: patch.providerInstances }
+      ? {
+          providerInstances: replaceProviderInstancesPreservingScopes(
+            current.providerInstances,
+            patch.providerInstances,
+          ),
+        }
       : {}),
     // Applied after (and on top of) any whole-map replacement so per-instance
     // patches win when a caller inexplicably sends both.
     ...(providerInstancesPatch !== undefined
       ? {
           providerInstances: applyProviderInstancesPatch(
-            patch.providerInstances ?? current.providerInstances,
+            patch.providerInstances !== undefined
+              ? replaceProviderInstancesPreservingScopes(
+                  current.providerInstances,
+                  patch.providerInstances,
+                )
+              : current.providerInstances,
             providerInstancesPatch,
           ),
         }
@@ -242,6 +303,9 @@ export function applyServerSettingsPatch(
     automaticGitFetchInterval: resolvedBackgroundActivity.automaticGitFetchInterval,
     providerHealthRefreshInterval: resolvedBackgroundActivity.providerHealthRefreshInterval,
     backgroundActivityProfile: resolvedBackgroundActivity.profile,
+    // Server-managed monotonic ack counter — every applied patch bumps it,
+    // and patches themselves can never set it (it is not a patch field).
+    settingsRevision: (current.settingsRevision ?? 0) + 1,
   };
   if (!selectionPatch) {
     return nextWithReplacements;

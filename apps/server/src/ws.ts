@@ -542,20 +542,31 @@ const makeWsRpcLayer = (
           ),
         );
 
-      const toBootstrapDispatchCommandCauseError = (cause: Cause.Cause<unknown>) => {
+      const toBootstrapDispatchCommandCauseError = (
+        cause: Cause.Cause<unknown>,
+        options: { readonly retryEligible: boolean },
+      ) => {
         const error = Cause.squash(cause);
-        return isOrchestrationDispatchCommandError(error)
-          ? error
-          : new OrchestrationDispatchCommandError({
-              message:
-                error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
-              // Same classification as the plain dispatch wrap: a transient
-              // git/database/engine failure mid-bootstrap must not read as a
-              // deterministic rejection, or offline queues restore-and-drop
-              // a task that a retry would have delivered.
-              ...(isDeterministicOrchestrationRejection(error) ? {} : { retryable: true }),
-              cause,
-            });
+        if (isOrchestrationDispatchCommandError(error)) {
+          // Once the bootstrap created (and cleaned up) the thread, a retry
+          // of the same queued command is doomed — it pins the thread id and
+          // a deleted id stays occupied — so even an inner retryable error
+          // downgrades to a terminal rejection.
+          return options.retryEligible || error.retryable !== true
+            ? error
+            : new OrchestrationDispatchCommandError({ message: error.message, cause: error });
+        }
+        return new OrchestrationDispatchCommandError({
+          message:
+            error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
+          // A transient git/database/engine failure mid-bootstrap is only
+          // worth retrying while the retry can still succeed (no thread was
+          // created yet); deterministic rejections never are.
+          ...(options.retryEligible && !isDeterministicOrchestrationRejection(error)
+            ? { retryable: true }
+            : {}),
+          cause,
+        });
       };
 
       const toShellStreamEvent = (
@@ -780,6 +791,8 @@ const makeWsRpcLayer = (
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
           let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
 
+          let createdWorktree: { readonly cwd: string; readonly path: string } | null = null;
+
           const cleanupCreatedThread = () =>
             createdThread
               ? serverCommandId("bootstrap-thread-delete").pipe(
@@ -792,6 +805,21 @@ const makeWsRpcLayer = (
                   ),
                   Effect.ignoreCause({ log: true }),
                 )
+              : Effect.void;
+
+          // A worktree created for a bootstrap that then failed must not be
+          // left behind: a later attempt (fresh thread id, possibly the same
+          // requested path) would fail on "worktree already exists", turning
+          // one transient failure into a permanent one.
+          const cleanupCreatedWorktree = () =>
+            createdWorktree !== null
+              ? gitWorkflow
+                  .removeWorktree({
+                    cwd: createdWorktree.cwd,
+                    path: createdWorktree.path,
+                    force: true,
+                  })
+                  .pipe(Effect.ignoreCause({ log: true }))
               : Effect.void;
 
           const recordSetupScriptLaunchFailure = (input: {
@@ -948,6 +976,10 @@ const makeWsRpcLayer = (
                 baseRefName: bootstrap.prepareWorktree.baseBranch,
                 path: null,
               });
+              createdWorktree = {
+                cwd: bootstrap.prepareWorktree.projectCwd,
+                path: worktree.worktree.path,
+              };
               targetWorktreePath = worktree.worktree.path;
               yield* orchestrationEngine.dispatch({
                 type: "thread.meta.update",
@@ -966,11 +998,16 @@ const makeWsRpcLayer = (
 
           return yield* bootstrapProgram.pipe(
             Effect.catchCause((cause) => {
-              const dispatchError = toBootstrapDispatchCommandCauseError(cause);
+              const dispatchError = toBootstrapDispatchCommandCauseError(cause, {
+                retryEligible: !createdThread,
+              });
               if (Cause.hasInterruptsOnly(cause)) {
                 return Effect.fail(dispatchError);
               }
-              return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
+              return cleanupCreatedWorktree().pipe(
+                Effect.andThen(cleanupCreatedThread()),
+                Effect.flatMap(() => Effect.fail(dispatchError)),
+              );
             }),
           );
         });

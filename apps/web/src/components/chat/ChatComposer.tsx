@@ -578,6 +578,13 @@ export interface ChatComposerProps {
   activeProjectDefaultModelSelection: ModelSelection | null | undefined;
   activeProjectId: ProjectId | null | undefined;
   activeProjectAllowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null | undefined;
+  /**
+   * True when the thread names a project id that no longer resolves in the
+   * live shell (the project was deleted). Distinct from "no project":
+   * access rules still exist server-side, this client just cannot read
+   * them — so the picker fails CLOSED instead of offering every provider.
+   */
+  activeProjectMissing?: boolean | undefined;
   activeThreadModelSelection: ModelSelection | null | undefined;
 
   // Context window
@@ -675,6 +682,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeProjectDefaultModelSelection,
     activeProjectId,
     activeProjectAllowedProviderInstances,
+    activeProjectMissing = false,
     activeThreadModelSelection,
     activeThreadActivities,
     resolvedTheme,
@@ -786,11 +794,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
     () =>
-      filterProviderInstanceEntriesForProject(
-        configuredProviderInstanceEntries,
-        activeProjectProviderContext,
-      ),
-    [activeProjectProviderContext, configuredProviderInstanceEntries],
+      // A known-but-deleted project fails CLOSED: its rules still exist
+      // server-side (the validator resolves them from the unfiltered row),
+      // this client just cannot read them, so no provider may be offered.
+      activeProjectMissing
+        ? []
+        : filterProviderInstanceEntriesForProject(
+            configuredProviderInstanceEntries,
+            activeProjectProviderContext,
+          ),
+    [activeProjectMissing, activeProjectProviderContext, configuredProviderInstanceEntries],
   );
   // Enabled instances hidden by a project rule, with the rule that hid them —
   // rendered as an explanatory picker footer so restrictions never read as a
@@ -3194,7 +3207,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             >
               <div className="-m-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                 {noProviderAvailable ? (
-                  restrictedProviderInstanceNotes.length > 0 ? (
+                  activeProjectMissing ? (
+                    // Known-but-deleted project: the rules that would decide
+                    // provider access are unreadable here, so nothing may be
+                    // offered — a distinct state from "genuinely unscoped".
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled
+                      data-chat-provider-unavailable="true"
+                      className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
+                    >
+                      <CircleAlertIcon className="size-4" />
+                      This thread&apos;s project is no longer available
+                    </Button>
+                  ) : restrictedProviderInstanceNotes.length > 0 ? (
                     // Restrictions emptied the picker: keep the affordance
                     // alive so the notes explain what happened and where to
                     // fix it, instead of a dead "No provider available".
@@ -3221,13 +3249,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                           (note) => note.cause === "project-allowlist",
                         ) ? (
                           // Provider settings cannot change the project's own
-                          // allowlist — point at the surfaces that can.
+                          // allowlist — point at the surfaces that can. The
+                          // pasted command KEEPS the currently allowed ids and
+                          // adds the blocked ones, so it never removes valid
+                          // entries as a side effect.
                           <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
                             Allowed providers are set in the project&apos;s settings (project row →
                             Project settings), or from the project directory with{" "}
-                            <code>npx t3@latest project providers . --allow codex,claudeAgent</code>{" "}
-                            — comma-separated instance ids; <code>--all</code> clears the
-                            restriction.
+                            <code>
+                              {`npx t3@latest project providers . --allow ${[
+                                ...new Set([
+                                  ...(activeProjectAllowedProviderInstances ?? []),
+                                  ...restrictedProviderInstanceNotes
+                                    .filter((note) => note.cause === "project-allowlist")
+                                    .map((note) => note.entry.instanceId),
+                                ]),
+                              ].join(",")}`}
+                            </code>{" "}
+                            — <code>--all</code> clears the restriction.
                           </p>
                         ) : null}
                         {restrictedProviderInstanceNotes.some(

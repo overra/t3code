@@ -23,11 +23,14 @@ export function usePendingNewTasks(): ReadonlyArray<PendingNewTask> {
       if (!message.creation) {
         continue;
       }
-      // An entry committed to recovery is mid-removal: its content is (or is
-      // about to be) the project's new-task draft. Listing it would open the
-      // editor over a record the recovery flow is concurrently marking and
-      // deleting — edits there would be lost the moment removal lands.
-      if (message.recoveryStartedAt !== undefined || message.restoredAt !== undefined) {
+      // Only a COMPLETED restore hides the entry (its content now lives in
+      // the project's new-task draft and removal is imminent). An entry
+      // merely committed to recovery stays visible and editable — recovery
+      // marks the current record, preserves markers through edits, and
+      // retracts a superseded restore, so editing is safe; hiding it while
+      // its restore defers (occupied draft, missing project) would leave the
+      // content with no reachable UI at all.
+      if (message.restoredAt !== undefined) {
         continue;
       }
       tasks.push({

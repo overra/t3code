@@ -278,11 +278,12 @@ it.layer(NodeServices.layer)("decider project provider allowlist", (it) => {
     }),
   );
 
-  it.effect("thread.create recreates a soft-deleted thread id (bootstrap retry)", () =>
+  it.effect("thread.create refuses to reuse a soft-deleted thread id", () =>
     Effect.gen(function* () {
       const withThread = yield* restrictedProjectReadModel({ withThread: true });
-      // Bootstrap cleanup soft-deletes the partially created thread; the
-      // retry reuses the same pinned thread id and must be able to recreate.
+      // Child rows (messages, sessions, checkpoints) survive soft deletion
+      // keyed by thread id; recreation would resurrect them into the "new"
+      // thread, so the id stays occupied forever.
       const readModel = yield* projectEvent(withThread, {
         sequence: 3,
         eventId: EventId.make("evt-thread-delete"),
@@ -296,16 +297,17 @@ it.layer(NodeServices.layer)("decider project provider allowlist", (it) => {
         metadata: {},
         payload: { threadId: THREAD_ID, deletedAt: NOW },
       });
-      const result = yield* decideOrchestrationCommand({
-        command: {
-          ...threadCreateCommand(CODEX_INSTANCE),
-          commandId: CommandId.make("cmd-thread-recreate"),
-          threadId: THREAD_ID,
-        },
-        readModel,
-      });
-      const event = Array.isArray(result) ? result[0] : result;
-      expect(event.type).toBe("thread.created");
+      const failure = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            ...threadCreateCommand(CODEX_INSTANCE),
+            commandId: CommandId.make("cmd-thread-recreate"),
+            threadId: THREAD_ID,
+          },
+          readModel,
+        }),
+      );
+      expect(failure.message).toContain("already exists and cannot be created twice");
     }),
   );
 

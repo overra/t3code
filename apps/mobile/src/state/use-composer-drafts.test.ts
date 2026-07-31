@@ -13,6 +13,7 @@ import {
   removeComposerDraftsForEnvironment,
   restoreComposerDraftSnapshotOnceState,
   restoreComposerDraftSnapshotState,
+  retractComposerDraftRestoreState,
 } from "./use-composer-drafts";
 
 const DRAFT: ComposerDraft = {
@@ -235,23 +236,68 @@ describe("mobile composer drafts", () => {
     expect(refused.restored).toBe(false);
     expect(refused.next).toBe(occupied);
 
-    // A settings-only draft is user state too: a picked model/workspace/mode
-    // must not be silently replaced by the queued task's shape.
+    // A settings-only draft ACCEPTS the restore — deferring would deadlock
+    // (settings survive content clearing) — but the user's explicit picks
+    // win over the queued task's shape.
     const settingsOnly = {
       [draftKey]: {
         text: "",
         attachments: [],
-        runtimeMode: "approval-required" as const,
+        runtimeMode: "full-access" as const,
       },
     };
-    const refusedSettings = restoreComposerDraftSnapshotOnceState(
+    const restoredIntoSettings = restoreComposerDraftSnapshotOnceState(
       settingsOnly,
       draftKey,
       snapshot,
       receiptId,
     );
-    expect(refusedSettings.restored).toBe(false);
-    expect(refusedSettings.next).toBe(settingsOnly);
+    expect(restoredIntoSettings.restored).toBe(true);
+    expect(restoredIntoSettings.next[draftKey]).toMatchObject({
+      text: "Queued task",
+      runtimeMode: "full-access",
+      importedShareIds: [receiptId],
+    });
+  });
+
+  it("retracts a restore only while the draft still holds exactly the restored content", () => {
+    const draftKey = "new-task:environment-1:project-1";
+    const receiptId = "thread-outbox:message-1";
+    const restored = {
+      [draftKey]: {
+        text: "Queued task",
+        attachments: [],
+        runtimeMode: "approval-required" as const,
+        importedShareIds: [receiptId],
+      },
+    };
+
+    // Untouched restore: content and receipt are removed, settings survive.
+    const retracted = retractComposerDraftRestoreState(
+      restored,
+      draftKey,
+      { text: "Queued task", attachments: [] },
+      receiptId,
+    );
+    expect(retracted.retracted).toBe(true);
+    expect(retracted.next[draftKey]).toEqual({
+      text: "",
+      attachments: [],
+      runtimeMode: "approval-required",
+    });
+
+    // Edited content is the user's now — never retracted.
+    const edited = {
+      [draftKey]: { ...restored[draftKey]!, text: "Queued task, edited" },
+    };
+    const kept = retractComposerDraftRestoreState(
+      edited,
+      draftKey,
+      { text: "Queued task", attachments: [] },
+      receiptId,
+    );
+    expect(kept.retracted).toBe(false);
+    expect(kept.next).toBe(edited);
   });
 
   it("refuses an outbox-content merge that would truncate attachments", () => {

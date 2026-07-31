@@ -602,6 +602,9 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       assert.deepEqual(JSON.parse(raw), {
         addProjectBaseDirectory: "~/Development",
+        // The server-managed write counter bumps on every applied patch and
+        // persists (1 after the single update above).
+        settingsRevision: 1,
         observability: {
           otlpTracesUrl: "http://localhost:4318/v1/traces",
           otlpMetricsUrl: "http://localhost:4318/v1/metrics",

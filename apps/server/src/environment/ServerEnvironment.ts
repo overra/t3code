@@ -143,6 +143,7 @@ export const make = Effect.gen(function* () {
       threadSettlement: true,
       threadSnooze: true,
       threadTitleRegeneration: true,
+      providerProjectScopes: true,
       ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
       ...(serverSelfUpdate === "boot-service" || serverSelfUpdate === "respawn"
         ? { serverSelfUpdateProgress: true }

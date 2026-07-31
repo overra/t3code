@@ -57,6 +57,14 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Server can stream self-update progress before acknowledging the
       restart. Clients fall back to server.updateServer when absent. */
   serverSelfUpdateProgress: Schema.optionalKey(Schema.Boolean),
+  /** Server understands per-project provider access: the project
+      `allowedProviderInstances` allowlist, the instance `allowedProjects`
+      scope, and the granular `providerInstancesPatch` settings key. Absent
+      on older servers — clients must hide both access editors and fall back
+      to whole-map instance writes, since an older server strips the unknown
+      fields and silently acknowledges a no-op (or, worse, an edit that
+      drops scopes it never knew about). */
+  providerProjectScopes: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

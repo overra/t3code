@@ -185,12 +185,15 @@ describe("buildProviderInstanceUpdatePatch", () => {
       },
     } satisfies ProviderInstanceConfig;
 
-    const patch = buildProviderInstanceUpdatePatch({
-      instanceId,
-      instance: nextInstance,
-      driver: ProviderDriverKind.make("codex"),
-      isDefault: true,
-    });
+    const patch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: true,
+      },
+      { granular: true },
+    );
 
     // GRANULAR: exactly one instance entry, no whole-map replacement — the
     // server merges this onto its own current map, so concurrent edits to
@@ -198,6 +201,20 @@ describe("buildProviderInstanceUpdatePatch", () => {
     expect(patch.providerInstances).toBeUndefined();
     expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
     expect(patch.providers).toEqual({ codex: DEFAULT_SERVER_SETTINGS.providers.codex });
+
+    // Legacy mode (pre-capability servers, which strip the patch key and
+    // would no-op): the whole-map shape composed from the caller's settings.
+    const legacyPatch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: true,
+      },
+      { granular: false, settings: DEFAULT_SERVER_SETTINGS },
+    );
+    expect(legacyPatch.providerInstancesPatch).toBeUndefined();
+    expect(legacyPatch.providerInstances?.[instanceId]).toEqual(nextInstance);
   });
 
   it("updates custom instances without touching legacy provider settings", () => {
@@ -210,12 +227,15 @@ describe("buildProviderInstanceUpdatePatch", () => {
       },
     } satisfies ProviderInstanceConfig;
 
-    const patch = buildProviderInstanceUpdatePatch({
-      instanceId,
-      instance: nextInstance,
-      driver: ProviderDriverKind.make("codex"),
-      isDefault: false,
-    });
+    const patch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: false,
+      },
+      { granular: true },
+    );
 
     expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
     expect(patch.providers).toBeUndefined();

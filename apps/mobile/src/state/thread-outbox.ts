@@ -30,16 +30,25 @@ export function updateThreadOutboxMessage(message: QueuedThreadMessage): Promise
   return threadOutboxManager.update(message);
 }
 
+/** Reads the CURRENT stored entry once pending mutations settle. */
+export function getThreadOutboxMessageById(
+  messageId: MessageId,
+): Promise<QueuedThreadMessage | undefined> {
+  return threadOutboxManager.getById(messageId);
+}
+
 /**
  * Durably applies recovery markers to the CURRENT stored entry (never a
- * captured snapshot). Returns false — writing nothing — when the entry no
- * longer exists.
+ * captured snapshot). "missing" = deleted concurrently; "stale" = the
+ * stored content no longer matches `expect` (an edit landed mid-recovery).
+ * Nothing is written in either non-"marked" case.
  */
 export function markThreadOutboxMessageRecovery(
   messageId: MessageId,
   markers: ThreadOutboxRecoveryMarkers,
-): Promise<boolean> {
-  return threadOutboxManager.mark(messageId, markers);
+  expect?: { readonly text: string; readonly attachmentIds: ReadonlyArray<string> },
+): Promise<"marked" | "missing" | "stale"> {
+  return threadOutboxManager.mark(messageId, markers, expect);
 }
 
 export function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {

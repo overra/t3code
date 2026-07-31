@@ -234,24 +234,48 @@ describe("thread outbox", () => {
     await manager.update({ ...message, text: "edited while rejection was in flight" });
     expect(
       await manager.mark(message.messageId, { recoveryStartedAt: "2026-06-08T10:00:05.000Z" }),
-    ).toBe(true);
+    ).toBe("marked");
     expect(stored.get(message.messageId)).toMatchObject({
       text: "edited while rejection was in flight",
       recoveryStartedAt: "2026-06-08T10:00:05.000Z",
     });
 
     // An editor save that reconstructs the record WITHOUT the marker cannot
-    // erase it: markers are monotonic through update().
+    // erase it: markers are monotonic through update(). The same holds for a
+    // same-id re-enqueue (offline resubmission of an open pending task).
     expect(await manager.update({ ...message, text: "editor save" })).toBe(true);
     expect(stored.get(message.messageId)).toMatchObject({
       text: "editor save",
       recoveryStartedAt: "2026-06-08T10:00:05.000Z",
     });
+    await manager.enqueue({ ...message, text: "resubmitted" });
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "resubmitted",
+      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
+    });
 
-    // Marking an entry deleted concurrently writes nothing and reports false.
+    // A content-CAS mark refuses when the stored content changed since the
+    // caller read it — recovery then retracts its restore and retries fresh.
+    expect(
+      await manager.mark(
+        message.messageId,
+        { restoredAt: "2026-06-08T10:00:06.000Z" },
+        { text: "some older capture", attachmentIds: [] },
+      ),
+    ).toBe("stale");
+    expect(stored.get(message.messageId)?.restoredAt).toBeUndefined();
+    expect(
+      await manager.mark(
+        message.messageId,
+        { restoredAt: "2026-06-08T10:00:06.000Z" },
+        { text: "resubmitted", attachmentIds: [] },
+      ),
+    ).toBe("marked");
+
+    // Marking an entry deleted concurrently writes nothing and reports it.
     await manager.remove(message);
-    expect(await manager.mark(message.messageId, { restoredAt: "2026-06-08T10:00:06.000Z" })).toBe(
-      false,
+    expect(await manager.mark(message.messageId, { restoredAt: "2026-06-08T10:00:07.000Z" })).toBe(
+      "missing",
     );
     expect(stored.size).toBe(0);
     registry.dispose();

@@ -1,5 +1,6 @@
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
+import * as Option from "effect/Option";
 import {
   canSnooze,
   effectiveSettled,
@@ -96,6 +97,7 @@ import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
+import { environmentShell } from "../state/shell";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
 import { projectEnvironment } from "../state/projects";
@@ -1085,45 +1087,48 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
 function ProjectAllowedProvidersControl(props: {
   member: SidebarProjectGroupMember;
   providerEntries: ReadonlyArray<ProviderInstanceEntry>;
-  /** Resolves false when the server rejected the update (optimistic state rolls back). */
+  /**
+   * Resolves `{ok: false}` when the server rejected the update (optimistic
+   * state rolls back); on success carries the dispatch's event sequence so
+   * the overlay can hold until the shell stream provably reflects it.
+   */
   onUpdate: (
     member: SidebarProjectGroupMember,
     allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
-  ) => Promise<boolean>;
+  ) => Promise<{ readonly ok: boolean; readonly sequence?: number }>;
 }) {
   const { member, providerEntries, onUpdate } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the streamed prop (which lags a round-trip and would resurrect the
-  // previous edit). There is deliberately NO clear-on-value-equality: echoes
-  // carry no version, so "prop equals pending" cannot distinguish the final
-  // echo from the pre-write value or an intermediate one (an A→B→A sequence
-  // makes them identical), and clearing early exposes a stale echo and lets
-  // the next edit chain from the wrong state. While the overlay equals the
-  // prop it renders identically anyway, so holding it is free. It clears only
-  // on rejection rollback (generation-guarded) or after a quiet period — no
-  // write in flight, re-armed on every settle — by which time every echo for
-  // our writes has long landed.
+  // previous edit). The overlay resolves against an AUTHORITATIVE
+  // acknowledgment: every dispatch returns the event sequence its write
+  // produced, and the shell stream applies events in sequence order — so
+  // the overlay clears only once the environment's applied snapshot
+  // sequence has caught up to the highest acknowledged write with no write
+  // in flight. Never on value equality (ambiguous under A→B→A) and never on
+  // elapsed time (a delayed or reconnect-replayed echo after a timed clear
+  // would expose stale policy that the next toggle then composes from). A
+  // rejected write rolls back immediately, generation-guarded.
   const [pendingAllowed, setPendingAllowed] = useState<
     ReadonlyArray<ProviderInstanceId> | null | undefined
   >(undefined);
   const [settledTick, setSettledTick] = useState(0);
   const generationRef = useRef(0);
   const inflightRef = useRef(0);
+  const ackSequenceRef = useRef(0);
+  const shellState = useAtomValue(environmentShell.stateValueAtom(member.environmentId));
+  const appliedSequence = Option.match(shellState.snapshot, {
+    onNone: () => 0,
+    onSome: (snapshot) => snapshot.snapshotSequence,
+  });
   const propAllowed = member.allowedProviderInstances ?? null;
   useEffect(() => {
     if (pendingAllowed === undefined) return;
-    const generation = generationRef.current;
-    // The quiet period must observe STREAMED ECHOES, not just request
-    // settlement: `propAllowed` in the deps re-arms the window on every
-    // incoming echo, so a delayed intermediate echo landing just before
-    // expiry restarts the clock instead of being exposed by an early clear.
-    const timer = window.setTimeout(() => {
-      if (generationRef.current === generation && inflightRef.current === 0) {
-        setPendingAllowed(undefined);
-      }
-    }, 5000);
-    return () => window.clearTimeout(timer);
-  }, [pendingAllowed, settledTick, propAllowed]);
+    if (inflightRef.current !== 0) return;
+    if (appliedSequence >= ackSequenceRef.current) {
+      setPendingAllowed(undefined);
+    }
+  }, [pendingAllowed, settledTick, appliedSequence]);
   const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
   const checkedIds = useMemo(
     () =>
@@ -1150,8 +1155,14 @@ function ProjectAllowedProvidersControl(props: {
     inflightRef.current += 1;
     setPendingAllowed(next);
     void onUpdate(member, next)
-      .then((ok) => {
-        if (!ok && generationRef.current === generation) setPendingAllowed(undefined);
+      .then((outcome) => {
+        if (outcome.ok) {
+          if (outcome.sequence !== undefined) {
+            ackSequenceRef.current = Math.max(ackSequenceRef.current, outcome.sequence);
+          }
+          return;
+        }
+        if (generationRef.current === generation) setPendingAllowed(undefined);
       })
       .finally(() => {
         inflightRef.current -= 1;
@@ -1646,7 +1657,7 @@ export default function SidebarV2() {
     async (
       member: SidebarProjectGroupMember,
       allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
-    ): Promise<boolean> => {
+    ): Promise<{ readonly ok: boolean; readonly sequence?: number }> => {
       // The decider auto-clears a default the new allowlist excludes;
       // deriving that clear here from possibly-stale member state raced the
       // dialog's own rapid edits.
@@ -1667,7 +1678,11 @@ export default function SidebarV2() {
           }),
         );
       }
-      return result._tag !== "Failure";
+      if (result._tag !== "Success") {
+        return { ok: result._tag !== "Failure" };
+      }
+      const sequence = (result.value as { sequence?: unknown }).sequence;
+      return { ok: true, ...(typeof sequence === "number" ? { sequence } : {}) };
     },
     [updateProject],
   );
@@ -3111,35 +3126,46 @@ export default function SidebarV2() {
                       </Select>
                     </label>
                   </div>
-                  <ProjectAllowedProvidersControl
-                    // `projectActionsTarget` is a snapshot from dialog-open;
-                    // overlay the live project record so the allowlist
-                    // checkboxes track the shell stream instead of freezing
-                    // at their open-time state.
-                    member={(() => {
-                      const liveProject = projects.find(
-                        (project) =>
-                          project.environmentId === member.environmentId &&
-                          project.id === member.id,
-                      );
-                      return liveProject ? { ...member, ...liveProject } : member;
-                    })()}
-                    providerEntries={sortProviderInstanceEntries(
-                      (() => {
-                        const memberServerConfig = serverConfigs.get(member.environmentId);
-                        const entries = deriveProviderInstanceEntries(
-                          memberServerConfig?.providers ?? [],
+                  {serverConfigs.get(member.environmentId)?.environment.capabilities
+                    .providerProjectScopes !== true ? (
+                    // Version-skew gate: an older server strips the
+                    // allowlist field from the command and would silently
+                    // acknowledge a no-op — hide the editor rather than
+                    // pretend the policy took effect.
+                    <p className="text-xs text-muted-foreground">
+                      Managing allowed providers requires a newer server on this environment.
+                    </p>
+                  ) : (
+                    <ProjectAllowedProvidersControl
+                      // `projectActionsTarget` is a snapshot from dialog-open;
+                      // overlay the live project record so the allowlist
+                      // checkboxes track the shell stream instead of freezing
+                      // at their open-time state.
+                      member={(() => {
+                        const liveProject = projects.find(
+                          (project) =>
+                            project.environmentId === member.environmentId &&
+                            project.id === member.id,
                         );
-                        // The settings overlay stamps each entry's project
-                        // scope (and authoritative enabled state) so the
-                        // control can render cross-rule verdicts.
-                        return memberServerConfig
-                          ? applyProviderInstanceSettings(entries, memberServerConfig.settings)
-                          : entries;
-                      })(),
-                    )}
-                    onUpdate={updateProjectAllowedProviders}
-                  />
+                        return liveProject ? { ...member, ...liveProject } : member;
+                      })()}
+                      providerEntries={sortProviderInstanceEntries(
+                        (() => {
+                          const memberServerConfig = serverConfigs.get(member.environmentId);
+                          const entries = deriveProviderInstanceEntries(
+                            memberServerConfig?.providers ?? [],
+                          );
+                          // The settings overlay stamps each entry's project
+                          // scope (and authoritative enabled state) so the
+                          // control can render cross-rule verdicts.
+                          return memberServerConfig
+                            ? applyProviderInstanceSettings(entries, memberServerConfig.settings)
+                            : entries;
+                        })(),
+                      )}
+                      onUpdate={updateProjectAllowedProviders}
+                    />
+                  )}
                   {projectActionsTarget.memberProjects.length > 1 ? (
                     <div className="flex justify-end">
                       <Button

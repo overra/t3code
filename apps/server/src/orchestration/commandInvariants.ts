@@ -208,13 +208,13 @@ export function requireThreadAbsent(input: {
   readonly command: OrchestrationCommand;
   readonly threadId: ThreadId;
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {
-  const thread = findThreadById(input.readModel, input.threadId);
-  // A soft-deleted thread no longer occupies its id: bootstrap cleanup
-  // deletes a partially created thread precisely so a retry of the same
-  // queued command (which pins the thread id) can recreate it. Both the
-  // in-memory projector and the SQLite projection replace the entry
-  // wholesale on `thread.created`, so recreation starts from a clean row.
-  if (!thread || thread.deletedAt !== null) {
+  // A soft-deleted thread STILL occupies its id: child rows — messages,
+  // activities, plans, checkpoints, turns, approvals, provider sessions —
+  // are keyed by thread id and are not purged by soft deletion, so
+  // recreating the id would resurrect the old thread's history (and its
+  // provider session) into the "new" thread, across projects. Callers that
+  // need to retry a creation must use a fresh id.
+  if (!findThreadById(input.readModel, input.threadId)) {
     return Effect.void;
   }
   return Effect.fail(

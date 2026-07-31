@@ -2,7 +2,7 @@
 
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { CheckIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ProviderInstanceId,
   ProviderDriverKind,
@@ -118,18 +118,25 @@ interface AddProviderInstanceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /**
-   * Persists the new instance. Provided by the settings panel so the write
-   * goes through its whole-map composition (freshest settings + pending
-   * writes) — a dialog-local `{...settings.providerInstances}` spread races
-   * the panel's own in-flight edits in both directions.
+   * Persists the new instance through the settings panel's writer (granular
+   * patch on capable servers). Returns the persist promise; `undefined`
+   * means no primary environment existed to write to.
    */
   onCreateInstance: (instanceId: ProviderInstanceId, instance: ProviderInstanceConfig) => unknown;
+  /**
+   * Instance ids that exist beyond the echoed explicit config map: the
+   * synthesized per-driver default ids and every live server-reported
+   * instance. Creation is an upsert, so colliding with any of these would
+   * silently overwrite rather than error.
+   */
+  reservedInstanceIds?: ReadonlyArray<string> | undefined;
 }
 
 export function AddProviderInstanceDialog({
   open,
   onOpenChange,
   onCreateInstance,
+  reservedInstanceIds,
 }: AddProviderInstanceDialogProps) {
   const settings = usePrimarySettings();
 
@@ -145,10 +152,28 @@ export function AddProviderInstanceDialog({
   // they update live so fixing the problem clears the message in place.
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  // A save completing after this dialog instance closed (or after an
+  // environment switch remounted it) must not toast or close the CURRENT
+  // dialog on its behalf.
+  const unmountedRef = useRef(false);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
+  const requestOpenChange = (nextOpen: boolean) => {
+    // The write targets whatever this dialog validated against; closing (or
+    // dismissing via Escape/overlay) mid-save would detach that outcome
+    // from any feedback surface.
+    if (isSaving && !nextOpen) return;
+    onOpenChange(nextOpen);
+  };
 
   const existingIds = useMemo(
-    () => new Set(Object.keys(settings.providerInstances ?? {})),
-    [settings.providerInstances],
+    () =>
+      new Set([...Object.keys(settings.providerInstances ?? {}), ...(reservedInstanceIds ?? [])]),
+    [settings.providerInstances, reservedInstanceIds],
   );
 
   const driverOption = DRIVER_OPTION_BY_VALUE[driver] ?? DEFAULT_DRIVER_OPTION;
@@ -214,19 +239,25 @@ export function AddProviderInstanceDialog({
     try {
       // The persist settles with an AtomCommandResult rather than throwing;
       // success is only reported (and the dialog only closed) once the
-      // server acknowledged the write. Failure keeps the dialog open with
-      // the entered values intact.
+      // server acknowledged the write. `undefined` means there was no
+      // primary environment to write to — a failure, not a success. Failure
+      // keeps the dialog open with the entered values intact.
       const settled = await Promise.resolve(onCreateInstance(brandedId, nextInstance));
+      if (unmountedRef.current) return;
       const failed =
-        typeof settled === "object" &&
-        settled !== null &&
-        "_tag" in settled &&
-        settled._tag === "Failure";
+        settled === undefined ||
+        (typeof settled === "object" &&
+          settled !== null &&
+          "_tag" in settled &&
+          settled._tag === "Failure");
       if (failed) {
         toastManager.add({
           type: "error",
           title: "Could not add provider instance",
-          description: "The settings update was rejected by the server.",
+          description:
+            settled === undefined
+              ? "No connected primary environment to save to."
+              : "The settings update was rejected by the server.",
         });
         return;
       }
@@ -237,6 +268,7 @@ export function AddProviderInstanceDialog({
       });
       onOpenChange(false);
     } catch (error) {
+      if (unmountedRef.current) return;
       toastManager.add({
         type: "error",
         title: "Could not add provider instance",
@@ -248,7 +280,7 @@ export function AddProviderInstanceDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={requestOpenChange}>
       <DialogPopup className="max-w-xl overflow-hidden">
         <div className="flex min-h-0 flex-col overflow-hidden">
           <DialogHeader>
@@ -437,9 +469,10 @@ export function AddProviderInstanceDialog({
             <Button
               variant="outline"
               size="sm"
+              disabled={isSaving}
               onClick={() => {
                 if (wizardStep === 0) {
-                  onOpenChange(false);
+                  requestOpenChange(false);
                   return;
                 }
                 setWizardStep((step) => Math.max(0, step - 1));

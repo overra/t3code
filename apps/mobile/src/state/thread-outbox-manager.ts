@@ -89,23 +89,48 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     return loadPromise;
   };
 
+  // Returns `message` by IDENTITY when nothing needs preserving: enqueue's
+  // rollback and confirmQueued compare by reference, and wrapping every
+  // message in a copy would break both.
+  const withPreservedRecoveryMarkers = (
+    message: QueuedThreadMessage,
+    existing: QueuedThreadMessage | undefined,
+  ): QueuedThreadMessage => {
+    if (existing === undefined) return message;
+    const preserveRecoveryStarted =
+      message.recoveryStartedAt === undefined && existing.recoveryStartedAt !== undefined;
+    const preserveRestored = message.restoredAt === undefined && existing.restoredAt !== undefined;
+    if (!preserveRecoveryStarted && !preserveRestored) return message;
+    return {
+      ...message,
+      ...(preserveRecoveryStarted ? { recoveryStartedAt: existing.recoveryStartedAt } : {}),
+      ...(preserveRestored ? { restoredAt: existing.restoredAt } : {}),
+    };
+  };
+
   // The queued atom drives the composer's immediate "queued" feedback, so it
   // is published synchronously; the durable write happens behind it and rolls
   // the message back out if it fails (durability only matters for crash
-  // recovery, not for the in-session queue).
+  // recovery, not for the in-session queue). Re-enqueueing an id preserves
+  // any recovery markers the stored entry carries — a resubmission must not
+  // make a recovery-committed entry deliverable again.
   const enqueue = (message: QueuedThreadMessage): Promise<void> => {
-    setMessages([
-      ...currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
+    const merged = withPreservedRecoveryMarkers(
       message,
+      currentMessages().find((candidate) => candidate.messageId === message.messageId),
+    );
+    setMessages([
+      ...currentMessages().filter((candidate) => candidate.messageId !== merged.messageId),
+      merged,
     ]);
     return serialize(async () => {
       try {
-        await options.storage.write(message);
+        await options.storage.write(merged);
       } catch (cause) {
         // Roll back by reference, not messageId: a retry enqueue with the same
         // id may have optimistically replaced this attempt while the write was
         // in flight, and its entry must survive this attempt's failure.
-        setMessages(currentMessages().filter((candidate) => candidate !== message));
+        setMessages(currentMessages().filter((candidate) => candidate !== merged));
         throw new ThreadOutboxManagerError({
           operation: "enqueue",
           environmentId: message.environmentId,
@@ -138,15 +163,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (existing === undefined) {
         return false;
       }
-      const merged: QueuedThreadMessage = {
-        ...message,
-        ...(message.recoveryStartedAt === undefined && existing.recoveryStartedAt !== undefined
-          ? { recoveryStartedAt: existing.recoveryStartedAt }
-          : {}),
-        ...(message.restoredAt === undefined && existing.restoredAt !== undefined
-          ? { restoredAt: existing.restoredAt }
-          : {}),
-      };
+      const merged = withPreservedRecoveryMarkers(message, existing);
       try {
         await options.storage.write(merged);
       } catch (cause) {
@@ -165,15 +182,41 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       return true;
     });
 
+  // Reads the CURRENT stored entry once pending mutations settle. Recovery
+  // must restore what is stored NOW, not a snapshot captured before the
+  // rejection round-trip — an edit landing meanwhile would otherwise be
+  // silently discarded.
+  const getById = (messageId: MessageId): Promise<QueuedThreadMessage | undefined> =>
+    serialize(async () => currentMessages().find((candidate) => candidate.messageId === messageId));
+
   // Applies recovery markers to the CURRENT stored entry — never to a
   // caller-captured snapshot — so marking cannot clobber content edits made
-  // while a rejection was in flight. Returns false when the entry no longer
-  // exists (deleted concurrently), in which case nothing was written.
-  const mark = (messageId: MessageId, markers: ThreadOutboxRecoveryMarkers): Promise<boolean> =>
+  // while a rejection was in flight. "missing" means the entry no longer
+  // exists (deleted concurrently); with `expect` provided, "stale" means the
+  // stored content changed since the caller read it (an edit landed
+  // mid-recovery) — in both cases nothing was written.
+  const mark = (
+    messageId: MessageId,
+    markers: ThreadOutboxRecoveryMarkers,
+    expect?: {
+      readonly text: string;
+      readonly attachmentIds: ReadonlyArray<string>;
+    },
+  ): Promise<"marked" | "missing" | "stale"> =>
     serialize(async () => {
       const existing = currentMessages().find((candidate) => candidate.messageId === messageId);
       if (existing === undefined) {
-        return false;
+        return "missing";
+      }
+      if (expect !== undefined) {
+        const attachmentIds = existing.attachments.map((attachment) => attachment.id);
+        const contentMatches =
+          existing.text === expect.text &&
+          attachmentIds.length === expect.attachmentIds.length &&
+          attachmentIds.every((id, index) => id === expect.attachmentIds[index]);
+        if (!contentMatches) {
+          return "stale";
+        }
       }
       const merged: QueuedThreadMessage = { ...existing, ...markers };
       try {
@@ -191,7 +234,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
         ...currentMessages().filter((candidate) => candidate.messageId !== messageId),
         merged,
       ]);
-      return true;
+      return "marked";
     });
 
   const remove = (message: QueuedThreadMessage): Promise<void> =>
@@ -264,6 +307,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     enqueue,
     confirmQueued,
     update,
+    getById,
     mark,
     remove,
     clearEnvironment,

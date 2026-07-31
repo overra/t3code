@@ -5936,9 +5936,20 @@ function ChatViewContent(props: ChatViewProps) {
                             activeProjectDefaultModelSelection={
                               activeProject?.defaultModelSelection
                             }
-                            activeProjectId={activeProject?.id}
+                            activeProjectId={activeProject?.id ?? activeThread?.projectId}
                             activeProjectAllowedProviderInstances={
                               activeProject?.allowedProviderInstances
+                            }
+                            // A thread whose project id resolves to nothing
+                            // in the live shell is NOT unscoped — its project
+                            // was deleted, and the server validates against
+                            // the deleted project's real rules. Fail closed
+                            // instead of offering every provider.
+                            activeProjectMissing={
+                              activeThread !== null &&
+                              activeThread !== undefined &&
+                              activeEnvironmentBootstrapComplete &&
+                              activeProject === null
                             }
                             activeThreadModelSelection={activeThread?.modelSelection}
                             activeThreadActivities={activeThread?.activities}
