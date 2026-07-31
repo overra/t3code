@@ -135,6 +135,9 @@ const ProjectionProjectLookupRowSchema = ProjectionProjectDbRowSchema;
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
 });
+const ProjectionThreadProjectIdLookupRowSchema = Schema.Struct({
+  projectId: ProjectId,
+});
 const ProjectionThreadCheckpointContextThreadRowSchema = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
@@ -870,6 +873,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           ON projects.project_id = threads.project_id
         WHERE threads.thread_id = ${threadId}
           AND threads.deleted_at IS NULL
+        LIMIT 1
+      `,
+  });
+
+  // Deliberately unfiltered: access checks must resolve archived and
+  // soft-deleted threads too (see ProjectionSnapshotQueryShape docs).
+  const getThreadProjectIdRowById = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadProjectIdLookupRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          project_id AS "projectId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
         LIMIT 1
       `,
   });
@@ -2034,6 +2052,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       });
     });
 
+  const getThreadProjectIdById: ProjectionSnapshotQueryShape["getThreadProjectIdById"] = (
+    threadId,
+  ) =>
+    getThreadProjectIdRowById({ threadId }).pipe(
+      Effect.map(Option.map((row) => row.projectId)),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getThreadProjectIdById:query",
+          "ProjectionSnapshotQuery.getThreadProjectIdById:decodeRow",
+        ),
+      ),
+    );
+
   const getThreadShellById: ProjectionSnapshotQueryShape["getThreadShellById"] = (threadId) =>
     Effect.gen(function* () {
       const [threadRow, latestTurnRow, sessionRow] = yield* Effect.all([
@@ -2280,6 +2311,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadCheckpointContext,
     getFullThreadDiffContext,
     getThreadShellById,
+    getThreadProjectIdById,
     getThreadDetailById,
     getThreadDetailSnapshot,
   } satisfies ProjectionSnapshotQueryShape;

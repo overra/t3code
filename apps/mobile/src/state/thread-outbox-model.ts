@@ -51,6 +51,12 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
   createdAt: IsoDateTime,
+  // Set once this entry's content has been durably restored to a composer
+  // draft after a deterministic rejection. The marker lives HERE (not only as
+  // a receipt inside the draft) so a failed outbox removal can never lead to
+  // a second restore after the user sends the recovered draft — sending
+  // clears the draft along with its receipt, but not this entry.
+  restoredAt: Schema.optional(IsoDateTime),
 });
 
 const decodeStoredQueuedThreadMessage = Schema.decodeUnknownSync(QueuedThreadMessageSchema);
@@ -78,6 +84,8 @@ export interface QueuedThreadMessage {
   readonly interactionMode?: ProviderInteractionModeType;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
+  /** See `QueuedThreadMessageSchema.restoredAt`. */
+  readonly restoredAt?: string;
 }
 
 export interface ThreadSettingsSnapshot {

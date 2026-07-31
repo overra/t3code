@@ -632,9 +632,16 @@ const projectProvidersCommand = Command.make("providers", {
           const current =
             snapshot.projects.find((entry) => entry.id === project.id)?.allowedProviderInstances ??
             null;
+          // The show form is read-only; spell out the mutating flags and
+          // where instance ids come from so this output is enough to act on.
+          const remediation = [
+            "Use --allow <ids> to restrict, or --all to clear the restriction.",
+            "Instance ids are the driver name for default instances (codex, claudeAgent)",
+            "or the name chosen when an instance was added (see Settings → Providers).",
+          ].join("\n");
           return current === null
-            ? `Project ${project.id} allows every provider instance.`
-            : `Project ${project.id} allows: ${current.join(", ")}.`;
+            ? `Project ${project.id} allows every provider instance.\n${remediation}`
+            : `Project ${project.id} allows: ${current.join(", ")}.\n${remediation}`;
         }
 
         if (flags.all) {

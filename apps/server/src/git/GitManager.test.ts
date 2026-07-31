@@ -708,6 +708,16 @@ it("relates normalized repository paths across separators for the writer clamp",
   const uncNested = normalizeProjectPathForComparison("\\\\server\\share\\repo\\sub");
   expect(GitManager.areNormalizedPathsRelated(uncNested, uncRoot)).toBe(true);
   expect(GitManager.areNormalizedPathsRelated(uncRoot, uncNested)).toBe(true);
+
+  // Filesystem roots already end in their separator; a project rooted there
+  // must still own every repository beneath it.
+  expect(normalizeProjectPathForComparison("/")).toBe("/");
+  expect(GitManager.areNormalizedPathsRelated("/repo", "/")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/", "/repo")).toBe(true);
+  const winDriveRoot = normalizeProjectPathForComparison("C:\\");
+  expect(winDriveRoot).toBe("c:\\");
+  expect(GitManager.areNormalizedPathsRelated("c:\\repo", winDriveRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winDriveRoot, winDriveRoot)).toBe(true);
 });
 
 const GitManagerTestLayer = GitVcsDriver.layer.pipe(

@@ -3225,7 +3225,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                           <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
                             Allowed providers are set in the project&apos;s settings (project row →
                             Project settings), or from the project directory with{" "}
-                            <code>npx t3@latest project providers .</code>.
+                            <code>
+                              npx t3@latest project providers . --allow &lt;instance-ids&gt;
+                            </code>{" "}
+                            (<code>--all</code> clears the restriction).
                           </p>
                         ) : null}
                         {restrictedProviderInstanceNotes.some(

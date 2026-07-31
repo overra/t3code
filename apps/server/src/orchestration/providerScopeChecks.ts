@@ -27,7 +27,6 @@ import {
   type ClientOrchestrationCommand,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
-  type OrchestrationThreadShell,
   type ProjectId,
   type ProviderInstanceId,
   type ServerSettings,
@@ -109,12 +108,16 @@ export function collectProviderScopeChecks(
  * Capabilities the validator needs, passed as values rather than resolved
  * from the Effect context so dispatch surfaces can reuse their existing
  * service handles without growing their handlers' context requirements.
+ *
+ * `getThreadProjectId` must resolve archived and soft-deleted threads too:
+ * the decider still accepts commands against them, so a lookup that filters
+ * inactive threads would let a bootstrap-bearing turn substitute an
+ * arbitrary (more permissive) project for validation while the command
+ * lands on the inactive thread's real project.
  */
 export interface ValidateCommandProviderAccessDeps<E1 = never, E2 = never, E3 = never> {
   readonly getSettings: Effect.Effect<ServerSettings, E1>;
-  readonly getThreadShellById: (
-    threadId: ThreadId,
-  ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, E2>;
+  readonly getThreadProjectId: (threadId: ThreadId) => Effect.Effect<Option.Option<ProjectId>, E2>;
   readonly getProjectShellById: (
     projectId: ProjectId,
   ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E3>;
@@ -143,11 +146,11 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
     const projectId =
       target.kind === "project"
         ? target.projectId
-        : yield* deps.getThreadShellById(target.threadId).pipe(
+        : yield* deps.getThreadProjectId(target.threadId).pipe(
             Effect.map(Option.getOrUndefined),
-            Effect.map((thread) =>
-              thread !== undefined
-                ? thread.projectId
+            Effect.map((threadProjectId) =>
+              threadProjectId !== undefined
+                ? threadProjectId
                 : target.kind === "thread-else-project"
                   ? target.fallbackProjectId
                   : undefined,

@@ -32,7 +32,9 @@ npx t3@latest project providers . --allow codex,claudeAgent_work  # restrict
 npx t3@latest project providers . --all                           # clear the restriction
 ```
 
-The `--allow` list takes provider _instance_ ids as shown by the show
-command — the default instance for a driver is the driver name itself
-(`codex`, `claudeAgent`), and additional instances use the name they were
-created with (for example `claudeAgent_work`).
+The flagless form only prints the current allowlist — changing it always
+takes `--allow` or `--all`. The `--allow` list takes provider _instance_
+ids: the driver name for a default instance (`codex`, `claudeAgent`), or
+the name chosen when an extra instance was added (for example
+`claudeAgent_work`). Every configured instance id is visible in
+Settings → Providers.

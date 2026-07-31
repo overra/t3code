@@ -514,7 +514,10 @@ export function restoreComposerDraftSnapshotOnceState(
   if (existing.importedShareIds?.includes(receiptId)) {
     return { next: current, restored: true };
   }
-  if (existing.text.length > 0 || existing.attachments.length > 0) {
+  // ANY user state blocks the restore — including a settings-only draft: a
+  // model/workspace/branch/mode the user picked must not be silently
+  // replaced by the queued task's shape.
+  if (!isEmptyDraft(existing)) {
     return { next: current, restored: false };
   }
   return {
@@ -527,12 +530,33 @@ export function restoreComposerDraftSnapshotOnceState(
 }
 
 /**
+ * Awaits hydration, then commits `next` as the draft state both in memory
+ * and durably. The pending debounce timer is cancelled only here, at the
+ * moment its captured (older) map is superseded by `next` — cancelling it on
+ * a path that does NOT write would silently drop other drafts' pending
+ * edits. A rejected filesystem write propagates to the caller AFTER the
+ * in-memory publish, so content is never lost — but callers must not treat
+ * the operation as durable until this resolves.
+ */
+async function commitComposerDraftState(next: Record<string, ComposerDraft>): Promise<void> {
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  appAtomRegistry.set(composerDraftsAtom, next);
+  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+}
+
+/**
  * Restores a queued task's full draft — content, task-shape settings, and its
- * recovery receipt — as ONE durable write, but only when the target draft has
- * no user content to clobber or truncate. A draft already carrying
- * `receiptId` counts as restored (a crash between restore and outbox removal
- * lands here on the retry), which keeps the call idempotent. Returns whether
- * the draft now holds the restored task.
+ * recovery receipt — as ONE durable write, but only into a draft with no user
+ * state to clobber. A draft already carrying `receiptId` counts as restored
+ * (a crash between restore and outbox removal lands here on the retry), and
+ * that path STILL awaits a persist of the current state before reporting
+ * success: the receipt may exist only in memory when the original write
+ * failed after publishing, and the caller deletes the outbox entry — the
+ * only other durable copy — on success. Returns whether the draft durably
+ * holds the restored task.
  */
 export async function restoreComposerDraftSnapshotOnce(
   draftKey: string,
@@ -543,10 +567,6 @@ export async function restoreComposerDraftSnapshotOnce(
   if (loadPromise !== null) {
     await loadPromise;
   }
-  if (persistTimer !== null) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
   const current = appAtomRegistry.get(composerDraftsAtom);
   const { next, restored } = restoreComposerDraftSnapshotOnceState(
     current,
@@ -555,13 +575,72 @@ export async function restoreComposerDraftSnapshotOnce(
     receiptId,
   );
   if (!restored) {
-    return { restored };
+    return { restored: false };
   }
+  if (next === current) {
+    // Receipt already present: verify durability before reporting success.
+    await persistenceQueue.run(() =>
+      writePersistedComposerDrafts(appAtomRegistry.get(composerDraftsAtom)),
+    );
+    return { restored: true };
+  }
+  await commitComposerDraftState(next);
+  return { restored: true };
+}
+
+export function canMergeComposerDraftContentWithoutTruncation(
+  existing: ComposerDraft,
+  content: ComposerDraftContent,
+): boolean {
+  const existingAttachmentIds = new Set(existing.attachments.map((attachment) => attachment.id));
+  const incomingAttachmentCount = content.attachments.filter(
+    (attachment) => !existingAttachmentIds.has(attachment.id),
+  ).length;
+  return (
+    existing.attachments.length + incomingAttachmentCount <= PROVIDER_SEND_TURN_MAX_ATTACHMENTS
+  );
+}
+
+/**
+ * Merges recovered outbox content into a thread draft, but ONLY when every
+ * attachment fits under the draft cap — a partial restore would persist a
+ * truncated copy (plus its dedup receipt) while the caller keeps the full
+ * original queued, leaving two diverging copies and a receipt that blocks
+ * the retry from ever completing. Refusal writes nothing at all. The
+ * receipt-present path awaits a persist of current state before reporting
+ * success, mirroring `restoreComposerDraftSnapshotOnce`.
+ */
+export async function mergeComposerDraftContentIfFits(
+  draftKey: string,
+  content: ComposerDraftContent,
+): Promise<{ readonly merged: boolean }> {
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) {
+    await loadPromise;
+  }
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const existing = normalizeDraft(current[draftKey]);
+  if (content.sourceShareId && existing.importedShareIds?.includes(content.sourceShareId)) {
+    await persistenceQueue.run(() =>
+      writePersistedComposerDrafts(appAtomRegistry.get(composerDraftsAtom)),
+    );
+    return { merged: true };
+  }
+  if (!canMergeComposerDraftContentWithoutTruncation(existing, content)) {
+    return { merged: false };
+  }
+  const next = mergeComposerDraftContentState(current, draftKey, content);
   if (next !== current) {
-    appAtomRegistry.set(composerDraftsAtom, next);
-    await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+    await commitComposerDraftState(next);
+  } else {
+    // No-op merge (content already present): still verify durability, so
+    // `merged: true` uniformly means "on disk" before the caller deletes
+    // the outbox entry.
+    await persistenceQueue.run(() =>
+      writePersistedComposerDrafts(appAtomRegistry.get(composerDraftsAtom)),
+    );
   }
-  return { restored };
+  return { merged: true };
 }
 
 /** Restores the exact content/settings captured before an interrupted import. */

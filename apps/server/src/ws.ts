@@ -70,6 +70,10 @@ import {
   projectActivityEvent,
   projectThreadDetailSnapshot,
 } from "./orchestration/ActivityPayloadProjection.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationCommandPreviouslyRejectedError,
+} from "./orchestration/Errors.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import { validateCommandProviderAccess } from "./orchestration/providerScopeChecks.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -122,6 +126,19 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
+  OrchestrationCommandPreviouslyRejectedError,
+);
+/**
+ * Rejections that will fail identically on every retry: the decider found the
+ * command invalid, or this command id was already tried and rejected. Client
+ * retry queues must treat these as final (restore + drop) — marking them
+ * retryable would pin an offline queue's FIFO on the poisoned entry forever.
+ */
+const isDeterministicOrchestrationRejection = (error: unknown): boolean =>
+  isOrchestrationCommandInvariantError(error) ||
+  isOrchestrationCommandPreviouslyRejectedError(error);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(5);
@@ -464,11 +481,12 @@ const makeWsRpcLayer = (
           ? cause
           : new OrchestrationDispatchCommandError({
               message: cause instanceof Error ? cause.message : fallbackMessage,
-              // A generic wrap covers unknown infrastructure failures
-              // (startup, database, engine) — not policy decisions. Retry
-              // queues must not discard commands rejected this way; policy
-              // denials are constructed directly and stay unmarked.
-              retryable: true,
+              // Unknown infrastructure failures (startup, database, engine
+              // plumbing) are retryable, but DETERMINISTIC rejections —
+              // decider invariants, previously rejected command ids — must
+              // stay unmarked or retry queues would repeat them forever.
+              // Policy denials are constructed directly and stay unmarked.
+              ...(isDeterministicOrchestrationRejection(cause) ? {} : { retryable: true }),
               cause,
             });
       const randomUUID = crypto.randomUUIDv4.pipe(
@@ -531,6 +549,11 @@ const makeWsRpcLayer = (
           : new OrchestrationDispatchCommandError({
               message:
                 error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
+              // Same classification as the plain dispatch wrap: a transient
+              // git/database/engine failure mid-bootstrap must not read as a
+              // deterministic rejection, or offline queues restore-and-drop
+              // a task that a retry would have delivered.
+              ...(isDeterministicOrchestrationRejection(error) ? {} : { retryable: true }),
               cause,
             });
       };
@@ -1025,7 +1048,7 @@ const makeWsRpcLayer = (
               // its attachments to the attachment store.
               yield* validateCommandProviderAccess(command, {
                 getSettings: serverSettings.getSettings,
-                getThreadShellById: projectionSnapshotQuery.getThreadShellById,
+                getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
                 getProjectShellById: projectionSnapshotQuery.getProjectShellById,
               });
               const normalizedCommand = yield* normalizeDispatchCommand(command);

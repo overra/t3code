@@ -287,10 +287,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       }
       // Keep the (allowlist, default) pair consistent SERVER-SIDE: either
       // field may arrive alone from a client whose view of the other is
-      // stale — deriving the clear on the client races its own writes (an
-      // A→B→A allowlist sequence would resurrect nothing but silently rely
-      // on stale state). When the post-update allowlist excludes the
-      // post-update default, the default is cleared in the same event.
+      // stale. When a narrowed allowlist excludes the project's EXISTING
+      // default, the default is cleared in the same event — deriving that
+      // clear on the client races its own writes. But a default the caller
+      // EXPLICITLY asks for in this command is different: silently
+      // acknowledging it and writing `null` instead would report success for
+      // the opposite mutation, so that is rejected, matching project.create.
       const nextAllowedProviderInstances =
         command.allowedProviderInstances !== undefined
           ? command.allowedProviderInstances
@@ -299,10 +301,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.defaultModelSelection !== undefined
           ? command.defaultModelSelection
           : project.defaultModelSelection;
-      const defaultBecomesDisallowed =
+      const disallowedDefaultInstanceId =
         nextAllowedProviderInstances !== null &&
         nextDefaultModelSelection !== null &&
-        !nextAllowedProviderInstances.includes(nextDefaultModelSelection.instanceId);
+        !nextAllowedProviderInstances.includes(nextDefaultModelSelection.instanceId)
+          ? nextDefaultModelSelection.instanceId
+          : null;
+      if (disallowedDefaultInstanceId !== null && command.defaultModelSelection !== undefined) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Default provider instance '${disallowedDefaultInstanceId}' is not in the project's allowed provider instances.`,
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -322,7 +332,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           ...(command.allowedProviderInstances !== undefined
             ? { allowedProviderInstances: command.allowedProviderInstances }
             : {}),
-          ...(defaultBecomesDisallowed ? { defaultModelSelection: null } : {}),
+          ...(disallowedDefaultInstanceId !== null ? { defaultModelSelection: null } : {}),
           ...(command.scripts !== undefined ? { scripts: command.scripts } : {}),
           updatedAt: occurredAt,
         },

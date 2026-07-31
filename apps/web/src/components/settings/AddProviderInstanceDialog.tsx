@@ -9,7 +9,7 @@ import {
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 
-import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Button } from "../ui/button";
@@ -117,11 +117,21 @@ function validateInstanceId(id: string, existing: ReadonlySet<string>): string |
 interface AddProviderInstanceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /**
+   * Persists the new instance. Provided by the settings panel so the write
+   * goes through its whole-map composition (freshest settings + pending
+   * writes) — a dialog-local `{...settings.providerInstances}` spread races
+   * the panel's own in-flight edits in both directions.
+   */
+  onCreateInstance: (instanceId: ProviderInstanceId, instance: ProviderInstanceConfig) => unknown;
 }
 
-export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderInstanceDialogProps) {
+export function AddProviderInstanceDialog({
+  open,
+  onOpenChange,
+  onCreateInstance,
+}: AddProviderInstanceDialogProps) {
   const settings = usePrimarySettings();
-  const updateSettings = useUpdatePrimarySettings();
 
   const [wizardStep, setWizardStep] = useState(0);
   const [driver, setDriver] = useState<ProviderDriverKind>(DEFAULT_DRIVER_KIND);
@@ -199,12 +209,8 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
     // keeps the type boundary honest and guards against any future drift in
     // the slug rules.
     const brandedId = ProviderInstanceId.make(instanceId);
-    const nextMap = {
-      ...settings.providerInstances,
-      [brandedId]: nextInstance,
-    };
     try {
-      updateSettings({ providerInstances: nextMap });
+      onCreateInstance(brandedId, nextInstance);
       toastManager.add({
         type: "success",
         title: "Provider instance added",

@@ -65,7 +65,11 @@ import {
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
 import { useTheme } from "../../hooks/useTheme";
-import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import {
+  getClientSettings,
+  usePrimarySettings,
+  useUpdatePrimarySettings,
+} from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import {
@@ -2017,13 +2021,27 @@ export function ProviderSettingsPanel() {
   };
 
   const deleteProviderInstance = (id: ProviderInstanceId) => {
-    const { fresh, providerInstances } = composeProviderInstancesForWrite();
+    const { providerInstances } = composeProviderInstancesForWrite();
+    // Preferences and favorites are CLIENT-owned keys: they never appear on
+    // the server settings atom, so they must come from the client snapshot
+    // (which is updated synchronously and is therefore already the freshest
+    // state — no pending overlay needed).
+    const client = getClientSettings();
     const persist = updateSettings({
       providerInstances: withoutProviderInstanceKey(providerInstances, id),
-      providerModelPreferences: withoutProviderInstanceKey(fresh.providerModelPreferences, id),
-      favorites: withoutProviderInstanceFavorites(fresh.favorites ?? [], id),
+      providerModelPreferences: withoutProviderInstanceKey(client.providerModelPreferences, id),
+      favorites: withoutProviderInstanceFavorites(client.favorites ?? [], id),
     });
     trackPendingInstanceWrite(id, null, persist);
+  };
+
+  const createProviderInstance = (id: ProviderInstanceId, instance: ProviderInstanceConfig) => {
+    const { providerInstances } = composeProviderInstancesForWrite();
+    const persist = updateSettings({
+      providerInstances: { ...providerInstances, [id]: instance },
+    });
+    trackPendingInstanceWrite(id, instance, persist);
+    return persist;
   };
 
   const updateProviderModelPreferences = (
@@ -2035,8 +2053,9 @@ export function ProviderSettingsPanel() {
   ) => {
     const hiddenModels = [...new Set(next.hiddenModels.filter((slug) => slug.trim().length > 0))];
     const modelOrder = [...new Set(next.modelOrder.filter((slug) => slug.trim().length > 0))];
+    // Client-owned map: the synchronous client snapshot is the freshest.
     const rest = withoutProviderInstanceKey(
-      appAtomRegistry.get(primaryServerSettingsAtom).providerModelPreferences,
+      getClientSettings().providerModelPreferences,
       instanceId,
     );
     updateSettings({
@@ -2067,10 +2086,8 @@ export function ProviderSettingsPanel() {
     ];
     updateSettings({
       favorites: [
-        ...withoutProviderInstanceFavorites(
-          appAtomRegistry.get(primaryServerSettingsAtom).favorites ?? [],
-          instanceId,
-        ),
+        // Client-owned list: the synchronous client snapshot is the freshest.
+        ...withoutProviderInstanceFavorites(getClientSettings().favorites ?? [], instanceId),
         ...favoriteModels.map((model) => ({ provider: instanceId, model })),
       ],
     });
@@ -2086,6 +2103,7 @@ export function ProviderSettingsPanel() {
     const defaultLegacyProvider = defaultLegacyProviders[driverKind];
     if (defaultLegacyProvider === undefined) return;
     const { fresh, providerInstances } = composeProviderInstancesForWrite();
+    const client = getClientSettings();
     const persist = updateSettings({
       providers: {
         ...fresh.providers,
@@ -2093,10 +2111,10 @@ export function ProviderSettingsPanel() {
       } as typeof settings.providers,
       providerInstances: withoutProviderInstanceKey(providerInstances, defaultInstanceId),
       providerModelPreferences: withoutProviderInstanceKey(
-        fresh.providerModelPreferences,
+        client.providerModelPreferences,
         defaultInstanceId,
       ),
-      favorites: withoutProviderInstanceFavorites(fresh.favorites ?? [], defaultInstanceId),
+      favorites: withoutProviderInstanceFavorites(client.favorites ?? [], defaultInstanceId),
     });
     trackPendingInstanceWrite(defaultInstanceId, null, persist);
   };
@@ -2313,7 +2331,11 @@ export function ProviderSettingsPanel() {
       </SettingsSection>
 
       {isAddInstanceDialogOpen ? (
-        <AddProviderInstanceDialog open onOpenChange={setIsAddInstanceDialogOpen} />
+        <AddProviderInstanceDialog
+          open
+          onOpenChange={setIsAddInstanceDialogOpen}
+          onCreateInstance={createProviderInstance}
+        />
       ) : null}
     </SettingsPageContainer>
   );

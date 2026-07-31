@@ -3,6 +3,7 @@ import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import {
+  canMergeComposerDraftContentWithoutTruncation,
   clearComposerDraftContentState,
   composerDraftsAtom,
   decodePersistedComposerDrafts,
@@ -233,6 +234,57 @@ describe("mobile composer drafts", () => {
     const refused = restoreComposerDraftSnapshotOnceState(occupied, draftKey, snapshot, receiptId);
     expect(refused.restored).toBe(false);
     expect(refused.next).toBe(occupied);
+
+    // A settings-only draft is user state too: a picked model/workspace/mode
+    // must not be silently replaced by the queued task's shape.
+    const settingsOnly = {
+      [draftKey]: {
+        text: "",
+        attachments: [],
+        runtimeMode: "approval-required" as const,
+      },
+    };
+    const refusedSettings = restoreComposerDraftSnapshotOnceState(
+      settingsOnly,
+      draftKey,
+      snapshot,
+      receiptId,
+    );
+    expect(refusedSettings.restored).toBe(false);
+    expect(refusedSettings.next).toBe(settingsOnly);
+  });
+
+  it("refuses an outbox-content merge that would truncate attachments", () => {
+    const image = (id: string) => ({
+      id,
+      type: "image" as const,
+      name: `${id}.png`,
+      mimeType: "image/png",
+      sizeBytes: 3,
+      dataUrl: "data:image/png;base64,YWJj",
+      previewUri: "data:image/png;base64,YWJj",
+    });
+    const existing: ComposerDraft = { text: "", attachments: [image("existing")] };
+    const eight = Array.from({ length: 8 }, (_, index) => image(`incoming-${index}`));
+
+    // 1 existing + 8 incoming exceeds the cap of 8: nothing may be written.
+    expect(
+      canMergeComposerDraftContentWithoutTruncation(existing, { text: "", attachments: eight }),
+    ).toBe(false);
+    // 1 existing + 7 incoming fits.
+    expect(
+      canMergeComposerDraftContentWithoutTruncation(existing, {
+        text: "",
+        attachments: eight.slice(0, 7),
+      }),
+    ).toBe(true);
+    // Already-present ids do not count against the cap (idempotent retry).
+    expect(
+      canMergeComposerDraftContentWithoutTruncation(
+        { text: "", attachments: eight },
+        { text: "", attachments: eight },
+      ),
+    ).toBe(true);
   });
 
   it("restores the exact draft captured before an interrupted share import", () => {

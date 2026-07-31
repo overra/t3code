@@ -46,16 +46,6 @@ export interface ProviderScopePeerInstance {
   readonly allowedProjects: ReadonlyArray<ProjectId> | null;
 }
 
-function projectScopesEqual(
-  a: ReadonlyArray<ProjectId> | null,
-  b: ReadonlyArray<ProjectId> | null,
-): boolean {
-  if (a === null || b === null) return a === b;
-  if (a.length !== b.length) return false;
-  const ids = new Set<ProjectId>(a);
-  return b.every((id) => ids.has(id));
-}
-
 function strandedProjectTitles(input: {
   readonly instanceId: ProviderInstanceId;
   readonly candidateScope: ReadonlyArray<ProjectId> | null;
@@ -94,12 +84,16 @@ export function ProviderProjectScopeSection(props: {
   const { projects, onChange } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the settings prop (which lags the settings round-trip and would
-  // resurrect the previous edit). The overlay clears when the prop catches
-  // up to the pending value while no write is in flight — an intermediate
-  // echo from an earlier write must not expose stale state under a newer
-  // edit. A rejected persist rolls back (generation-guarded so an older
-  // rejection cannot clear a newer edit), and a generation-guarded timeout
-  // backstops lost echoes.
+  // resurrect the previous edit). There is deliberately NO
+  // clear-on-value-equality: echoes carry no version, so "prop equals
+  // pending" cannot distinguish the final echo from the pre-write value or
+  // an intermediate one (an A→B→A sequence makes them identical), and
+  // clearing early exposes a stale echo and lets the next edit chain from
+  // the wrong state. While the overlay equals the prop it renders
+  // identically anyway, so holding it is free. It clears only on rejection
+  // rollback (generation-guarded) or after a quiet period — no write in
+  // flight, re-armed on every settle — by which time every echo for our
+  // writes has long landed.
   const [pendingScope, setPendingScope] = useState<ReadonlyArray<ProjectId> | null | undefined>(
     undefined,
   );
@@ -107,22 +101,8 @@ export function ProviderProjectScopeSection(props: {
   const generationRef = useRef(0);
   const inflightRef = useRef(0);
   useEffect(() => {
-    if (
-      pendingScope !== undefined &&
-      inflightRef.current === 0 &&
-      projectScopesEqual(props.allowedProjects, pendingScope)
-    ) {
-      setPendingScope(undefined);
-    }
-  }, [props.allowedProjects, pendingScope, settledTick]);
-  useEffect(() => {
     if (pendingScope === undefined) return;
     const generation = generationRef.current;
-    // The timeout only backstops a LOST echo, so it must not fire while a
-    // write is still in flight — a slow persist is not a lost echo, and
-    // clearing under it would resurrect the pre-edit prop value. settledTick
-    // in the deps re-arms the timer after each settle, so the backstop window
-    // starts once the write is done rather than racing it.
     const timer = window.setTimeout(() => {
       if (generationRef.current === generation && inflightRef.current === 0) {
         setPendingScope(undefined);

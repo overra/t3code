@@ -163,6 +163,17 @@ export interface ProjectionSnapshotQueryShape {
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
 
   /**
+   * Read the owning project id of a thread REGARDLESS of archived/deleted
+   * state. Access checks must resolve any thread the decider still
+   * recognizes: treating an archived thread as "missing" would let a
+   * bootstrap-bearing turn substitute an arbitrary (more permissive) project
+   * for validation while the command still lands on the archived thread.
+   */
+  readonly getThreadProjectIdById: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<ProjectId>, ProjectionRepositoryError>;
+
+  /**
    * Read a single active thread detail snapshot by id.
    */
   readonly getThreadDetailById: (

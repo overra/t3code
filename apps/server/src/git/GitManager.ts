@@ -133,9 +133,15 @@ type GitActionProgressEmitter = (event: GitActionProgressPayload) => Effect.Effe
  * backslashes, POSIX paths use slashes, and containment must respect
  * whichever separator the normalizer produced or Windows ownership silently
  * misses (`C:\repo` would otherwise not own `C:\repo\packages\app`).
+ * Filesystem roots (`/`, `c:\`) already end in their separator — appending
+ * another would make a root own nothing at all.
  */
-export const isNormalizedPathWithin = (child: string, parent: string): boolean =>
-  child.startsWith(`${parent}/`) || child.startsWith(`${parent}\\`);
+export const isNormalizedPathWithin = (child: string, parent: string): boolean => {
+  if (parent.endsWith("/") || parent.endsWith("\\")) {
+    return child !== parent && child.startsWith(parent);
+  }
+  return child.startsWith(`${parent}/`) || child.startsWith(`${parent}\\`);
+};
 
 /** Ownership for the writer clamp: equal, or containment in either direction. */
 export const areNormalizedPathsRelated = (a: string, b: string): boolean =>

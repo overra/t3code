@@ -8,7 +8,6 @@ import {
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
-  type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -184,36 +183,19 @@ describe("validateCommandProviderAccess", () => {
     createdAt: NOW,
     updatedAt: NOW,
   };
-  const threadInRestrictedProject: OrchestrationThreadShell = {
-    id: THREAD_ID,
-    projectId: RESTRICTED_PROJECT_ID,
-    title: "Thread",
-    modelSelection: { instanceId: CODEX_INSTANCE, model: "gpt-5.4-codex" },
-    runtimeMode: "full-access",
-    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-    branch: null,
-    worktreePath: null,
-    latestTurn: null,
-    createdAt: NOW,
-    updatedAt: NOW,
-    archivedAt: null,
-    settledOverride: null,
-    settledAt: null,
-    session: null,
-    latestUserMessageAt: null,
-    hasPendingApprovals: false,
-    hasPendingUserInput: false,
-    hasActionableProposedPlan: false,
-  };
   const projectShells = new Map<ProjectId, OrchestrationProjectShell>([
     [RESTRICTED_PROJECT_ID, restrictedProject],
     [PROJECT_ID, permissiveProject],
   ]);
-  const makeDeps = (thread: OrchestrationThreadShell | undefined) => ({
+  const makeDeps = (threadProjectId: ProjectId | undefined) => ({
     getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
-    getThreadShellById: (threadId: ThreadId) =>
+    // Mirrors getThreadProjectIdById: resolves the owning project for ANY
+    // stored thread, archived or not.
+    getThreadProjectId: (threadId: ThreadId) =>
       Effect.succeed(
-        thread !== undefined && thread.id === threadId ? Option.some(thread) : Option.none(),
+        threadProjectId !== undefined && threadId === THREAD_ID
+          ? Option.some(threadProjectId)
+          : Option.none(),
       ),
     getProjectShellById: (projectId: ProjectId) => {
       const project = projectShells.get(projectId);
@@ -229,8 +211,11 @@ describe("validateCommandProviderAccess", () => {
     "denies via the EXISTING thread's project even when the bootstrap names a permissive one",
     () =>
       Effect.gen(function* () {
+        // The same lookup resolves archived/soft-deleted threads: an
+        // inactive-but-stored thread must be validated against ITS project,
+        // never the bootstrap fallback.
         const failure = yield* Effect.flip(
-          validateCommandProviderAccess(spoofingTurn, makeDeps(threadInRestrictedProject)),
+          validateCommandProviderAccess(spoofingTurn, makeDeps(RESTRICTED_PROJECT_ID)),
         );
         expect(failure.message).toContain("claudeAgent_work");
         expect(failure.message).toContain("'Restricted'");
@@ -246,7 +231,7 @@ describe("validateCommandProviderAccess", () => {
     Effect.gen(function* () {
       const failure = yield* Effect.flip(
         validateCommandProviderAccess(spoofingTurn, {
-          ...makeDeps(threadInRestrictedProject),
+          ...makeDeps(RESTRICTED_PROJECT_ID),
           getSettings: Effect.fail("settings store offline" as const),
         }),
       );

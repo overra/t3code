@@ -88,7 +88,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           const providerAccess = yield* Effect.result(
             validateCommandProviderAccess(args.payload, {
               getSettings: serverSettings.getSettings,
-              getThreadShellById: projectionSnapshotQuery.getThreadShellById,
+              getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
               getProjectShellById: projectionSnapshotQuery.getProjectShellById,
             }),
           );

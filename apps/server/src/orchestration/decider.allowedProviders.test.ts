@@ -182,6 +182,32 @@ it.layer(NodeServices.layer)("decider project provider allowlist", (it) => {
   );
 
   it.effect(
+    "project.meta.update rejects an EXPLICITLY requested default outside the allowlist",
+    () =>
+      Effect.gen(function* () {
+        const readModel: OrchestrationReadModel = yield* restrictedProjectReadModel();
+        // Asking for this default is an invalid request — acknowledging it
+        // and silently writing `null` would report success for the opposite
+        // mutation. Auto-clear is reserved for defaults merely inherited
+        // from prior state.
+        const failure = yield* Effect.flip(
+          decideOrchestrationCommand({
+            command: {
+              type: "project.meta.update",
+              commandId: CommandId.make("cmd-project-update-explicit-conflict"),
+              projectId: PROJECT_ID,
+              defaultModelSelection: { instanceId: PERSONAL_INSTANCE, model: "claude-opus-4-6" },
+            },
+            readModel,
+          }),
+        );
+        expect(failure.message).toContain(
+          "Default provider instance 'claudeAgent' is not in the project's allowed provider instances.",
+        );
+      }),
+  );
+
+  it.effect(
     "project.meta.update accepts a narrowed allowlist when the default is cleared with it",
     () =>
       Effect.gen(function* () {

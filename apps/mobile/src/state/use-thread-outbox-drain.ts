@@ -25,8 +25,12 @@ import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
   removeThreadOutboxMessage,
+  updateThreadOutboxMessage,
 } from "./thread-outbox";
-import { mergeComposerDraftContent, restoreComposerDraftSnapshotOnce } from "./use-composer-drafts";
+import {
+  mergeComposerDraftContentIfFits,
+  restoreComposerDraftSnapshotOnce,
+} from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -37,6 +41,7 @@ import {
   type QueuedThreadCreation,
   type QueuedThreadMessage,
   type ThreadOutboxCommandStage,
+  type ThreadOutboxDeliveryAction,
 } from "./thread-outbox-model";
 import { environmentThreadShells, threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
@@ -151,98 +156,122 @@ export function useThreadOutboxDrain(): void {
      * draft for a message on an existing thread, the project's new-task
      * draft for a queued creation (that thread was never created). The
      * poisoned entry is then removed so it stops blocking the FIFO.
+     *
+     * Returns whether the entry was fully resolved (restored AND removed);
+     * `false` keeps it queued for a later pass with backoff.
      */
-    const discardPoisonedEntry = async (): Promise<void> => {
+    const discardPoisonedEntry = async (): Promise<boolean> => {
       const receiptId = `thread-outbox:${queuedMessage.messageId}`;
-      try {
-        if (queuedMessage.creation !== undefined) {
-          // A queued creation restores into the project's new-task draft
-          // (mirrors the flow's `new-task:${scopedProjectKey(...)}` key) as
-          // ONE durable snapshot write: content plus its task shape —
-          // workspace selection with startFromOrigin pinned to the value the
-          // task would have sent with, runtime and interaction modes — so
-          // the recovered draft resubmits as the same kind of task. The
-          // revoked model selection is deliberately NOT restored; the flow's
-          // clamp picks a usable one. The restore refuses to touch a draft
-          // where the user has typed content, keeping the entry queued
-          // instead of clobbering or truncating their work.
-          const restoreDraftKey = `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`;
-          const { restored } = await restoreComposerDraftSnapshotOnce(
-            restoreDraftKey,
-            {
+      // A durable restoredAt marker means a prior pass restored the content
+      // and only the removal failed. The draft receipt alone cannot carry
+      // this fact — sending the recovered draft clears the draft and its
+      // receipt — so without the marker that sequence would restore the
+      // same task a second time.
+      if (queuedMessage.restoredAt === undefined) {
+        try {
+          if (queuedMessage.creation !== undefined) {
+            // A queued creation restores into the project's new-task draft
+            // (mirrors the flow's `new-task:${scopedProjectKey(...)}` key)
+            // as ONE durable snapshot write: content plus its task shape —
+            // workspace selection with startFromOrigin pinned to the value
+            // the task would have sent with, runtime and interaction modes —
+            // so the recovered draft resubmits as the same kind of task. The
+            // revoked model selection is deliberately NOT restored; the
+            // flow's clamp picks a usable one. The restore refuses to touch
+            // a draft holding ANY user state (content or settings), keeping
+            // the entry queued instead of clobbering their work.
+            const restoreDraftKey = `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`;
+            const { restored } = await restoreComposerDraftSnapshotOnce(
+              restoreDraftKey,
+              {
+                text: queuedMessage.text,
+                attachments: queuedMessage.attachments,
+                workspaceSelection: {
+                  mode: queuedMessage.creation.workspaceMode,
+                  branch: queuedMessage.creation.branch,
+                  worktreePath: queuedMessage.creation.worktreePath,
+                  startFromOrigin: queuedMessage.creation.startFromOrigin ?? false,
+                },
+                ...(queuedMessage.runtimeMode !== undefined
+                  ? { runtimeMode: queuedMessage.runtimeMode }
+                  : {}),
+                ...(queuedMessage.interactionMode !== undefined
+                  ? { interactionMode: queuedMessage.interactionMode }
+                  : {}),
+              },
+              receiptId,
+            );
+            if (!restored) {
+              console.warn(
+                "[thread-outbox] deferred poisoned pending-task restore; the new-task draft is in use",
+                {
+                  environmentId: queuedMessage.environmentId,
+                  threadId: queuedMessage.threadId,
+                  messageId: queuedMessage.messageId,
+                },
+              );
+              return false;
+            }
+          } else {
+            // ALL-OR-NOTHING restore: the merge writes nothing when the
+            // draft cannot fit every attachment, so a truncated copy (and a
+            // dedup receipt that would block later retries) never persists
+            // alongside the retained full original. Once the draft has room
+            // — the user sends or trims it — a later pass merges the whole
+            // message in one durable write.
+            const restoreDraftKey = scopedThreadKey(
+              queuedMessage.environmentId,
+              queuedMessage.threadId,
+            );
+            const { merged } = await mergeComposerDraftContentIfFits(restoreDraftKey, {
               text: queuedMessage.text,
               attachments: queuedMessage.attachments,
-              workspaceSelection: {
-                mode: queuedMessage.creation.workspaceMode,
-                branch: queuedMessage.creation.branch,
-                worktreePath: queuedMessage.creation.worktreePath,
-                startFromOrigin: queuedMessage.creation.startFromOrigin ?? false,
-              },
-              ...(queuedMessage.runtimeMode !== undefined
-                ? { runtimeMode: queuedMessage.runtimeMode }
-                : {}),
-              ...(queuedMessage.interactionMode !== undefined
-                ? { interactionMode: queuedMessage.interactionMode }
-                : {}),
-            },
-            receiptId,
-          );
-          if (!restored) {
-            console.warn(
-              "[thread-outbox] deferred poisoned pending-task restore; the new-task draft has content",
-              {
-                environmentId: queuedMessage.environmentId,
-                threadId: queuedMessage.threadId,
-                messageId: queuedMessage.messageId,
-              },
-            );
-            return;
+              sourceShareId: receiptId,
+            });
+            if (!merged) {
+              console.warn(
+                "[thread-outbox] deferred poisoned queued message restore; the thread draft cannot fit its attachments",
+                {
+                  environmentId: queuedMessage.environmentId,
+                  threadId: queuedMessage.threadId,
+                  messageId: queuedMessage.messageId,
+                },
+              );
+              return false;
+            }
           }
-        } else {
-          // Durable, idempotent restore FIRST: the merge awaits its persisted
-          // write and dedupes via the receipt (this message id), so a crash
-          // between restore and removal — or a failed removal retried on the
-          // next drain pass — cannot lose or duplicate the content.
-          const restoreDraftKey = scopedThreadKey(
-            queuedMessage.environmentId,
-            queuedMessage.threadId,
-          );
-          const { skippedAttachmentCount } = await mergeComposerDraftContent(restoreDraftKey, {
-            text: queuedMessage.text,
-            attachments: queuedMessage.attachments,
-            sourceShareId: receiptId,
+        } catch (error) {
+          // Content is NOT durably saved; keep the outbox entry rather than
+          // lose the message. The FIFO stays blocked until storage recovers,
+          // which is the correct trade for a durability failure.
+          console.warn("[thread-outbox] failed to restore poisoned queued message to draft", {
+            environmentId: queuedMessage.environmentId,
+            threadId: queuedMessage.threadId,
+            messageId: queuedMessage.messageId,
+            error,
           });
-          if (skippedAttachmentCount > 0) {
-            // The thread draft is at the attachment cap, so part of this
-            // message did NOT make it back. Keep the entry queued — the next
-            // pass re-attempts once the user sends or trims the draft — so
-            // attachments are never permanently dropped.
-            console.warn(
-              "[thread-outbox] kept poisoned queued message; draft truncated its attachments",
-              {
-                environmentId: queuedMessage.environmentId,
-                threadId: queuedMessage.threadId,
-                messageId: queuedMessage.messageId,
-                skippedAttachmentCount,
-              },
-            );
-            return;
-          }
+          return false;
         }
-      } catch (error) {
-        // Content is NOT saved; keep the outbox entry rather than lose the
-        // message. The FIFO stays blocked until storage recovers, which is
-        // the correct trade for a durability failure.
-        console.warn("[thread-outbox] failed to restore poisoned queued message to draft", {
-          environmentId: queuedMessage.environmentId,
-          threadId: queuedMessage.threadId,
-          messageId: queuedMessage.messageId,
-          error,
-        });
-        return;
+        // The restore is durable — record that ON THE ENTRY before removal.
+        // If this marker write fails the draft receipt still guards the
+        // common retry path, so removal proceeds regardless.
+        try {
+          await updateThreadOutboxMessage({
+            ...queuedMessage,
+            restoredAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          console.warn("[thread-outbox] failed to mark poisoned queued message restored", {
+            environmentId: queuedMessage.environmentId,
+            threadId: queuedMessage.threadId,
+            messageId: queuedMessage.messageId,
+            error,
+          });
+        }
       }
       try {
         await removeThreadOutboxMessage(queuedMessage);
+        return true;
       } catch (error) {
         console.warn("[thread-outbox] failed to remove poisoned queued message", {
           environmentId: queuedMessage.environmentId,
@@ -250,6 +279,7 @@ export function useThreadOutboxDrain(): void {
           messageId: queuedMessage.messageId,
           error,
         });
+        return false;
       }
     };
     const completeDelivery = async (
@@ -260,8 +290,11 @@ export function useThreadOutboxDrain(): void {
         if (reportFailure(deliveryResult, "start-turn")) {
           return false;
         }
-        await discardPoisonedEntry();
-        return false;
+        // Resolving the poisoned entry (restored + removed) counts as
+        // settling this queue slot: returning its result lets the drain
+        // clear the retry bookkeeping instead of scheduling a retry for an
+        // entry that no longer exists.
+        return discardPoisonedEntry();
       }
 
       try {
@@ -292,11 +325,13 @@ export function useThreadOutboxDrain(): void {
       // as a deterministic start-turn failure.
       const failSettingsSync = async (
         result: AtomCommandResult<unknown, unknown>,
-      ): Promise<false> => {
-        if (!reportFailure(result, "settings-sync")) {
-          await discardPoisonedEntry();
+      ): Promise<boolean> => {
+        if (reportFailure(result, "settings-sync")) {
+          return false;
         }
-        return false;
+        // A resolved discard (restored + removed) settles this queue slot —
+        // see the matching note in completeDelivery.
+        return discardPoisonedEntry();
       };
 
       if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
@@ -435,13 +470,20 @@ export function useThreadOutboxDrain(): void {
         (candidate) => candidate.environmentId === nextQueuedMessage.environmentId,
       );
       const shellStatus = shellStatuses.get(nextQueuedMessage.environmentId) ?? "empty";
-      const deliveryAction = resolveThreadOutboxDeliveryAction({
-        isCreation: creation !== undefined,
-        threadExists: thread !== undefined,
-        shellStatus,
-        environmentConnected: environment?.connectionState === "connected",
-        threadBusy: thread?.session?.status === "running" || thread?.session?.status === "starting",
-      });
+      // An entry already durably restored to a draft must never be delivered
+      // again — the user may have edited and resent that content. Its only
+      // remaining work is the removal that failed on the earlier pass.
+      const deliveryAction: ThreadOutboxDeliveryAction =
+        nextQueuedMessage.restoredAt !== undefined
+          ? "remove"
+          : resolveThreadOutboxDeliveryAction({
+              isCreation: creation !== undefined,
+              threadExists: thread !== undefined,
+              shellStatus,
+              environmentConnected: environment?.connectionState === "connected",
+              threadBusy:
+                thread?.session?.status === "running" || thread?.session?.status === "starting",
+            });
       if (deliveryAction === "wait") {
         continue;
       }
@@ -505,7 +547,11 @@ export function useThreadOutboxDrain(): void {
           return true;
         }
         return deliveryAction === "remove"
-          ? removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
+          ? removeQueuedMessage(
+              nextQueuedMessage.restoredAt !== undefined
+                ? "[thread-outbox] failed to remove already-restored message"
+                : "[thread-outbox] failed to remove message for a missing thread",
+            )
           : creation !== undefined
             ? creationProjectCwd !== null
               ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)

@@ -1069,16 +1069,6 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
 });
 
-function providerAllowlistsEqual(
-  a: ReadonlyArray<ProviderInstanceId> | null,
-  b: ReadonlyArray<ProviderInstanceId> | null,
-): boolean {
-  if (a === null || b === null) return a === b;
-  if (a.length !== b.length) return false;
-  const ids = new Set<ProviderInstanceId>(a);
-  return b.every((id) => ids.has(id));
-}
-
 /**
  * Per-project provider allowlist editor in the project settings dialog.
  * Every checkbox reflects one configured provider instance of the member's
@@ -1104,12 +1094,15 @@ function ProjectAllowedProvidersControl(props: {
   const { member, providerEntries, onUpdate } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the streamed prop (which lags a round-trip and would resurrect the
-  // previous edit). The overlay clears when the prop CATCHES UP to the
-  // pending value while no write is in flight — an intermediate echo from an
-  // earlier write must not expose stale state underneath a newer pending
-  // edit. A rejected write rolls back (generation-guarded so an older
-  // rejection cannot clear a newer edit), and a generation-guarded timeout
-  // backstops lost echoes.
+  // previous edit). There is deliberately NO clear-on-value-equality: echoes
+  // carry no version, so "prop equals pending" cannot distinguish the final
+  // echo from the pre-write value or an intermediate one (an A→B→A sequence
+  // makes them identical), and clearing early exposes a stale echo and lets
+  // the next edit chain from the wrong state. While the overlay equals the
+  // prop it renders identically anyway, so holding it is free. It clears only
+  // on rejection rollback (generation-guarded) or after a quiet period — no
+  // write in flight, re-armed on every settle — by which time every echo for
+  // our writes has long landed.
   const [pendingAllowed, setPendingAllowed] = useState<
     ReadonlyArray<ProviderInstanceId> | null | undefined
   >(undefined);
@@ -1118,22 +1111,8 @@ function ProjectAllowedProvidersControl(props: {
   const inflightRef = useRef(0);
   const propAllowed = member.allowedProviderInstances ?? null;
   useEffect(() => {
-    if (
-      pendingAllowed !== undefined &&
-      inflightRef.current === 0 &&
-      providerAllowlistsEqual(propAllowed, pendingAllowed)
-    ) {
-      setPendingAllowed(undefined);
-    }
-  }, [propAllowed, pendingAllowed, settledTick]);
-  useEffect(() => {
     if (pendingAllowed === undefined) return;
     const generation = generationRef.current;
-    // The timeout only backstops a LOST echo, so it must not fire while a
-    // write is still in flight — a slow persist is not a lost echo, and
-    // clearing under it would resurrect the pre-edit prop value. settledTick
-    // in the deps re-arms the timer after each settle, so the backstop window
-    // starts once the write is done rather than racing it.
     const timer = window.setTimeout(() => {
       if (generationRef.current === generation && inflightRef.current === 0) {
         setPendingAllowed(undefined);
