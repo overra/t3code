@@ -17,6 +17,7 @@ import {
   defaultInstanceIdForDriver,
   getProviderInstanceProjectRestriction,
   PROVIDER_DISPLAY_NAMES,
+  getProviderInstanceConfig,
   type ModelSelection,
   type ProjectAllowedProviderInstances,
   type ProjectId,
@@ -212,7 +213,10 @@ export function applyProviderInstanceSettings(
   >;
 
   return entries.map((entry) => {
-    const explicitInstance = settings.providerInstances?.[entry.instanceId];
+    const explicitInstance = getProviderInstanceConfig(
+      settings.providerInstances,
+      entry.instanceId,
+    );
     const enabled = explicitInstance
       ? (explicitInstance.enabled ?? true)
       : entry.isDefault

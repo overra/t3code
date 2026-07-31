@@ -350,6 +350,17 @@ describe("serverSettings helpers", () => {
     expect(next[openId]).toBeUndefined();
   });
 
+  it("treats nonexistent prototype-named instances as disabled, not inherited", () => {
+    // A bare indexed read of "constructor" would match Object.prototype and
+    // make the nonexistent instance look configured-and-enabled.
+    expect(
+      isModelSelectionProviderEnabled(DEFAULT_SERVER_SETTINGS, {
+        instanceId: ProviderInstanceId.make("constructor"),
+        model: "some-model",
+      }),
+    ).toBe(false);
+  });
+
   it("retains restricted instances with prototype-named ids", () => {
     // Instance ids are user-chosen strings: "constructor" must behave like
     // any other id, not match Object.prototype via `in`/property reads.

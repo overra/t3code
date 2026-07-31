@@ -146,6 +146,23 @@ export const ProviderInstanceConfig = Schema.Struct({
 export type ProviderInstanceConfig = typeof ProviderInstanceConfig.Type;
 
 /**
+ * Prototype-safe read of an instance envelope. Instance ids are user-chosen
+ * strings, so a bare indexed read of a prototype-named id ("constructor",
+ * "toString") would match inherited Object properties and make a nonexistent
+ * instance look configured — enabled and unrestricted. Every dynamic-key
+ * read of a provider-instances map must go through this accessor.
+ */
+export function getProviderInstanceConfig(
+  providerInstances: ProviderInstanceConfigMap | undefined,
+  instanceId: string,
+): ProviderInstanceConfig | undefined {
+  if (providerInstances === undefined || !Object.hasOwn(providerInstances, instanceId)) {
+    return undefined;
+  }
+  return providerInstances[instanceId as ProviderInstanceId];
+}
+
+/**
  * Read an instance's project scope out of the `ServerSettings.providerInstances`
  * map. Instances without an envelope (built-in defaults synthesized from the
  * legacy per-driver settings) have no scope: usable everywhere.
@@ -158,7 +175,7 @@ export function getProviderInstanceAllowedProjects(
   providerInstances: ProviderInstanceConfigMap | undefined,
   instanceId: ProviderInstanceId,
 ): ProviderInstanceAllowedProjects | null {
-  return providerInstances?.[instanceId]?.allowedProjects ?? null;
+  return getProviderInstanceConfig(providerInstances, instanceId)?.allowedProjects ?? null;
 }
 
 /**

@@ -323,6 +323,19 @@ export const PendingTaskListRow = memo(function PendingTaskListRow(props: {
       </View>
     ) : null;
 
+  const failureReasonRow = pendingTask.failed ? (
+    <Text
+      className={
+        compact
+          ? "text-sm text-red-600 dark:text-red-400"
+          : "text-xs text-red-600 dark:text-red-400"
+      }
+      numberOfLines={1}
+    >
+      {pendingTask.message.failureReason ?? "The server rejected this task."}
+    </Text>
+  ) : null;
+
   const rowContent = compact ? (
     <Pressable
       accessibilityHint="Opens the queued task for editing"
@@ -363,6 +376,7 @@ export const PendingTaskListRow = memo(function PendingTaskListRow(props: {
             </View>
           </View>
           {subtitleRow}
+          {failureReasonRow}
         </View>
       </View>
     </Pressable>
@@ -395,6 +409,7 @@ export const PendingTaskListRow = memo(function PendingTaskListRow(props: {
           </View>
         </View>
         {subtitleRow}
+        {failureReasonRow}
       </View>
     </Pressable>
   );

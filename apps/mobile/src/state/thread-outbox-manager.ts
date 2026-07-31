@@ -79,8 +79,18 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     }
     loadPromise = serialize(async () => {
       const persistedMessages = await options.storage.load();
+      // The committed baseline is tracked BY IDENTITY against the published
+      // atom objects. Ids already live in the atom keep their existing
+      // mapping: overwriting them with the freshly DECODED (equal but
+      // different) object would make every later update/mark/remove treat
+      // the atom entry as an uncommitted optimistic resubmission forever.
+      // For an optimistic entry enqueued before this load, its own
+      // serialized write — queued behind this op — commits it.
+      const liveMessageIds = new Set(currentMessages().map((message) => message.messageId));
       for (const message of persistedMessages) {
-        committedById.set(message.messageId, message);
+        if (!liveMessageIds.has(message.messageId)) {
+          committedById.set(message.messageId, message);
+        }
       }
       setMessages([...persistedMessages, ...currentMessages()]);
     }).catch((cause) => {

@@ -969,7 +969,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         ) : null}
 
         {/* Failed queued messages need user resolution before the queue moves */}
-        <FailedQueuedMessages failedMessages={failedQueuedMessages} />
+        <FailedQueuedMessages
+          failedMessages={failedQueuedMessages}
+          queuedBehindCount={pendingQueueCount}
+        />
 
         {/* Queue count */}
         {pendingQueueCount > 0 ? (

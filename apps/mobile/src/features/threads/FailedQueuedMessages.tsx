@@ -1,41 +1,75 @@
-import { memo } from "react";
+import { memo, useRef, useState } from "react";
 import { Alert, Pressable, View } from "react-native";
 import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 
 import { AppText as Text } from "../../components/AppText";
 import { scopedThreadKey } from "../../lib/scopedEntities";
-import {
-  getComposerDraftSnapshot,
-  mergeComposerDraftContent,
-} from "../../state/use-composer-drafts";
+import { placeContentInEmptyComposerDraft } from "../../state/use-composer-drafts";
 import {
   removeThreadOutboxMessage,
   updateThreadOutboxMessage,
   type QueuedThreadMessage,
 } from "../../state/thread-outbox";
 
+function confirm(title: string, message: string, confirmLabel: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    Alert.alert(
+      title,
+      message,
+      [
+        { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+        { text: confirmLabel, style: "destructive", onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+}
+
 /**
  * Moves a failed message's content into the thread's composer draft for
- * editing, then retires the outbox entry. User-initiated and ordered
- * durable-copy-first: a crash between the two writes shows the content
- * twice (composer and failed entry), never zero times. Refuses while the
- * composer holds content so nothing is silently mixed or clobbered.
+ * editing, then retires the outbox entry. The draft write is ONE
+ * conditional transaction (hydration-aware empty check + attachment-cap
+ * check + durable persist); the entry is deleted only after it succeeds,
+ * so a crash between the two shows the content twice, never zero times.
+ *
+ * Editing DEQUEUES the message: anything queued behind it resumes sending,
+ * and the edited content re-enters at the tail when resent. When messages
+ * are queued behind, that reorder happens only with explicit consent.
  */
-async function editIntoComposer(message: QueuedThreadMessage): Promise<void> {
-  const threadKey = scopedThreadKey(message.environmentId, message.threadId);
-  const draft = getComposerDraftSnapshot(threadKey);
-  if (draft.text.trim().length > 0 || draft.attachments.length > 0) {
-    Alert.alert(
-      "Composer is not empty",
-      "Send or clear the composer first, then edit this failed message.",
+async function editIntoComposer(
+  message: QueuedThreadMessage,
+  queuedBehindCount: number,
+): Promise<void> {
+  if (queuedBehindCount > 0) {
+    const proceed = await confirm(
+      "Edit failed message?",
+      `${queuedBehindCount} message${queuedBehindCount === 1 ? "" : "s"} queued behind it will send while you edit.`,
+      "Edit",
     );
-    return;
+    if (!proceed) {
+      return;
+    }
   }
+  const threadKey = scopedThreadKey(message.environmentId, message.threadId);
   try {
-    await mergeComposerDraftContent(threadKey, {
+    const placement = await placeContentInEmptyComposerDraft(threadKey, {
       text: message.text,
       attachments: message.attachments,
     });
+    if (placement === "occupied") {
+      Alert.alert(
+        "Composer is not empty",
+        "Send or clear the composer first, then edit this failed message.",
+      );
+      return;
+    }
+    if (placement === "does-not-fit") {
+      Alert.alert(
+        "Too many attachments",
+        "This message's attachments exceed what the composer can hold.",
+      );
+      return;
+    }
     await removeThreadOutboxMessage(message);
   } catch (error) {
     Alert.alert(
@@ -65,33 +99,39 @@ async function retryFailedMessage(message: QueuedThreadMessage): Promise<void> {
   }
 }
 
-function confirmDeleteFailedMessage(message: QueuedThreadMessage): void {
-  Alert.alert("Delete failed message?", "Its text and attachments will be discarded.", [
-    { text: "Cancel", style: "cancel" },
-    {
-      text: "Delete",
-      style: "destructive",
-      onPress: () => {
-        removeThreadOutboxMessage(message).catch((error) => {
-          console.warn("[thread-outbox] failed to delete failed queued message", error);
-        });
-      },
-    },
-  ]);
+async function deleteFailedMessage(message: QueuedThreadMessage): Promise<void> {
+  const proceed = await confirm(
+    "Delete failed message?",
+    "Its text and attachments will be discarded.",
+    "Delete",
+  );
+  if (!proceed) {
+    return;
+  }
+  try {
+    await removeThreadOutboxMessage(message);
+  } catch (error) {
+    Alert.alert(
+      "Could not delete message",
+      error instanceof Error ? error.message : "The failed message could not be deleted.",
+    );
+  }
 }
 
 function FailedMessageAction(props: {
   readonly label: string;
   readonly destructive?: boolean;
+  readonly disabled: boolean;
   readonly onPress: () => void;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={props.label}
+      disabled={props.disabled}
       onPress={props.onPress}
       className="rounded-full bg-zinc-500/10 px-2.5 py-1 dark:bg-zinc-500/16"
-      style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+      style={({ pressed }) => ({ opacity: props.disabled ? 0.4 : pressed ? 0.6 : 1 })}
     >
       <Text
         className={
@@ -111,11 +151,29 @@ function FailedMessageAction(props: {
  * deterministically rejected. Each failed entry shows its content and
  * reason with the full set of resolutions — edit (move to the composer),
  * retry (requeue), delete — since a failed head deliberately holds later
- * messages in this thread's queue.
+ * messages in this thread's queue. The three actions are MUTUALLY
+ * EXCLUSIVE: while one runs, all are disabled, so a Retry can never
+ * dispatch an entry that an Edit is concurrently copying out.
  */
 export const FailedQueuedMessages = memo(function FailedQueuedMessages(props: {
   readonly failedMessages: ReadonlyArray<QueuedThreadMessage>;
+  /** Non-failed messages queued behind these in the same thread. */
+  readonly queuedBehindCount: number;
 }) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const runExclusive = (action: () => Promise<void>) => {
+    if (busyRef.current) {
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    void action().finally(() => {
+      busyRef.current = false;
+      setBusy(false);
+    });
+  };
+
   if (props.failedMessages.length === 0) {
     return null;
   }
@@ -142,12 +200,21 @@ export const FailedQueuedMessages = memo(function FailedQueuedMessages(props: {
             </Text>
           ) : null}
           <View className="mt-1.5 flex-row gap-2">
-            <FailedMessageAction label="Edit" onPress={() => void editIntoComposer(message)} />
-            <FailedMessageAction label="Retry" onPress={() => void retryFailedMessage(message)} />
+            <FailedMessageAction
+              label="Edit"
+              disabled={busy}
+              onPress={() => runExclusive(() => editIntoComposer(message, props.queuedBehindCount))}
+            />
+            <FailedMessageAction
+              label="Retry"
+              disabled={busy}
+              onPress={() => runExclusive(() => retryFailedMessage(message))}
+            />
             <FailedMessageAction
               destructive
               label="Delete"
-              onPress={() => confirmDeleteFailedMessage(message)}
+              disabled={busy}
+              onPress={() => runExclusive(() => deleteFailedMessage(message))}
             />
           </View>
         </View>

@@ -47,9 +47,12 @@ import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import {
   enqueueThreadOutboxMessage,
+  flattenQueuedThreadMessages,
   isQueuedThreadMessageFailed,
   removeThreadOutboxMessage,
+  threadOutboxManager,
 } from "../../state/thread-outbox";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { branchBadgeLabel, useNewTaskFlow } from "./new-task-flow-provider";
 import { useCreateProjectThread } from "./use-project-actions";
@@ -831,9 +834,17 @@ export function NewTaskDraftScreen(props: {
     // A FAILED task's identifiers are burned (its bootstrap may have created
     // the thread before failing, and that soft-deleted id stays occupied
     // forever). Resubmitting it always mints fresh turn metadata; the failed
-    // record is retired after the fresh submission lands.
+    // record is retired after the fresh submission lands. Failed-ness comes
+    // from the LIVE outbox record, not the snapshot captured when the editor
+    // opened — a bootstrap already in flight at open time may have failed
+    // (and burned these ids) since.
+    const storedEditingTask = editingPendingTask
+      ? flattenQueuedThreadMessages(
+          appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+        ).find((candidate) => candidate.messageId === editingPendingTask.messageId)
+      : undefined;
     const editingFailed =
-      editingPendingTask !== null && isQueuedThreadMessageFailed(editingPendingTask);
+      storedEditingTask !== undefined && isQueuedThreadMessageFailed(storedEditingTask);
 
     if (!environmentConnected) {
       // Offline: park the task in the outbox; the drain sends it when the
@@ -852,30 +863,35 @@ export function NewTaskDraftScreen(props: {
       if (!message) {
         return;
       }
+      // `submitting` stays true through retirement of the failed original —
+      // clearing it earlier would let a second tap mint yet another fresh
+      // creation from the same editor session.
       flow.setSubmitting(true);
       try {
-        await enqueueThreadOutboxMessage(message);
-      } catch (error) {
-        Alert.alert(
-          "Could not queue task",
-          error instanceof Error ? error.message : "The task could not be saved to the outbox.",
-        );
-        return;
+        try {
+          await enqueueThreadOutboxMessage(message);
+        } catch (error) {
+          Alert.alert(
+            "Could not queue task",
+            error instanceof Error ? error.message : "The task could not be saved to the outbox.",
+          );
+          return;
+        }
+        if (editingPendingTask) {
+          if (editingFailed) {
+            // Enqueued under NEW ids; retire the failed original.
+            try {
+              await removeThreadOutboxMessage(storedEditingTask ?? editingPendingTask);
+            } catch (error) {
+              console.warn("[new-task] failed to retire failed task after fresh requeue", error);
+            }
+          }
+          flow.finishEditingPendingTask();
+        } else {
+          clearComposerDraftContent(draftKey);
+        }
       } finally {
         flow.setSubmitting(false);
-      }
-      if (editingPendingTask) {
-        if (editingFailed) {
-          // Enqueued under NEW ids; retire the failed original.
-          try {
-            await removeThreadOutboxMessage(editingPendingTask);
-          } catch (error) {
-            console.warn("[new-task] failed to retire failed task after fresh requeue", error);
-          }
-        }
-        flow.finishEditingPendingTask();
-      } else {
-        clearComposerDraftContent(draftKey);
       }
       navigation.getParent()?.goBack();
       return;
@@ -914,9 +930,9 @@ export function NewTaskDraftScreen(props: {
           }
         : {}),
     });
-    flow.setSubmitting(false);
 
     if (result._tag === "Failure") {
+      flow.setSubmitting(false);
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         Alert.alert(
@@ -927,9 +943,11 @@ export function NewTaskDraftScreen(props: {
       return;
     }
 
+    // `submitting` stays true through outbox retirement so a second tap
+    // cannot mint another creation while the old record is being removed.
     if (editingPendingTask) {
       try {
-        await removeThreadOutboxMessage(editingPendingTask);
+        await removeThreadOutboxMessage(storedEditingTask ?? editingPendingTask);
       } catch (error) {
         console.warn("[new-task] failed to remove delivered pending task", error);
       }
@@ -937,6 +955,7 @@ export function NewTaskDraftScreen(props: {
     } else {
       clearComposerDraftContent(draftKey);
     }
+    flow.setSubmitting(false);
     navigation.dispatch(
       StackActions.replace("Thread", {
         environmentId: String(result.value.environmentId),

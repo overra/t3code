@@ -363,6 +363,46 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("keeps the committed baseline usable when load follows an enqueue", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      // Production storage DECODES fresh objects on every load — the same
+      // content under a different identity than what enqueue published.
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+    await manager.load();
+
+    // The freshly decoded load result must not displace the committed
+    // identity of the already-published entry — that would turn every later
+    // update into a no-op and leave remove ghosting the atom.
+    expect(await manager.update({ ...original, text: "edited" })).toBe(true);
+    expect(stored.get(original.messageId)?.text).toBe("edited");
+    const afterUpdate = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(afterUpdate[0]?.text).toBe("edited");
+
+    await manager.remove(original);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
   it("keeps atom and disk aligned when a failure mark races an optimistic re-enqueue", async () => {
     const registry = AtomRegistry.make();
     const stored = new Map<MessageId, QueuedThreadMessage>();

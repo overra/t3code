@@ -504,6 +504,48 @@ export async function mergeComposerDraftContent(
   return { skippedAttachmentCount };
 }
 
+/**
+ * ONE conditional transaction for moving failed-outbox content into a
+ * composer draft: awaits hydration (an unhydrated snapshot can look empty
+ * while disk holds content), refuses when the draft holds any content
+ * ("occupied") or when any attachment would be dropped by the send cap
+ * ("does-not-fit"), and otherwise publishes and durably persists the
+ * content — draft settings preserved — before resolving "placed". Nothing
+ * is written on either refusal, so the caller can safely keep the outbox
+ * entry as the only copy.
+ */
+export async function placeContentInEmptyComposerDraft(
+  draftKey: string,
+  content: {
+    readonly text: string;
+    readonly attachments: ReadonlyArray<DraftComposerImageAttachment>;
+  },
+): Promise<"placed" | "occupied" | "does-not-fit"> {
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) {
+    await loadPromise;
+  }
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const existing = normalizeDraft(current[draftKey]);
+  if (existing.text.trim().length > 0 || existing.attachments.length > 0) {
+    return "occupied";
+  }
+  if (content.attachments.length > PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+    return "does-not-fit";
+  }
+  const next = {
+    ...current,
+    [draftKey]: { ...existing, text: content.text, attachments: [...content.attachments] },
+  };
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  appAtomRegistry.set(composerDraftsAtom, next);
+  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+  return "placed";
+}
+
 /** Restores the exact content/settings captured before an interrupted import. */
 export async function restoreComposerDraftSnapshot(
   draftKey: string,

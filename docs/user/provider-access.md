@@ -52,11 +52,13 @@ Deliberate trade-offs in the current implementation:
 - **Instance deletion vs. a concurrent stale edit.** Per-instance writes
   are granular upserts merged under the server's settings lock, but an
   upsert carries no "must already exist" expectation: a device editing an
-  instance that another device deleted moments earlier recreates it (with
-  its stored scope preserved when the write omits one, or scope-less —
-  and therefore unrestricted — if the recreating client never saw a
-  scope). This one CAN briefly widen access after a delete; closing it
-  needs conditional create-vs-update mutations.
+  instance that another device deleted moments earlier recreates it. Since
+  non-scope edits never carry the scope key (and the deleted server-side
+  scope no longer exists to preserve), the recreated instance comes back
+  UNRESTRICTED — even when the stale client had previously seen its scope
+  — and stays that way until someone notices and corrects it. This is the
+  one limitation that can widen access; closing it needs conditional
+  create-vs-update mutations.
 - **Pre-capability clients cannot delete restricted instances.** Whole-map
   writes from older clients retain any restricted instance they omit (the
   alternative silently converts "restricted" into "unrestricted default").
@@ -74,4 +76,7 @@ Deliberate trade-offs in the current implementation:
   editable (re-queued under fresh identifiers for creations), retryable,
   and deletable. A failed entry intentionally holds later messages queued
   behind it in the same thread, since delivering around it would reorder
-  the conversation.
+  the conversation; choosing **Edit** dequeues it into the composer, which
+  lets those later messages resume (confirmed first when any are waiting),
+  and the edited message re-enters at the tail when sent. Deleting a
+  thread discards its queued messages, failed ones included.

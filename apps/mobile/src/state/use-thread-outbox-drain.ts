@@ -360,12 +360,6 @@ export function useThreadOutboxDrain(): void {
       if (editingQueuedMessageIds[nextQueuedMessage.messageId]) {
         continue;
       }
-      // A failed entry holds its thread's queue (visible and editable in
-      // place) until an editor save clears its markers or the user deletes
-      // it. Legacy already-restored entries fall through to removal below.
-      if (isQueuedThreadMessageFailed(nextQueuedMessage)) {
-        continue;
-      }
       if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
         continue;
       }
@@ -394,6 +388,15 @@ export function useThreadOutboxDrain(): void {
               threadBusy:
                 thread?.session?.status === "running" || thread?.session?.status === "starting",
             });
+      // A failed entry holds its thread's queue (visible and editable in
+      // place) until an editor save clears its markers or the user deletes
+      // it — but cleanup REMOVALS still apply: its thread being deleted
+      // discards it like any other queued message (there is no composer
+      // left to recover into), and a failed creation whose thread exists
+      // actually succeeded and needs only cleanup.
+      if (isQueuedThreadMessageFailed(nextQueuedMessage) && deliveryAction !== "remove") {
+        continue;
+      }
       if (deliveryAction === "wait") {
         continue;
       }

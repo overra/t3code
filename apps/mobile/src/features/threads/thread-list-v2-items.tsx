@@ -153,6 +153,11 @@ export const ThreadListV2PendingRow = memo(function ThreadListV2PendingRow(props
       <Text className="mt-1 text-base font-t3-medium text-foreground" numberOfLines={1}>
         {pendingTask.title}
       </Text>
+      {pendingTask.failed ? (
+        <Text className="mt-1 text-xs text-red-600 dark:text-red-400" numberOfLines={1}>
+          {pendingTask.message.failureReason ?? "The server rejected this task."}
+        </Text>
+      ) : null}
       {branch || props.environmentLabel ? (
         <Text className="mt-1 text-xs text-foreground-muted" numberOfLines={1}>
           {branch ? (
