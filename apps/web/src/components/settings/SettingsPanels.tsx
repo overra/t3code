@@ -139,6 +139,7 @@ import {
   projectGroupingModeFromToggle,
   readLastEnabledProjectGroupingMode,
   rememberEnabledProjectGroupingMode,
+  stripUnchangedScope,
   resolveBackgroundActivityProfileOption,
 } from "./SettingsPanels.logic";
 import {
@@ -2021,29 +2022,6 @@ export function ProviderSettingsPanel() {
     ];
   });
 
-  // Access scope is SECURITY POLICY with its own write channel: an instance
-  // value that does not explicitly carry `allowedProjects` leaves the stored
-  // scope untouched server-side. Stripping the key from writes whose scope
-  // is UNCHANGED means a name/enabled/config edit composed from a stale
-  // render can never write an outdated scope back — only the scope editor's
-  // explicit values (null included) change it.
-  const stripUnchangedScope = (
-    row: InstanceRow,
-    next: ProviderInstanceConfig,
-  ): ProviderInstanceConfig => {
-    if (!("allowedProjects" in next)) return next;
-    const currentScope = row.instance.allowedProjects ?? null;
-    const nextScope = next.allowedProjects ?? null;
-    const unchanged =
-      currentScope === null || nextScope === null
-        ? currentScope === nextScope
-        : currentScope.length === nextScope.length &&
-          nextScope.every((id) => currentScope.includes(id));
-    if (!unchanged) return next;
-    const { allowedProjects: _unchangedScope, ...rest } = next;
-    return rest;
-  };
-
   // Every instance write is a GRANULAR `providerInstancesPatch` (upsert or
   // null-delete of exactly one entry) that the server merges onto its own
   // current map under its write lock. No whole-map composition happens on
@@ -2065,7 +2043,7 @@ export function ProviderSettingsPanel() {
       buildProviderInstanceUpdatePatch(
         {
           instanceId: row.instanceId,
-          instance: supportsProviderScopes ? stripUnchangedScope(row, next) : next,
+          instance: supportsProviderScopes ? stripUnchangedScope(row.instance, next) : next,
           driver: row.driver,
           isDefault: row.isDefault,
           textGenerationModelSelection: options?.textGenerationModelSelection,

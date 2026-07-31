@@ -115,6 +115,20 @@ function nextConfigBlobWithValue(
   return base;
 }
 
+/**
+ * Shapes a scope write. ALWAYS carries the `allowedProjects` key, `null`
+ * included: the server preserves the stored scope on any write that omits
+ * the key, so clearing to "all projects" must arrive as an explicit
+ * `allowedProjects: null`, never an omission.
+ */
+export function buildAllowedProjectsUpdate(
+  instance: ProviderInstanceConfig,
+  value: ReadonlyArray<ProjectId> | null,
+): ProviderInstanceConfig {
+  const { allowedProjects: _omit, ...rest } = instance;
+  return { ...rest, allowedProjects: value } as ProviderInstanceConfig;
+}
+
 export function deriveProviderModelsForDisplay(input: {
   readonly liveModels: ReadonlyArray<ServerProviderModel> | undefined;
   readonly customModels: ReadonlyArray<string>;
@@ -495,14 +509,8 @@ export function ProviderInstanceCard({
     onUpdate({ ...instance, enabled: value });
   };
 
-  const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) => {
-    const { allowedProjects: _omit, ...rest } = instance;
-    return onUpdate(
-      value !== null
-        ? ({ ...rest, allowedProjects: value } as ProviderInstanceConfig)
-        : (rest as ProviderInstanceConfig),
-    );
-  };
+  const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) =>
+    onUpdate(buildAllowedProjectsUpdate(instance, value));
 
   const updateAccentColor = (value: string) => {
     const normalized = normalizeProviderAccentColor(value);

@@ -291,7 +291,11 @@ export const PendingTaskListRow = memo(function PendingTaskListRow(props: {
     [onDeletePendingTask, pendingTask],
   );
 
-  const statusPill = (
+  const statusPill = pendingTask.failed ? (
+    <View className="rounded-full bg-red-500/12 px-1.5 py-0.5 dark:bg-red-500/16">
+      <Text className="text-3xs font-t3-bold text-red-600 dark:text-red-400">Failed</Text>
+    </View>
+  ) : (
     <View className="rounded-full bg-zinc-500/12 px-1.5 py-0.5 dark:bg-zinc-500/16">
       <Text className="text-3xs font-t3-bold text-zinc-600 dark:text-zinc-300">Pending</Text>
     </View>

@@ -177,6 +177,14 @@ export function applyProviderInstancesPatch(
  * older client re-sending the entire map (its schema having stripped the
  * unknown `allowedProjects` field from every entry) must not erase stored
  * scopes as a side effect of an ordinary provider edit.
+ *
+ * RESTRICTED entries (non-null scope) absent from the incoming map are
+ * RETAINED, not deleted: a
+ * pre-capability client may simply not carry the entry (or a stale one may
+ * predate it), and deleting it would let provider hydration resynthesize a
+ * driver default with no scope — silently converting a restricted instance
+ * into an unrestricted one. The cost is that scoped instances can only be
+ * deleted through the granular patch channel (capability-aware clients).
  */
 export function replaceProviderInstancesPreservingScopes(
   current: ServerSettings["providerInstances"],
@@ -194,6 +202,19 @@ export function replaceProviderInstancesPreservingScopes(
   >) {
     next[instanceId] =
       value === undefined ? value : withPreservedInstanceScope(current[instanceId], value);
+  }
+  for (const [instanceId, value] of Object.entries(current) as Array<
+    [
+      keyof ServerSettings["providerInstances"],
+      ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]],
+    ]
+  >) {
+    if (instanceId in next || value === undefined) continue;
+    // `allowedProjects: null` means "all projects" — deleting such an entry
+    // cannot widen access, so legacy deletes of it still go through.
+    if (value.allowedProjects != null) {
+      next[instanceId] = value;
+    }
   }
   return next;
 }

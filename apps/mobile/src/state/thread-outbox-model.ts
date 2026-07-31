@@ -51,15 +51,19 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
   createdAt: IsoDateTime,
-  // Recovery phase markers, written DURABLY in order around the draft
-  // restore so a crash between the two stores can never re-deliver or
-  // double-restore this entry:
-  //   1. `recoveryStartedAt` commits the entry to recovery BEFORE the draft
-  //      is written — from then on it is never delivered again, only
-  //      restored (idempotently) and removed.
-  //   2. `restoredAt` records the completed durable restore — from then on
-  //      only removal remains, even if the user has since sent the
-  //      recovered draft (which clears the draft-side receipt).
+  // A deterministically rejected entry is kept in the outbox as FAILED: it
+  // stays visible and editable exactly where it already lives, is never
+  // dispatched again, and re-queues when the user edits it (an editor save
+  // clears the markers) or disappears when they delete it. There is no
+  // cross-store draft-restore handoff.
+  failedAt: Schema.optional(IsoDateTime),
+  failureReason: Schema.optional(Schema.String),
+  // LEGACY (schema v3 recovery phase machine, since removed) — retained so
+  // stored entries decode. `restoredAt` means the old version durably
+  // restored the content into a composer draft: only removal remains. A bare
+  // `recoveryStartedAt` means the old version committed to recovery but the
+  // restore is unconfirmed: the entry is treated as failed (kept visible and
+  // editable) rather than re-delivered or dropped.
   recoveryStartedAt: Schema.optional(IsoDateTime),
   restoredAt: Schema.optional(IsoDateTime),
 });
@@ -89,15 +93,29 @@ export interface QueuedThreadMessage {
   readonly interactionMode?: ProviderInteractionModeType;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
-  /** See the recovery phase markers on `QueuedThreadMessageSchema`. */
+  /** See the failure/legacy-recovery markers on `QueuedThreadMessageSchema`. */
+  readonly failedAt?: string;
+  readonly failureReason?: string;
   readonly recoveryStartedAt?: string;
   readonly restoredAt?: string;
 }
 
-/** Recovery markers settable via the outbox manager's monotonic mark op. */
-export interface ThreadOutboxRecoveryMarkers {
-  readonly recoveryStartedAt?: string;
-  readonly restoredAt?: string;
+/** Failure markers applied via the outbox manager's markFailed op. */
+export interface ThreadOutboxFailureMarkers {
+  readonly failedAt: string;
+  readonly failureReason?: string;
+}
+
+/**
+ * A failed entry is skipped by the drain (blocking only its own thread's
+ * queue) until an editor save or re-enqueue clears its markers. Includes
+ * legacy mid-recovery entries (committed by the removed v3 recovery machine,
+ * restore unconfirmed) — kept visible and editable as failed rather than
+ * re-delivered or dropped.
+ */
+export function isQueuedThreadMessageFailed(message: QueuedThreadMessage): boolean {
+  if (message.failedAt !== undefined) return true;
+  return message.recoveryStartedAt !== undefined && message.restoredAt === undefined;
 }
 
 export interface ThreadSettingsSnapshot {

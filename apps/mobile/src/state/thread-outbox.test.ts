@@ -12,6 +12,7 @@ import { AtomRegistry } from "effect/unstable/reactivity";
 import {
   decodeQueuedThreadMessage,
   encodeQueuedThreadMessage,
+  flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -209,7 +210,7 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
-  it("keeps recovery markers monotonic across rewrites and marks the CURRENT entry", async () => {
+  it("marks the CURRENT entry failed and clears the markers on edit or re-enqueue", async () => {
     const registry = AtomRegistry.make();
     const stored = new Map<MessageId, QueuedThreadMessage>();
     const storage: ThreadOutboxStorage = {
@@ -228,56 +229,97 @@ describe("thread outbox", () => {
     });
     await manager.enqueue(message);
 
-    // mark() applies to the CURRENT stored entry — including edits made
-    // after the recovery flow captured its snapshot — so marking can never
-    // clobber concurrently edited content.
+    // markFailed() applies to the CURRENT stored entry — including edits
+    // made while the rejection round-tripped — so marking can never clobber
+    // concurrently edited content.
     await manager.update({ ...message, text: "edited while rejection was in flight" });
     expect(
-      await manager.mark(message.messageId, { recoveryStartedAt: "2026-06-08T10:00:05.000Z" }),
+      await manager.markFailed(message.messageId, {
+        failedAt: "2026-06-08T10:00:05.000Z",
+        failureReason: "provider access revoked",
+      }),
     ).toBe("marked");
     expect(stored.get(message.messageId)).toMatchObject({
       text: "edited while rejection was in flight",
-      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
+      failedAt: "2026-06-08T10:00:05.000Z",
+      failureReason: "provider access revoked",
     });
 
-    // An editor save that reconstructs the record WITHOUT the marker cannot
-    // erase it: markers are monotonic through update(). The same holds for a
-    // same-id re-enqueue (offline resubmission of an open pending task).
+    // An editor save is the explicit requeue gesture: it reconstructs the
+    // record without the markers and update() lets them clear.
     expect(await manager.update({ ...message, text: "editor save" })).toBe(true);
-    expect(stored.get(message.messageId)).toMatchObject({
-      text: "editor save",
-      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
-    });
-    await manager.enqueue({ ...message, text: "resubmitted" });
-    expect(stored.get(message.messageId)).toMatchObject({
-      text: "resubmitted",
-      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
-    });
+    expect(stored.get(message.messageId)?.failedAt).toBeUndefined();
+    expect(stored.get(message.messageId)?.failureReason).toBeUndefined();
 
-    // A content-CAS mark refuses when the stored content changed since the
-    // caller read it — recovery then retracts its restore and retries fresh.
-    expect(
-      await manager.mark(
-        message.messageId,
-        { restoredAt: "2026-06-08T10:00:06.000Z" },
-        { text: "some older capture", attachmentIds: [] },
-      ),
-    ).toBe("stale");
-    expect(stored.get(message.messageId)?.restoredAt).toBeUndefined();
-    expect(
-      await manager.mark(
-        message.messageId,
-        { restoredAt: "2026-06-08T10:00:06.000Z" },
-        { text: "resubmitted", attachmentIds: [] },
-      ),
-    ).toBe("marked");
+    // Same for a same-id re-enqueue (offline resubmission).
+    await manager.markFailed(message.messageId, { failedAt: "2026-06-08T10:00:06.000Z" });
+    await manager.enqueue({ ...message, text: "resubmitted" });
+    expect(stored.get(message.messageId)).toMatchObject({ text: "resubmitted" });
+    expect(stored.get(message.messageId)?.failedAt).toBeUndefined();
+
+    // The LEGACY restoredAt marker stays monotonic through both paths: its
+    // content already lives in a composer draft, so the entry must never
+    // become deliverable again.
+    stored.set(message.messageId, {
+      ...stored.get(message.messageId)!,
+      restoredAt: "2026-06-08T10:00:07.000Z",
+    });
+    registry.dispose();
+    const registry2 = AtomRegistry.make();
+    const manager2 = createThreadOutboxManager({ registry: registry2, storage });
+    await manager2.load();
+    await manager2.update({ ...message, text: "post-restore editor save" });
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "post-restore editor save",
+      restoredAt: "2026-06-08T10:00:07.000Z",
+    });
 
     // Marking an entry deleted concurrently writes nothing and reports it.
-    await manager.remove(message);
-    expect(await manager.mark(message.messageId, { restoredAt: "2026-06-08T10:00:07.000Z" })).toBe(
-      "missing",
-    );
+    await manager2.remove(message);
+    expect(
+      await manager2.markFailed(message.messageId, { failedAt: "2026-06-08T10:00:08.000Z" }),
+    ).toBe("missing");
     expect(stored.size).toBe(0);
+    registry2.dispose();
+  });
+
+  it("restores the displaced entry when a same-id enqueue's durable write fails", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (failNextWrite) {
+          failNextWrite = false;
+          throw new Error("disk full");
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // The replacement's write fails: the durably stored entry it displaced
+    // must come back into the queue — dropping it would leave the atom and
+    // disk divergent until the next full reload.
+    failNextWrite = true;
+    await expect(manager.enqueue({ ...original, text: "replacement" })).rejects.toBeInstanceOf(
+      ThreadOutboxManagerError,
+    );
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toBe(original);
+    expect(stored.get(original.messageId)?.text).toBe("message-1");
     registry.dispose();
   });
 

@@ -2,7 +2,7 @@ import type { EnvironmentId, MessageId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import { createThreadOutboxManager } from "./thread-outbox-manager";
-import type { QueuedThreadMessage, ThreadOutboxRecoveryMarkers } from "./thread-outbox-model";
+import type { QueuedThreadMessage, ThreadOutboxFailureMarkers } from "./thread-outbox-model";
 import { expoThreadOutboxStorage } from "./thread-outbox-storage";
 
 export * from "./thread-outbox-model";
@@ -30,25 +30,16 @@ export function updateThreadOutboxMessage(message: QueuedThreadMessage): Promise
   return threadOutboxManager.update(message);
 }
 
-/** Reads the CURRENT stored entry once pending mutations settle. */
-export function getThreadOutboxMessageById(
-  messageId: MessageId,
-): Promise<QueuedThreadMessage | undefined> {
-  return threadOutboxManager.getById(messageId);
-}
-
 /**
- * Durably applies recovery markers to the CURRENT stored entry (never a
- * captured snapshot). "missing" = deleted concurrently; "stale" = the
- * stored content no longer matches `expect` (an edit landed mid-recovery).
- * Nothing is written in either non-"marked" case.
+ * Durably applies failure markers to the CURRENT stored entry (never a
+ * captured snapshot). "missing" = deleted or delivered concurrently;
+ * nothing is written then.
  */
-export function markThreadOutboxMessageRecovery(
+export function markThreadOutboxMessageFailed(
   messageId: MessageId,
-  markers: ThreadOutboxRecoveryMarkers,
-  expect?: { readonly text: string; readonly attachmentIds: ReadonlyArray<string> },
-): Promise<"marked" | "missing" | "stale"> {
-  return threadOutboxManager.mark(messageId, markers, expect);
+  markers: ThreadOutboxFailureMarkers,
+): Promise<"marked" | "missing"> {
+  return threadOutboxManager.markFailed(messageId, markers);
 }
 
 export function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {

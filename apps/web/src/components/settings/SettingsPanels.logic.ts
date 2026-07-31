@@ -158,6 +158,32 @@ export function formatDiagnosticsDescription(input: {
 }
 
 /**
+ * Access scope is SECURITY POLICY with its own write channel: an instance
+ * value that does not explicitly carry `allowedProjects` leaves the stored
+ * scope untouched server-side. Stripping the key from writes whose scope is
+ * UNCHANGED means a name/enabled/config edit composed from a stale render
+ * can never write an outdated scope back — while a genuine change (an
+ * explicit `null` clearing to "all projects" included) keeps the key and
+ * reaches the server.
+ */
+export function stripUnchangedScope(
+  current: ProviderInstanceConfig,
+  next: ProviderInstanceConfig,
+): ProviderInstanceConfig {
+  if (!("allowedProjects" in next)) return next;
+  const currentScope = current.allowedProjects ?? null;
+  const nextScope = next.allowedProjects ?? null;
+  const unchanged =
+    currentScope === null || nextScope === null
+      ? currentScope === nextScope
+      : currentScope.length === nextScope.length &&
+        nextScope.every((id) => currentScope.includes(id));
+  if (!unchanged) return next;
+  const { allowedProjects: _unchangedScope, ...rest } = next;
+  return rest;
+}
+
+/**
  * Builds a settings patch for one provider-instance edit.
  *
  * Granular mode (servers advertising `providerProjectScopes`): the instance

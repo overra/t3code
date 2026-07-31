@@ -6,7 +6,7 @@ import {
   flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   type QueuedThreadMessage,
-  type ThreadOutboxRecoveryMarkers,
+  type ThreadOutboxFailureMarkers,
 } from "./thread-outbox-model";
 import type { ThreadOutboxStorage } from "./thread-outbox-storage";
 
@@ -91,34 +91,28 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
 
   // Returns `message` by IDENTITY when nothing needs preserving: enqueue's
   // rollback and confirmQueued compare by reference, and wrapping every
-  // message in a copy would break both.
-  const withPreservedRecoveryMarkers = (
+  // message in a copy would break both. Only the LEGACY `restoredAt` marker
+  // is monotonic (its content already lives in a composer draft; the entry
+  // must never redeliver). Failure markers are deliberately NOT preserved:
+  // an editor save or a re-enqueue of the same id is an explicit requeue.
+  const withPreservedRestoredMarker = (
     message: QueuedThreadMessage,
     existing: QueuedThreadMessage | undefined,
   ): QueuedThreadMessage => {
     if (existing === undefined) return message;
-    const preserveRecoveryStarted =
-      message.recoveryStartedAt === undefined && existing.recoveryStartedAt !== undefined;
-    const preserveRestored = message.restoredAt === undefined && existing.restoredAt !== undefined;
-    if (!preserveRecoveryStarted && !preserveRestored) return message;
-    return {
-      ...message,
-      ...(preserveRecoveryStarted ? { recoveryStartedAt: existing.recoveryStartedAt } : {}),
-      ...(preserveRestored ? { restoredAt: existing.restoredAt } : {}),
-    };
+    if (message.restoredAt !== undefined || existing.restoredAt === undefined) return message;
+    return { ...message, restoredAt: existing.restoredAt };
   };
 
   // The queued atom drives the composer's immediate "queued" feedback, so it
   // is published synchronously; the durable write happens behind it and rolls
   // the message back out if it fails (durability only matters for crash
-  // recovery, not for the in-session queue). Re-enqueueing an id preserves
-  // any recovery markers the stored entry carries — a resubmission must not
-  // make a recovery-committed entry deliverable again.
+  // recovery, not for the in-session queue).
   const enqueue = (message: QueuedThreadMessage): Promise<void> => {
-    const merged = withPreservedRecoveryMarkers(
-      message,
-      currentMessages().find((candidate) => candidate.messageId === message.messageId),
+    const displaced = currentMessages().find(
+      (candidate) => candidate.messageId === message.messageId,
     );
+    const merged = withPreservedRestoredMarker(message, displaced);
     setMessages([
       ...currentMessages().filter((candidate) => candidate.messageId !== merged.messageId),
       merged,
@@ -129,8 +123,15 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       } catch (cause) {
         // Roll back by reference, not messageId: a retry enqueue with the same
         // id may have optimistically replaced this attempt while the write was
-        // in flight, and its entry must survive this attempt's failure.
-        setMessages(currentMessages().filter((candidate) => candidate !== merged));
+        // in flight, and its entry must survive this attempt's failure. When
+        // this attempt is still the live entry, the one it displaced comes
+        // back — the failed write left it durably stored, and dropping it
+        // from memory would strand disk and atom divergent until reload.
+        setMessages(
+          currentMessages().flatMap((candidate) =>
+            candidate === merged ? (displaced !== undefined ? [displaced] : []) : [candidate],
+          ),
+        );
         throw new ThreadOutboxManagerError({
           operation: "enqueue",
           environmentId: message.environmentId,
@@ -151,10 +152,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
 
   // Rewrites an already-queued message. A no-op when the message has been
   // removed in the meantime (e.g. deleted or delivered), so a trailing editor
-  // flush can never resurrect it. Recovery markers are MONOTONIC: once set
-  // on the stored entry they survive any content rewrite, so an editor save
-  // racing the recovery flow can never make an already-restored entry
-  // deliverable again. Returns whether the message was updated.
+  // flush can never resurrect it. An update CLEARS failure markers — saving
+  // an edit is the explicit requeue gesture for a failed entry — while the
+  // legacy `restoredAt` marker stays monotonic. Returns whether the message
+  // was updated.
   const update = (message: QueuedThreadMessage): Promise<boolean> =>
     serialize(async () => {
       const existing = currentMessages().find(
@@ -163,7 +164,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (existing === undefined) {
         return false;
       }
-      const merged = withPreservedRecoveryMarkers(message, existing);
+      const merged = withPreservedRestoredMarker(message, existing);
       try {
         await options.storage.write(merged);
       } catch (cause) {
@@ -182,41 +183,18 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       return true;
     });
 
-  // Reads the CURRENT stored entry once pending mutations settle. Recovery
-  // must restore what is stored NOW, not a snapshot captured before the
-  // rejection round-trip — an edit landing meanwhile would otherwise be
-  // silently discarded.
-  const getById = (messageId: MessageId): Promise<QueuedThreadMessage | undefined> =>
-    serialize(async () => currentMessages().find((candidate) => candidate.messageId === messageId));
-
-  // Applies recovery markers to the CURRENT stored entry — never to a
+  // Applies failure markers to the CURRENT stored entry — never to a
   // caller-captured snapshot — so marking cannot clobber content edits made
-  // while a rejection was in flight. "missing" means the entry no longer
-  // exists (deleted concurrently); with `expect` provided, "stale" means the
-  // stored content changed since the caller read it (an edit landed
-  // mid-recovery) — in both cases nothing was written.
-  const mark = (
+  // while the rejection round-tripped. "missing" means the entry no longer
+  // exists (deleted or delivered concurrently); nothing is written then.
+  const markFailed = (
     messageId: MessageId,
-    markers: ThreadOutboxRecoveryMarkers,
-    expect?: {
-      readonly text: string;
-      readonly attachmentIds: ReadonlyArray<string>;
-    },
-  ): Promise<"marked" | "missing" | "stale"> =>
+    markers: ThreadOutboxFailureMarkers,
+  ): Promise<"marked" | "missing"> =>
     serialize(async () => {
       const existing = currentMessages().find((candidate) => candidate.messageId === messageId);
       if (existing === undefined) {
         return "missing";
-      }
-      if (expect !== undefined) {
-        const attachmentIds = existing.attachments.map((attachment) => attachment.id);
-        const contentMatches =
-          existing.text === expect.text &&
-          attachmentIds.length === expect.attachmentIds.length &&
-          attachmentIds.every((id, index) => id === expect.attachmentIds[index]);
-        if (!contentMatches) {
-          return "stale";
-        }
       }
       const merged: QueuedThreadMessage = { ...existing, ...markers };
       try {
@@ -307,8 +285,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     enqueue,
     confirmQueued,
     update,
-    getById,
-    mark,
+    markFailed,
     remove,
     clearEnvironment,
   };

@@ -15,7 +15,7 @@ import * as Cause from "effect/Cause";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { scopedProjectKey, scopedThreadKey } from "../lib/scopedEntities";
+import { scopedThreadKey } from "../lib/scopedEntities";
 import { buildProjectThreadStartTurnInput } from "../lib/projectThreadStartTurn";
 import { toUploadChatImageAttachments } from "../lib/composerImages";
 import { randomHex } from "../lib/uuid";
@@ -24,19 +24,12 @@ import { useProjects, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
-  getThreadOutboxMessageById,
-  markThreadOutboxMessageRecovery,
+  markThreadOutboxMessageFailed,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
-import { environmentProjects } from "./projects";
-import {
-  getComposerDraftSnapshot,
-  mergeComposerDraftContentIfFits,
-  restoreComposerDraftSnapshotOnce,
-  retractComposerDraftRestore,
-} from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
+  isQueuedThreadMessageFailed,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
@@ -93,6 +86,21 @@ function findCreationProject(
 
 function settingsCommandId(message: QueuedThreadMessage, setting: string): CommandId {
   return CommandId.make(`${message.commandId}:${setting}`);
+}
+
+function failureReasonFrom(error: unknown): string | undefined {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return error.message;
+  }
+  return typeof error === "string" ? error : undefined;
 }
 
 export function useThreadOutboxDrain(): void {
@@ -154,226 +162,33 @@ export function useThreadOutboxDrain(): void {
     };
     /**
      * A deterministic rejection (e.g. provider access changed while the
-     * entry sat in the outbox) means this entry will never send — but the
-     * user's content must not vanish with it. Text and attachments are
-     * restored into the composer draft the entry came from: the thread's
-     * draft for a message on an existing thread, the project's new-task
-     * draft for a queued creation (that thread was never created). The
-     * poisoned entry is then removed so it stops blocking the FIFO.
+     * entry sat in the outbox) means this entry will never send as-is. It
+     * is kept in the outbox MARKED FAILED on the CURRENT stored entry (so
+     * marking cannot clobber an edit that landed while the rejection
+     * round-tripped): still visible and editable exactly where it already
+     * lives, never dispatched again until an editor save clears the markers
+     * and requeues it, deletable at any time. A failed entry blocks only
+     * its own thread's queue — deliberately, since delivering later
+     * messages around it would reorder the conversation (and they would
+     * usually fail the same way).
      *
-     * Recovery is a DURABLE PHASE MACHINE ordered for crash safety, with
-     * each marker written to the CURRENT stored entry (so it cannot clobber
-     * concurrent edits) and each phase gating the next:
-     *   1. `recoveryStartedAt` commits the entry to recovery BEFORE any
-     *      draft write — a crash right after leaves an entry that restart
-     *      reconciliation routes back here (never to delivery), and the
-     *      restore below is idempotent.
-     *   2. The draft restore itself (durable, all-or-nothing).
-     *   3. `restoredAt` records completion — a crash before it re-runs the
-     *      idempotent restore; after it, only removal remains even if the
-     *      user sends the recovered draft (clearing its receipt).
-     *   4. Removal.
-     *
-     * Returns whether the entry was fully resolved; `false` keeps it queued
-     * for a later pass with backoff.
+     * Returns whether the queue slot settled; `false` retries the marking
+     * on a later pass with backoff.
      */
-    const discardPoisonedEntry = async (): Promise<boolean> => {
-      const warnContext = {
-        environmentId: queuedMessage.environmentId,
-        threadId: queuedMessage.threadId,
-        messageId: queuedMessage.messageId,
-      };
-      // Operate on the CURRENT stored entry, never the captured dispatch
-      // snapshot: an edit can land while the rejection round-trips, and
-      // restoring the stale capture would silently discard the correction.
-      const entry = await getThreadOutboxMessageById(queuedMessage.messageId);
-      if (entry === undefined) {
-        // Deleted concurrently — the deletion wins; nothing is restored.
-        return true;
-      }
-      const receiptId = `thread-outbox:${entry.messageId}`;
-      const expectedContent = {
-        text: entry.text,
-        attachmentIds: entry.attachments.map((attachment) => attachment.id),
-      };
-      if (entry.restoredAt === undefined) {
-        if (entry.creation !== undefined) {
-          // A creation whose project no longer exists has no reachable
-          // destination draft — restoring there would strand the content
-          // behind a key no UI can open, and removing the entry would erase
-          // the only record that can still present it. Keep it queued and
-          // visible (it blocks only its own never-created thread's queue).
-          const projectExists = appAtomRegistry
-            .get(environmentProjects.projectsAtom)
-            .some(
-              (project) =>
-                project.environmentId === entry.environmentId &&
-                project.id === entry.creation?.projectId,
-            );
-          if (!projectExists) {
-            console.warn(
-              "[thread-outbox] kept poisoned pending task; its project no longer exists",
-              warnContext,
-            );
-            return false;
-          }
-          // Best-effort occupancy check BEFORE committing to recovery, so a
-          // content-occupied destination defers with the entry still whole,
-          // deliverable-if-policy-changes, and editable. (The restore itself
-          // re-checks atomically; entries committed past this point remain
-          // VISIBLE in the pending-task list until restoredAt.)
-          const destination = getComposerDraftSnapshot(
-            `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`,
-          );
-          if (
-            entry.recoveryStartedAt === undefined &&
-            (destination.text.length > 0 || destination.attachments.length > 0)
-          ) {
-            console.warn(
-              "[thread-outbox] deferred poisoned pending-task recovery; the new-task draft has content",
-              warnContext,
-            );
-            return false;
-          }
-        }
-        if (entry.recoveryStartedAt === undefined) {
-          let commit: "marked" | "missing" | "stale";
-          try {
-            commit = await markThreadOutboxMessageRecovery(entry.messageId, {
-              recoveryStartedAt: new Date().toISOString(),
-            });
-          } catch (error) {
-            // Not committed: nothing was restored, the entry stays whole.
-            console.warn("[thread-outbox] failed to commit poisoned queued message recovery", {
-              ...warnContext,
-              error,
-            });
-            return false;
-          }
-          if (commit === "missing") {
-            // Deleted concurrently before recovery began — deletion wins.
-            return true;
-          }
-        }
-        try {
-          if (entry.creation !== undefined) {
-            // ONE durable snapshot write: content plus task shape (workspace
-            // selection with startFromOrigin pinned, runtime and interaction
-            // modes) — while any settings the user already picked in the
-            // destination draft WIN over the task's shape. The revoked model
-            // selection is deliberately NOT restored; the flow's clamp picks
-            // a usable one.
-            const restoreDraftKey = `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`;
-            const { restored } = await restoreComposerDraftSnapshotOnce(
-              restoreDraftKey,
-              {
-                text: entry.text,
-                attachments: entry.attachments,
-                workspaceSelection: {
-                  mode: entry.creation.workspaceMode,
-                  branch: entry.creation.branch,
-                  worktreePath: entry.creation.worktreePath,
-                  startFromOrigin: entry.creation.startFromOrigin ?? false,
-                },
-                ...(entry.runtimeMode !== undefined ? { runtimeMode: entry.runtimeMode } : {}),
-                ...(entry.interactionMode !== undefined
-                  ? { interactionMode: entry.interactionMode }
-                  : {}),
-              },
-              receiptId,
-            );
-            if (!restored) {
-              console.warn(
-                "[thread-outbox] deferred poisoned pending-task restore; the new-task draft is in use",
-                warnContext,
-              );
-              return false;
-            }
-          } else {
-            // ALL-OR-NOTHING restore: the merge writes nothing when the
-            // draft cannot fit every attachment, so a truncated copy (and a
-            // dedup receipt that would block later retries) never persists
-            // alongside the retained full original. Once the draft has room
-            // — the user sends or trims it — a later pass merges the whole
-            // message in one durable write.
-            const restoreDraftKey = scopedThreadKey(entry.environmentId, entry.threadId);
-            const { merged } = await mergeComposerDraftContentIfFits(restoreDraftKey, {
-              text: entry.text,
-              attachments: entry.attachments,
-              sourceShareId: receiptId,
-            });
-            if (!merged) {
-              console.warn(
-                "[thread-outbox] deferred poisoned queued message restore; the thread draft cannot fit its attachments",
-                warnContext,
-              );
-              return false;
-            }
-          }
-        } catch (error) {
-          // Content is NOT durably saved; keep the outbox entry rather than
-          // lose the message.
-          console.warn("[thread-outbox] failed to restore poisoned queued message to draft", {
-            ...warnContext,
-            error,
-          });
-          return false;
-        }
-        // Record completion ON THE ENTRY before removal, CAS-guarded on the
-        // content we just restored: if an edit landed mid-restore ("stale")
-        // or the user deleted the entry ("missing"), the restored copy is
-        // RETRACTED (creations only, and only while untouched) so a
-        // superseded or unwanted restore never lingers in the composer. A
-        // failed marker write also retracts, closing the window where
-        // restored content is actionable without a durable completion
-        // marker.
-        const retractRestore = async () => {
-          if (entry.creation === undefined) return;
-          try {
-            await retractComposerDraftRestore(
-              `new-task:${scopedProjectKey(entry.environmentId, entry.creation.projectId)}`,
-              { text: entry.text, attachments: entry.attachments },
-              receiptId,
-            );
-          } catch (error) {
-            console.warn("[thread-outbox] failed to retract superseded draft restore", {
-              ...warnContext,
-              error,
-            });
-          }
-        };
-        let marked: "marked" | "missing" | "stale";
-        try {
-          marked = await markThreadOutboxMessageRecovery(
-            entry.messageId,
-            { restoredAt: new Date().toISOString() },
-            expectedContent,
-          );
-        } catch (error) {
-          console.warn("[thread-outbox] failed to mark poisoned queued message restored", {
-            ...warnContext,
-            error,
-          });
-          await retractRestore();
-          return false;
-        }
-        if (marked === "missing") {
-          await retractRestore();
-          return true;
-        }
-        if (marked === "stale") {
-          // The entry's content changed while we restored the old copy:
-          // retract it and retry against the fresh content next pass.
-          await retractRestore();
-          return false;
-        }
-      }
+    const markEntryFailed = async (reason: string | undefined): Promise<boolean> => {
       try {
-        await removeThreadOutboxMessage(entry);
+        // "marked" and "missing" (deleted or delivered concurrently — that
+        // outcome wins) both settle the slot.
+        await markThreadOutboxMessageFailed(queuedMessage.messageId, {
+          failedAt: new Date().toISOString(),
+          ...(reason !== undefined ? { failureReason: reason } : {}),
+        });
         return true;
       } catch (error) {
-        console.warn("[thread-outbox] failed to remove poisoned queued message", {
-          ...warnContext,
+        console.warn("[thread-outbox] failed to mark rejected queued message", {
+          environmentId: queuedMessage.environmentId,
+          threadId: queuedMessage.threadId,
+          messageId: queuedMessage.messageId,
           error,
         });
         return false;
@@ -387,11 +202,7 @@ export function useThreadOutboxDrain(): void {
         if (reportFailure(deliveryResult, "start-turn")) {
           return false;
         }
-        // Resolving the poisoned entry (restored + removed) counts as
-        // settling this queue slot: returning its result lets the drain
-        // clear the retry bookkeeping instead of scheduling a retry for an
-        // entry that no longer exists.
-        return discardPoisonedEntry();
+        return markEntryFailed(failureReasonFrom(Cause.squash(deliveryResult.cause)));
       }
 
       try {
@@ -407,28 +218,24 @@ export function useThreadOutboxDrain(): void {
         return false;
       }
     };
-    return { reportFailure, completeDelivery, discardPoisonedEntry };
+    return { reportFailure, completeDelivery, markEntryFailed };
   }, []);
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage, thread: EnvironmentThreadShell) => {
       const settings = resolveQueuedThreadSettings(queuedMessage, thread);
-      const { reportFailure, completeDelivery, discardPoisonedEntry } =
+      const { reportFailure, completeDelivery, markEntryFailed } =
         makeDeliveryHelpers(queuedMessage);
       // A deterministic settings-sync rejection (e.g. the queued selection
       // is no longer allowed in this project) can never succeed on retry;
-      // leaving the entry queued would invisibly block every later message
-      // in this thread's FIFO. Restore the content and drop the entry, same
-      // as a deterministic start-turn failure.
+      // mark the entry failed, same as a deterministic start-turn failure.
       const failSettingsSync = async (
         result: AtomCommandResult<unknown, unknown>,
       ): Promise<boolean> => {
-        if (reportFailure(result, "settings-sync")) {
+        if (!AsyncResult.isFailure(result) || reportFailure(result, "settings-sync")) {
           return false;
         }
-        // A resolved discard (restored + removed) settles this queue slot —
-        // see the matching note in completeDelivery.
-        return discardPoisonedEntry();
+        return markEntryFailed(failureReasonFrom(Cause.squash(result.cause)));
       };
 
       if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
@@ -553,6 +360,12 @@ export function useThreadOutboxDrain(): void {
       if (editingQueuedMessageIds[nextQueuedMessage.messageId]) {
         continue;
       }
+      // A failed entry holds its thread's queue (visible and editable in
+      // place) until an editor save clears its markers or the user deletes
+      // it. Legacy already-restored entries fall through to removal below.
+      if (isQueuedThreadMessageFailed(nextQueuedMessage)) {
+        continue;
+      }
       if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
         continue;
       }
@@ -567,15 +380,11 @@ export function useThreadOutboxDrain(): void {
         (candidate) => candidate.environmentId === nextQueuedMessage.environmentId,
       );
       const shellStatus = shellStatuses.get(nextQueuedMessage.environmentId) ?? "empty";
-      // Restart reconciliation for the recovery phase machine: an entry
-      // already restored needs only removal; an entry that COMMITTED to
-      // recovery (crash or failure between marker and restore) must resume
-      // the idempotent recovery flow — and neither may ever be delivered.
-      const recoveryResumePending =
-        nextQueuedMessage.restoredAt === undefined &&
-        nextQueuedMessage.recoveryStartedAt !== undefined;
+      // Legacy migration: an entry the removed v3 recovery machine already
+      // restored into a composer draft needs only removal — it must never
+      // be delivered (the content would send twice).
       const deliveryAction: ThreadOutboxDeliveryAction =
-        nextQueuedMessage.restoredAt !== undefined || recoveryResumePending
+        nextQueuedMessage.restoredAt !== undefined
           ? "remove"
           : resolveThreadOutboxDeliveryAction({
               isCreation: creation !== undefined,
@@ -647,23 +456,24 @@ export function useThreadOutboxDrain(): void {
         if (deliveryAction === "send" && creation === undefined && freshThreadBusy) {
           return true;
         }
-        return recoveryResumePending
-          ? // Resume the durable recovery flow (idempotent restore → mark →
-            // remove); the entry is already committed to never deliver.
-            makeDeliveryHelpers(nextQueuedMessage).discardPoisonedEntry()
-          : deliveryAction === "remove"
-            ? removeQueuedMessage(
-                nextQueuedMessage.restoredAt !== undefined
-                  ? "[thread-outbox] failed to remove already-restored message"
-                  : "[thread-outbox] failed to remove message for a missing thread",
-              )
-            : creation !== undefined
-              ? creationProjectCwd !== null
-                ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
-                : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
-              : thread !== undefined
-                ? sendQueuedMessage(nextQueuedMessage, thread)
-                : Promise.resolve(false);
+        return deliveryAction === "remove"
+          ? removeQueuedMessage(
+              nextQueuedMessage.restoredAt !== undefined
+                ? "[thread-outbox] failed to remove already-restored message"
+                : "[thread-outbox] failed to remove message for a missing thread",
+            )
+          : creation !== undefined
+            ? creationProjectCwd !== null
+              ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
+              : // No project and no snapshot cwd: the task cannot ever send.
+                // Mark it failed instead of dropping it — the entry is the
+                // only record of the user's content.
+                makeDeliveryHelpers(nextQueuedMessage).markEntryFailed(
+                  "This task's project is no longer available.",
+                )
+            : thread !== undefined
+              ? sendQueuedMessage(nextQueuedMessage, thread)
+              : Promise.resolve(false);
       });
       void delivery
         .then((sent) => {

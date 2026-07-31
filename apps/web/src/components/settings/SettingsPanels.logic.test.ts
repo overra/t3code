@@ -3,6 +3,7 @@ import {
   DEFAULT_UNIFIED_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 import { getBackgroundActivityPresetSettings } from "@t3tools/shared/backgroundActivitySettings";
@@ -16,6 +17,7 @@ import {
   isProjectGroupingEnabled,
   projectGroupingModeFromToggle,
   resolveBackgroundActivityProfileOption,
+  stripUnchangedScope,
 } from "./SettingsPanels.logic";
 
 describe("background activity settings restore", () => {
@@ -239,5 +241,29 @@ describe("buildProviderInstanceUpdatePatch", () => {
 
     expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
     expect(patch.providers).toBeUndefined();
+  });
+});
+
+describe("stripUnchangedScope", () => {
+  const driver = ProviderDriverKind.make("claudeAgent");
+  const projectA = ProjectId.make("project-a");
+
+  it("keeps an explicit null that clears a stored scope", () => {
+    const current = { driver, enabled: true, allowedProjects: [projectA] };
+    const next = { driver, enabled: true, allowedProjects: null };
+    // Clearing to "all projects" must reach the server as an explicit null —
+    // an omitted key would be interpreted as "preserve the restriction".
+    expect(stripUnchangedScope(current, next)).toEqual(next);
+    expect("allowedProjects" in stripUnchangedScope(current, next)).toBe(true);
+  });
+
+  it("strips the key when the scope is unchanged", () => {
+    const current = { driver, enabled: true, allowedProjects: [projectA] };
+    const next = { driver, enabled: false, allowedProjects: [projectA] };
+    expect("allowedProjects" in stripUnchangedScope(current, next)).toBe(false);
+
+    const unscopedCurrent = { driver, enabled: true };
+    const unscopedNext = { driver, enabled: false, allowedProjects: null };
+    expect("allowedProjects" in stripUnchangedScope(unscopedCurrent, unscopedNext)).toBe(false);
   });
 });

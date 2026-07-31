@@ -3,7 +3,6 @@ import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import {
-  canMergeComposerDraftContentWithoutTruncation,
   clearComposerDraftContentState,
   composerDraftsAtom,
   decodePersistedComposerDrafts,
@@ -11,9 +10,7 @@ import {
   getComposerDraftSnapshot,
   mergeComposerDraftContentState,
   removeComposerDraftsForEnvironment,
-  restoreComposerDraftSnapshotOnceState,
   restoreComposerDraftSnapshotState,
-  retractComposerDraftRestoreState,
 } from "./use-composer-drafts";
 
 const DRAFT: ComposerDraft = {
@@ -196,141 +193,6 @@ describe("mobile composer drafts", () => {
     expect(merged[draftKey]?.attachments).toHaveLength(8);
     expect(merged[draftKey]?.attachments[0]).toEqual(existingImage);
     expect(merged[draftKey]?.attachments.at(-1)?.id).toBe("shared-6");
-  });
-
-  it("restores a poisoned queued task only into an empty draft, exactly once", () => {
-    const draftKey = "new-task:environment-1:project-1";
-    const receiptId = "thread-outbox:message-1";
-    const snapshot: ComposerDraft = {
-      text: "Queued task",
-      attachments: [],
-      runtimeMode: "approval-required",
-      workspaceSelection: {
-        mode: "worktree",
-        branch: "main",
-        worktreePath: null,
-        startFromOrigin: false,
-      },
-    };
-
-    // Empty target: the full task shape and the receipt land in one state.
-    const restored = restoreComposerDraftSnapshotOnceState({}, draftKey, snapshot, receiptId);
-    expect(restored.restored).toBe(true);
-    expect(restored.next[draftKey]).toEqual({
-      ...snapshot,
-      importedShareIds: [receiptId],
-    });
-
-    // Receipt already present (crash between restore and outbox removal):
-    // idempotent, even after the user edited the restored content.
-    const edited = {
-      [draftKey]: { ...restored.next[draftKey]!, text: "Queued task, edited" },
-    };
-    const repeat = restoreComposerDraftSnapshotOnceState(edited, draftKey, snapshot, receiptId);
-    expect(repeat.restored).toBe(true);
-    expect(repeat.next).toBe(edited);
-
-    // A draft with user content and no receipt is refused, not clobbered.
-    const occupied = { [draftKey]: { text: "User draft", attachments: [] } };
-    const refused = restoreComposerDraftSnapshotOnceState(occupied, draftKey, snapshot, receiptId);
-    expect(refused.restored).toBe(false);
-    expect(refused.next).toBe(occupied);
-
-    // A settings-only draft ACCEPTS the restore — deferring would deadlock
-    // (settings survive content clearing) — but the user's explicit picks
-    // win over the queued task's shape.
-    const settingsOnly = {
-      [draftKey]: {
-        text: "",
-        attachments: [],
-        runtimeMode: "full-access" as const,
-      },
-    };
-    const restoredIntoSettings = restoreComposerDraftSnapshotOnceState(
-      settingsOnly,
-      draftKey,
-      snapshot,
-      receiptId,
-    );
-    expect(restoredIntoSettings.restored).toBe(true);
-    expect(restoredIntoSettings.next[draftKey]).toMatchObject({
-      text: "Queued task",
-      runtimeMode: "full-access",
-      importedShareIds: [receiptId],
-    });
-  });
-
-  it("retracts a restore only while the draft still holds exactly the restored content", () => {
-    const draftKey = "new-task:environment-1:project-1";
-    const receiptId = "thread-outbox:message-1";
-    const restored = {
-      [draftKey]: {
-        text: "Queued task",
-        attachments: [],
-        runtimeMode: "approval-required" as const,
-        importedShareIds: [receiptId],
-      },
-    };
-
-    // Untouched restore: content and receipt are removed, settings survive.
-    const retracted = retractComposerDraftRestoreState(
-      restored,
-      draftKey,
-      { text: "Queued task", attachments: [] },
-      receiptId,
-    );
-    expect(retracted.retracted).toBe(true);
-    expect(retracted.next[draftKey]).toEqual({
-      text: "",
-      attachments: [],
-      runtimeMode: "approval-required",
-    });
-
-    // Edited content is the user's now — never retracted.
-    const edited = {
-      [draftKey]: { ...restored[draftKey]!, text: "Queued task, edited" },
-    };
-    const kept = retractComposerDraftRestoreState(
-      edited,
-      draftKey,
-      { text: "Queued task", attachments: [] },
-      receiptId,
-    );
-    expect(kept.retracted).toBe(false);
-    expect(kept.next).toBe(edited);
-  });
-
-  it("refuses an outbox-content merge that would truncate attachments", () => {
-    const image = (id: string) => ({
-      id,
-      type: "image" as const,
-      name: `${id}.png`,
-      mimeType: "image/png",
-      sizeBytes: 3,
-      dataUrl: "data:image/png;base64,YWJj",
-      previewUri: "data:image/png;base64,YWJj",
-    });
-    const existing: ComposerDraft = { text: "", attachments: [image("existing")] };
-    const eight = Array.from({ length: 8 }, (_, index) => image(`incoming-${index}`));
-
-    // 1 existing + 8 incoming exceeds the cap of 8: nothing may be written.
-    expect(
-      canMergeComposerDraftContentWithoutTruncation(existing, { text: "", attachments: eight }),
-    ).toBe(false);
-    // 1 existing + 7 incoming fits.
-    expect(
-      canMergeComposerDraftContentWithoutTruncation(existing, {
-        text: "",
-        attachments: eight.slice(0, 7),
-      }),
-    ).toBe(true);
-    // Already-present ids do not count against the cap (idempotent retry).
-    expect(
-      canMergeComposerDraftContentWithoutTruncation(
-        { text: "", attachments: eight },
-        { text: "", attachments: eight },
-      ),
-    ).toBe(true);
   });
 
   it("restores the exact draft captured before an interrupted share import", () => {
