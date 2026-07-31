@@ -51,11 +51,16 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
   createdAt: IsoDateTime,
-  // Set once this entry's content has been durably restored to a composer
-  // draft after a deterministic rejection. The marker lives HERE (not only as
-  // a receipt inside the draft) so a failed outbox removal can never lead to
-  // a second restore after the user sends the recovered draft — sending
-  // clears the draft along with its receipt, but not this entry.
+  // Recovery phase markers, written DURABLY in order around the draft
+  // restore so a crash between the two stores can never re-deliver or
+  // double-restore this entry:
+  //   1. `recoveryStartedAt` commits the entry to recovery BEFORE the draft
+  //      is written — from then on it is never delivered again, only
+  //      restored (idempotently) and removed.
+  //   2. `restoredAt` records the completed durable restore — from then on
+  //      only removal remains, even if the user has since sent the
+  //      recovered draft (which clears the draft-side receipt).
+  recoveryStartedAt: Schema.optional(IsoDateTime),
   restoredAt: Schema.optional(IsoDateTime),
 });
 
@@ -84,7 +89,14 @@ export interface QueuedThreadMessage {
   readonly interactionMode?: ProviderInteractionModeType;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
-  /** See `QueuedThreadMessageSchema.restoredAt`. */
+  /** See the recovery phase markers on `QueuedThreadMessageSchema`. */
+  readonly recoveryStartedAt?: string;
+  readonly restoredAt?: string;
+}
+
+/** Recovery markers settable via the outbox manager's monotonic mark op. */
+export interface ThreadOutboxRecoveryMarkers {
+  readonly recoveryStartedAt?: string;
   readonly restoredAt?: string;
 }
 

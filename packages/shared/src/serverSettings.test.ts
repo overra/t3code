@@ -268,6 +268,47 @@ describe("serverSettings helpers", () => {
     expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
   });
 
+  it("merges providerInstancesPatch onto the current map without touching other instances", () => {
+    const codexId = ProviderInstanceId.make("codex");
+    const workId = ProviderInstanceId.make("claudeAgent_work");
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [codexId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled: true,
+          config: { homePath: "~/.codex" },
+        },
+        [workId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: null,
+        },
+      },
+    };
+
+    // Upsert one instance: the sibling — which a stale client map would have
+    // reverted — is untouched, including its full config blob.
+    const narrowed = applyServerSettingsPatch(current, {
+      providerInstancesPatch: {
+        [workId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: [ProjectId.make("project-work")],
+        },
+      },
+    }).providerInstances;
+    expect(narrowed[codexId]).toEqual(current.providerInstances[codexId]);
+    expect(narrowed[workId]?.allowedProjects).toEqual([ProjectId.make("project-work")]);
+
+    // Null deletes exactly that entry.
+    const deleted = applyServerSettingsPatch(current, {
+      providerInstancesPatch: { [codexId]: null },
+    }).providerInstances;
+    expect(deleted[codexId]).toBeUndefined();
+    expect(deleted[workId]).toEqual(current.providerInstances[workId]);
+  });
+
   it("replaces providerInstances maps so omitted instance fields are cleared", () => {
     const codexId = ProviderInstanceId.make("codex");
     const current = {

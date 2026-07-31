@@ -6,6 +6,7 @@ import {
   flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   type QueuedThreadMessage,
+  type ThreadOutboxRecoveryMarkers,
 } from "./thread-outbox-model";
 import type { ThreadOutboxStorage } from "./thread-outbox-storage";
 
@@ -125,17 +126,29 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
 
   // Rewrites an already-queued message. A no-op when the message has been
   // removed in the meantime (e.g. deleted or delivered), so a trailing editor
-  // flush can never resurrect it. Returns whether the message was updated.
+  // flush can never resurrect it. Recovery markers are MONOTONIC: once set
+  // on the stored entry they survive any content rewrite, so an editor save
+  // racing the recovery flow can never make an already-restored entry
+  // deliverable again. Returns whether the message was updated.
   const update = (message: QueuedThreadMessage): Promise<boolean> =>
     serialize(async () => {
-      const exists = currentMessages().some(
+      const existing = currentMessages().find(
         (candidate) => candidate.messageId === message.messageId,
       );
-      if (!exists) {
+      if (existing === undefined) {
         return false;
       }
+      const merged: QueuedThreadMessage = {
+        ...message,
+        ...(message.recoveryStartedAt === undefined && existing.recoveryStartedAt !== undefined
+          ? { recoveryStartedAt: existing.recoveryStartedAt }
+          : {}),
+        ...(message.restoredAt === undefined && existing.restoredAt !== undefined
+          ? { restoredAt: existing.restoredAt }
+          : {}),
+      };
       try {
-        await options.storage.write(message);
+        await options.storage.write(merged);
       } catch (cause) {
         throw new ThreadOutboxManagerError({
           operation: "update",
@@ -147,7 +160,36 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       }
       setMessages([
         ...currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
-        message,
+        merged,
+      ]);
+      return true;
+    });
+
+  // Applies recovery markers to the CURRENT stored entry — never to a
+  // caller-captured snapshot — so marking cannot clobber content edits made
+  // while a rejection was in flight. Returns false when the entry no longer
+  // exists (deleted concurrently), in which case nothing was written.
+  const mark = (messageId: MessageId, markers: ThreadOutboxRecoveryMarkers): Promise<boolean> =>
+    serialize(async () => {
+      const existing = currentMessages().find((candidate) => candidate.messageId === messageId);
+      if (existing === undefined) {
+        return false;
+      }
+      const merged: QueuedThreadMessage = { ...existing, ...markers };
+      try {
+        await options.storage.write(merged);
+      } catch (cause) {
+        throw new ThreadOutboxManagerError({
+          operation: "update",
+          environmentId: existing.environmentId,
+          threadId: existing.threadId,
+          messageId: existing.messageId,
+          cause,
+        });
+      }
+      setMessages([
+        ...currentMessages().filter((candidate) => candidate.messageId !== messageId),
+        merged,
       ]);
       return true;
     });
@@ -222,6 +264,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     enqueue,
     confirmQueued,
     update,
+    mark,
     remove,
     clearEnvironment,
   };

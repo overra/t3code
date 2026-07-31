@@ -58,6 +58,32 @@ export function requireProject(input: {
   );
 }
 
+/**
+ * Like `requireProject`, but rejects soft-deleted projects too. Commands
+ * that start NEW work under a project (thread creation, project metadata
+ * edits) must not target a deleted project: the read model retains deleted
+ * entries, and access rules resolved against live projections would
+ * otherwise be skipped for them entirely.
+ */
+export function requireActiveProject(input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly command: OrchestrationCommand;
+  readonly projectId: ProjectId;
+}): Effect.Effect<OrchestrationProject, OrchestrationCommandInvariantError> {
+  return requireProject(input).pipe(
+    Effect.flatMap((project) =>
+      project.deletedAt === null
+        ? Effect.succeed(project)
+        : Effect.fail(
+            invariantError(
+              input.command.type,
+              `Project '${input.projectId}' is deleted and cannot handle command '${input.command.type}'.`,
+            ),
+          ),
+    ),
+  );
+}
+
 export function requireProjectAbsent(input: {
   readonly readModel: OrchestrationReadModel;
   readonly command: OrchestrationCommand;
@@ -182,7 +208,13 @@ export function requireThreadAbsent(input: {
   readonly command: OrchestrationCommand;
   readonly threadId: ThreadId;
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {
-  if (!findThreadById(input.readModel, input.threadId)) {
+  const thread = findThreadById(input.readModel, input.threadId);
+  // A soft-deleted thread no longer occupies its id: bootstrap cleanup
+  // deletes a partially created thread precisely so a retry of the same
+  // queued command (which pins the thread id) can recreate it. Both the
+  // in-memory projector and the SQLite projection replace the entry
+  // wholesale on `thread.created`, so recreation starts from a clean row.
+  if (!thread || thread.deletedAt !== null) {
     return Effect.void;
   }
   return Effect.fail(

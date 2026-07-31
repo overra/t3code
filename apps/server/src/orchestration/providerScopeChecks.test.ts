@@ -7,7 +7,6 @@ import {
   ProviderInstanceId,
   ThreadId,
   type OrchestrationCommand,
-  type OrchestrationProjectShell,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -16,6 +15,7 @@ import * as Option from "effect/Option";
 import {
   collectProviderScopeChecks,
   validateCommandProviderAccess,
+  type ProviderScopeProjectAccess,
 } from "./providerScopeChecks.ts";
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -162,30 +162,12 @@ describe("collectProviderScopeChecks", () => {
 
 describe("validateCommandProviderAccess", () => {
   const RESTRICTED_PROJECT_ID = ProjectId.make("project-restricted");
-  const restrictedProject: OrchestrationProjectShell = {
-    id: RESTRICTED_PROJECT_ID,
-    title: "Restricted",
-    workspaceRoot: "/tmp/restricted",
-    defaultModelSelection: null,
-    allowedProviderInstances: [CODEX_INSTANCE],
-    scripts: [],
-    createdAt: NOW,
-    updatedAt: NOW,
-  };
-  // The bootstrap names PROJECT_ID, which allows everything.
-  const permissiveProject: OrchestrationProjectShell = {
-    id: PROJECT_ID,
-    title: "Permissive",
-    workspaceRoot: "/tmp/permissive",
-    defaultModelSelection: null,
-    allowedProviderInstances: null,
-    scripts: [],
-    createdAt: NOW,
-    updatedAt: NOW,
-  };
-  const projectShells = new Map<ProjectId, OrchestrationProjectShell>([
-    [RESTRICTED_PROJECT_ID, restrictedProject],
-    [PROJECT_ID, permissiveProject],
+  // Access rows resolve regardless of deleted/archived state, mirroring
+  // getProjectAccessById — a soft-deleted restricted project must still deny.
+  const projectAccessById = new Map<ProjectId, ProviderScopeProjectAccess>([
+    [RESTRICTED_PROJECT_ID, { title: "Restricted", allowedProviderInstances: [CODEX_INSTANCE] }],
+    // The bootstrap names PROJECT_ID, which allows everything.
+    [PROJECT_ID, { title: "Permissive", allowedProviderInstances: null }],
   ]);
   const makeDeps = (threadProjectId: ProjectId | undefined) => ({
     getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
@@ -197,8 +179,8 @@ describe("validateCommandProviderAccess", () => {
           ? Option.some(threadProjectId)
           : Option.none(),
       ),
-    getProjectShellById: (projectId: ProjectId) => {
-      const project = projectShells.get(projectId);
+    getProjectAccess: (projectId: ProjectId) => {
+      const project = projectAccessById.get(projectId);
       return Effect.succeed(project === undefined ? Option.none() : Option.some(project));
     },
   });

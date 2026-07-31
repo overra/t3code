@@ -26,7 +26,6 @@ import {
   OrchestrationDispatchCommandError,
   type ClientOrchestrationCommand,
   type OrchestrationCommand,
-  type OrchestrationProjectShell,
   type ProjectId,
   type ProviderInstanceId,
   type ServerSettings,
@@ -104,23 +103,29 @@ export function collectProviderScopeChecks(
   }
 }
 
+/** The project fields the access rules read; see `ProjectionProjectAccess`. */
+export interface ProviderScopeProjectAccess {
+  readonly title: string;
+  readonly allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null;
+}
+
 /**
  * Capabilities the validator needs, passed as values rather than resolved
  * from the Effect context so dispatch surfaces can reuse their existing
  * service handles without growing their handlers' context requirements.
  *
- * `getThreadProjectId` must resolve archived and soft-deleted threads too:
- * the decider still accepts commands against them, so a lookup that filters
- * inactive threads would let a bootstrap-bearing turn substitute an
- * arbitrary (more permissive) project for validation while the command
- * lands on the inactive thread's real project.
+ * BOTH lookups must resolve archived and soft-deleted records too: the
+ * decider still accepts commands against them, so a lookup that filters
+ * inactive rows would either let a bootstrap-bearing turn substitute an
+ * arbitrary (more permissive) project for validation, or skip the
+ * instance-scope check entirely for a thread whose project was deleted.
  */
 export interface ValidateCommandProviderAccessDeps<E1 = never, E2 = never, E3 = never> {
   readonly getSettings: Effect.Effect<ServerSettings, E1>;
   readonly getThreadProjectId: (threadId: ThreadId) => Effect.Effect<Option.Option<ProjectId>, E2>;
-  readonly getProjectShellById: (
+  readonly getProjectAccess: (
     projectId: ProjectId,
-  ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E3>;
+  ) => Effect.Effect<Option.Option<ProviderScopeProjectAccess>, E3>;
 }
 
 export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2, E3>(
@@ -160,10 +165,12 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
     // A cleanly missing thread without a bootstrap fallback is the
     // decider's error to report with proper context, not this gate's.
     if (projectId === undefined) continue;
-    const project = yield* deps.getProjectShellById(projectId).pipe(
+    const project = yield* deps.getProjectAccess(projectId).pipe(
       Effect.map(Option.getOrUndefined),
       Effect.mapError(() => verificationFailure("project state")),
     );
+    // A project row that is genuinely ABSENT (never existed) has no rules to
+    // check and the decider reports it; soft-deleted rows resolve above.
     if (project === undefined) continue;
     const restriction = getProviderInstanceProjectRestriction({
       instanceId: check.instanceId,

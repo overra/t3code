@@ -1113,13 +1113,17 @@ function ProjectAllowedProvidersControl(props: {
   useEffect(() => {
     if (pendingAllowed === undefined) return;
     const generation = generationRef.current;
+    // The quiet period must observe STREAMED ECHOES, not just request
+    // settlement: `propAllowed` in the deps re-arms the window on every
+    // incoming echo, so a delayed intermediate echo landing just before
+    // expiry restarts the clock instead of being exposed by an early clear.
     const timer = window.setTimeout(() => {
       if (generationRef.current === generation && inflightRef.current === 0) {
         setPendingAllowed(undefined);
       }
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [pendingAllowed, settledTick]);
+  }, [pendingAllowed, settledTick, propAllowed]);
   const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
   const checkedIds = useMemo(
     () =>

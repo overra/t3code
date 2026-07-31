@@ -175,7 +175,7 @@ describe("formatDiagnosticsDescription", () => {
 });
 
 describe("buildProviderInstanceUpdatePatch", () => {
-  it("promotes an edited default provider into providerInstances and resets the legacy provider", () => {
+  it("emits a single-instance patch and a single-driver legacy reset for defaults", () => {
     const instanceId = ProviderInstanceId.make("codex");
     const nextInstance = {
       driver: ProviderDriverKind.make("codex"),
@@ -186,24 +186,18 @@ describe("buildProviderInstanceUpdatePatch", () => {
     } satisfies ProviderInstanceConfig;
 
     const patch = buildProviderInstanceUpdatePatch({
-      settings: {
-        ...DEFAULT_SERVER_SETTINGS,
-        providers: {
-          ...DEFAULT_SERVER_SETTINGS.providers,
-          codex: {
-            ...DEFAULT_SERVER_SETTINGS.providers.codex,
-            binaryPath: "/legacy/codex",
-          },
-        },
-      },
       instanceId,
       instance: nextInstance,
       driver: ProviderDriverKind.make("codex"),
       isDefault: true,
     });
 
-    expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
-    expect(patch.providers?.codex).toEqual(DEFAULT_SERVER_SETTINGS.providers.codex);
+    // GRANULAR: exactly one instance entry, no whole-map replacement — the
+    // server merges this onto its own current map, so concurrent edits to
+    // other instances can never be reverted by this write.
+    expect(patch.providerInstances).toBeUndefined();
+    expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
+    expect(patch.providers).toEqual({ codex: DEFAULT_SERVER_SETTINGS.providers.codex });
   });
 
   it("updates custom instances without touching legacy provider settings", () => {
@@ -217,14 +211,13 @@ describe("buildProviderInstanceUpdatePatch", () => {
     } satisfies ProviderInstanceConfig;
 
     const patch = buildProviderInstanceUpdatePatch({
-      settings: DEFAULT_SERVER_SETTINGS,
       instanceId,
       instance: nextInstance,
       driver: ProviderDriverKind.make("codex"),
       isDefault: false,
     });
 
-    expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
+    expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
     expect(patch.providers).toBeUndefined();
   });
 });

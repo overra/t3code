@@ -665,11 +665,20 @@ export const ServerSettingsPatch = Schema.Struct({
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
     }),
   ),
-  // Whole-map replacement for the new instance config. Patching individual
-  // entries is intentionally out of scope: the map is small, and partial
-  // patches risk leaving driver-specific config in a half-merged state.
-  // The web UI sends a fully-formed map every time it edits this field.
+  // Whole-map replacement for the new instance config. Only appropriate for
+  // callers that genuinely own the entire map (migrations, imports) — UI
+  // edits of individual instances must use `providerInstancesPatch` below,
+  // since a whole-map write composed from possibly-stale client state can
+  // silently revert other instances' concurrent changes.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  // Per-instance upserts/deletes, merged onto the server's CURRENT map under
+  // its write lock — the race-free way for a client to edit one instance
+  // without composing the whole map client-side. `null` deletes an entry; a
+  // config value replaces that entry WHOLE (instance fields are not
+  // deep-merged, so driver-specific config never ends up half-merged).
+  providerInstancesPatch: Schema.optionalKey(
+    Schema.Record(ProviderInstanceId, Schema.NullOr(ProviderInstanceConfig)),
+  ),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 

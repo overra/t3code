@@ -5,6 +5,7 @@ import type {
   ProviderInstanceConfig,
   ProviderInstanceId,
   ServerSettings,
+  ServerSettingsPatch,
   SidebarProjectGroupingMode,
   UnifiedSettings,
 } from "@t3tools/contracts";
@@ -156,8 +157,16 @@ export function formatDiagnosticsDescription(input: {
   return `${mode}.`;
 }
 
+/**
+ * Builds a GRANULAR settings patch for one provider-instance edit. The
+ * instance goes through `providerInstancesPatch`, which the server merges
+ * onto its own current map under its write lock — no client-side whole-map
+ * composition, so concurrent edits (this panel's or another device's) to
+ * OTHER instances can never be reverted by this write. Editing a default
+ * instance also resets its legacy per-driver entry, again as a single-driver
+ * patch merged server-side.
+ */
 export function buildProviderInstanceUpdatePatch(input: {
-  readonly settings: Pick<ServerSettings, "providers" | "providerInstances">;
   readonly instanceId: ProviderInstanceId;
   readonly instance: ProviderInstanceConfig;
   readonly driver: ProviderDriverKind;
@@ -165,7 +174,7 @@ export function buildProviderInstanceUpdatePatch(input: {
   readonly textGenerationModelSelection?:
     | ServerSettings["textGenerationModelSelection"]
     | undefined;
-}): Partial<UnifiedSettings> {
+}): ServerSettingsPatch {
   type LegacyProviderSettings = ServerSettings["providers"][keyof ServerSettings["providers"]];
   const legacyProviderDefaults = DEFAULT_UNIFIED_SETTINGS.providers as Record<
     string,
@@ -176,13 +185,11 @@ export function buildProviderInstanceUpdatePatch(input: {
     ...(legacyProviderDefault !== undefined
       ? {
           providers: {
-            ...input.settings.providers,
             [input.driver]: legacyProviderDefault,
-          } as ServerSettings["providers"],
+          } as NonNullable<ServerSettingsPatch["providers"]>,
         }
       : {}),
-    providerInstances: {
-      ...input.settings.providerInstances,
+    providerInstancesPatch: {
       [input.instanceId]: input.instance,
     },
     ...(input.textGenerationModelSelection !== undefined

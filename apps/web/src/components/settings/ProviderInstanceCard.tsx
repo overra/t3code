@@ -368,6 +368,10 @@ interface ProviderInstanceCardProps {
   readonly projects?: ReadonlyArray<ProviderScopeProjectOption> | undefined;
   /** Every configured instance's effective enabled/scope state, this one included. */
   readonly peerInstances?: ReadonlyArray<ProviderScopePeerInstance> | undefined;
+  /** See `ProviderProjectScopeSection.onPendingScopeChange`. */
+  readonly onPendingScopeChange?:
+    | ((instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => void)
+    | undefined;
 }
 
 /**
@@ -414,6 +418,7 @@ export function ProviderInstanceCard({
   isUpdating = false,
   projects,
   peerInstances,
+  onPendingScopeChange,
 }: ProviderInstanceCardProps) {
   const enabled = instance.enabled ?? true;
   // The server-reported status wins when present; otherwise fall back to
@@ -795,6 +800,7 @@ export function ProviderInstanceCard({
                 instanceId={instanceId}
                 peerInstances={peerInstances}
                 onChange={updateAllowedProjects}
+                onPendingScopeChange={onPendingScopeChange}
               />
             ) : null}
 

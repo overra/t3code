@@ -89,7 +89,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             validateCommandProviderAccess(args.payload, {
               getSettings: serverSettings.getSettings,
               getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
-              getProjectShellById: projectionSnapshotQuery.getProjectShellById,
+              getProjectAccess: projectionSnapshotQuery.getProjectAccessById,
             }),
           );
           if (providerAccess._tag === "Failure") {

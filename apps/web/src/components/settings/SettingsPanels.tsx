@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import type { CSSProperties } from "react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   defaultInstanceIdForDriver,
@@ -18,10 +18,12 @@ import {
   type BackgroundActivitySettings,
   type DesktopUpdateChannel,
   PROVIDER_DISPLAY_NAMES,
+  type ProjectId,
   ProviderDriverKind,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
   type ScopedThreadRef,
+  type ServerSettingsPatch,
   type SidebarProjectGroupingMode,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -85,10 +87,8 @@ import { ensureLocalApi, readLocalApi } from "../../localApi";
 import {
   primaryServerObservabilityAtom,
   primaryServerProvidersAtom,
-  primaryServerSettingsAtom,
   serverEnvironment,
 } from "../../state/server";
-import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { usePrimaryEnvironment } from "../../state/environments";
 import { useProjects } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
@@ -320,12 +320,6 @@ function withoutProviderInstanceFavorites(
 const PROVIDER_SETTINGS = DRIVER_OPTIONS.map((definition) => ({
   provider: definition.value,
 }));
-
-// How long a sent provider-instance value keeps overriding patch composition
-// after its persist acknowledges. The config echo that makes the server state
-// catch up normally arrives well inside this window; after it, the overlay
-// entry is a no-op and expires.
-const PENDING_INSTANCE_WRITE_TTL_MS = 10_000;
 
 function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }) {
   useRelativeTimeTick();
@@ -1736,6 +1730,32 @@ export function ProviderSettingsPanel() {
   });
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [isAddInstanceDialogOpen, setIsAddInstanceDialogOpen] = useState(false);
+  // Pending (submitted, not yet echoed) scope edits reported by each card's
+  // Projects editor — DISPLAY-ONLY state feeding the cross-card
+  // stranded-project warnings, so quickly narrowing two instances warns
+  // against local intent instead of lagging echoes. Reset on environment
+  // change so one environment's edits never overlay another's configs.
+  const [pendingPeerScopes, setPendingPeerScopes] = useState<
+    Partial<Record<ProviderInstanceId, ReadonlyArray<ProjectId> | null>>
+  >({});
+  const primaryEnvironmentIdForScopes = primaryEnvironment?.environmentId ?? null;
+  useEffect(() => {
+    setPendingPeerScopes({});
+  }, [primaryEnvironmentIdForScopes]);
+  const reportPendingPeerScope = useCallback(
+    (instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => {
+      setPendingPeerScopes((previous) => {
+        if (scope === undefined) {
+          if (!(instanceId in previous)) return previous;
+          const next = { ...previous };
+          delete next[instanceId];
+          return next;
+        }
+        return { ...previous, [instanceId]: scope };
+      });
+    },
+    [],
+  );
   const [updatingProviderDrivers, setUpdatingProviderDrivers] = useState<
     ReadonlySet<ProviderDriverKind>
   >(() => new Set());
@@ -1932,70 +1952,28 @@ export function ProviderSettingsPanel() {
   // all. Availability comes from the live snapshots; an instance with no
   // snapshot yet counts as unavailable — an unprobed provider must not be
   // the one thing standing between a project and zero usable providers.
+  // Scopes overlay each card's not-yet-echoed pending edit (reported by the
+  // scope editors below) so quickly narrowing two instances warns against
+  // the freshest local intent, not the lagging echoes.
   const providerAvailabilityByInstanceId = new Map(
     serverProviders.map((snapshot) => [snapshot.instanceId, isProviderAvailable(snapshot)]),
   );
-  const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.map((row) => ({
-    instanceId: row.instanceId,
-    enabled: row.instance.enabled ?? true,
-    available: providerAvailabilityByInstanceId.get(row.instanceId) ?? false,
-    allowedProjects: row.instance.allowedProjects ?? null,
-  }));
-
-  // Settings updates replace the WHOLE providerInstances map, so a patch
-  // built from render-captured settings can resurrect the previous value of
-  // an instance whose own edit is still round-tripping (narrow instance W,
-  // quickly toggle instance X → X's patch re-widens W). Patches are instead
-  // built from the freshest server settings at write time, overlaid with this
-  // panel's not-yet-echoed writes. An entry clears immediately when its
-  // persist is rejected (so a denied value stops riding along) and otherwise
-  // lingers briefly past the ack to bridge the gap until the config echo
-  // lands — by then the overlay is a no-op.
-  const pendingInstanceWritesRef = useRef(
-    new Map<ProviderInstanceId, { readonly value: ProviderInstanceConfig | null }>(),
-  );
-
-  const composeProviderInstancesForWrite = () => {
-    const fresh = appAtomRegistry.get(primaryServerSettingsAtom);
-    let providerInstances = { ...fresh.providerInstances } as Record<
-      ProviderInstanceId,
-      ProviderInstanceConfig
-    >;
-    for (const [pendingId, write] of pendingInstanceWritesRef.current) {
-      if (write.value === null) {
-        providerInstances = withoutProviderInstanceKey(providerInstances, pendingId);
-      } else {
-        providerInstances[pendingId] = write.value;
-      }
-    }
-    return { fresh, providerInstances };
-  };
-
-  const trackPendingInstanceWrite = (
-    instanceId: ProviderInstanceId,
-    value: ProviderInstanceConfig | null,
-    persist: Promise<unknown> | undefined,
-  ) => {
-    const entry = { value };
-    pendingInstanceWritesRef.current.set(instanceId, entry);
-    const clearIfCurrent = () => {
-      if (pendingInstanceWritesRef.current.get(instanceId) === entry) {
-        pendingInstanceWritesRef.current.delete(instanceId);
-      }
+  const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.map((row) => {
+    const pendingScope = pendingPeerScopes[row.instanceId];
+    return {
+      instanceId: row.instanceId,
+      enabled: row.instance.enabled ?? true,
+      available: providerAvailabilityByInstanceId.get(row.instanceId) ?? false,
+      allowedProjects:
+        pendingScope !== undefined ? pendingScope : (row.instance.allowedProjects ?? null),
     };
-    void Promise.resolve(persist).then((outcome) => {
-      const rejected =
-        typeof outcome === "object" &&
-        outcome !== null &&
-        (outcome as { _tag?: unknown })._tag === "Failure";
-      if (rejected) {
-        clearIfCurrent();
-        return;
-      }
-      setTimeout(clearIfCurrent, PENDING_INSTANCE_WRITE_TTL_MS);
-    }, clearIfCurrent);
-  };
+  });
 
+  // Every instance write is a GRANULAR `providerInstancesPatch` (upsert or
+  // null-delete of exactly one entry) that the server merges onto its own
+  // current map under its write lock. No whole-map composition happens on
+  // the client, so there is no pending-write reconciliation state to race,
+  // lose on unmount, or leak across environments.
   const updateProviderInstance = (
     row: InstanceRow,
     next: ProviderInstanceConfig,
@@ -2004,11 +1982,9 @@ export function ProviderSettingsPanel() {
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
     },
-  ) => {
-    const { fresh, providerInstances } = composeProviderInstancesForWrite();
-    const persist = updateSettings(
+  ) =>
+    updateSettings(
       buildProviderInstanceUpdatePatch({
-        settings: { providers: fresh.providers, providerInstances },
         instanceId: row.instanceId,
         instance: next,
         driver: row.driver,
@@ -2016,33 +1992,21 @@ export function ProviderSettingsPanel() {
         textGenerationModelSelection: options?.textGenerationModelSelection,
       }),
     );
-    trackPendingInstanceWrite(row.instanceId, next, persist);
-    return persist;
-  };
 
   const deleteProviderInstance = (id: ProviderInstanceId) => {
-    const { providerInstances } = composeProviderInstancesForWrite();
     // Preferences and favorites are CLIENT-owned keys: they never appear on
-    // the server settings atom, so they must come from the client snapshot
-    // (which is updated synchronously and is therefore already the freshest
-    // state — no pending overlay needed).
+    // the server settings atom, so they come from the client snapshot (which
+    // is updated synchronously and is therefore already the freshest state).
     const client = getClientSettings();
-    const persist = updateSettings({
-      providerInstances: withoutProviderInstanceKey(providerInstances, id),
+    updateSettings({
+      providerInstancesPatch: { [id]: null },
       providerModelPreferences: withoutProviderInstanceKey(client.providerModelPreferences, id),
       favorites: withoutProviderInstanceFavorites(client.favorites ?? [], id),
     });
-    trackPendingInstanceWrite(id, null, persist);
   };
 
-  const createProviderInstance = (id: ProviderInstanceId, instance: ProviderInstanceConfig) => {
-    const { providerInstances } = composeProviderInstancesForWrite();
-    const persist = updateSettings({
-      providerInstances: { ...providerInstances, [id]: instance },
-    });
-    trackPendingInstanceWrite(id, instance, persist);
-    return persist;
-  };
+  const createProviderInstance = (id: ProviderInstanceId, instance: ProviderInstanceConfig) =>
+    updateSettings({ providerInstancesPatch: { [id]: instance } });
 
   const updateProviderModelPreferences = (
     instanceId: ProviderInstanceId,
@@ -2102,21 +2066,20 @@ export function ProviderSettingsPanel() {
     const defaultInstanceId = defaultInstanceIdForDriver(driverKind);
     const defaultLegacyProvider = defaultLegacyProviders[driverKind];
     if (defaultLegacyProvider === undefined) return;
-    const { fresh, providerInstances } = composeProviderInstancesForWrite();
     const client = getClientSettings();
-    const persist = updateSettings({
-      providers: {
-        ...fresh.providers,
-        [driverKind]: defaultLegacyProvider,
-      } as typeof settings.providers,
-      providerInstances: withoutProviderInstanceKey(providerInstances, defaultInstanceId),
+    updateSettings({
+      // Single-driver legacy reset + single-instance delete, both merged
+      // server-side; no client-side map composition.
+      providers: { [driverKind]: defaultLegacyProvider } as NonNullable<
+        ServerSettingsPatch["providers"]
+      >,
+      providerInstancesPatch: { [defaultInstanceId]: null },
       providerModelPreferences: withoutProviderInstanceKey(
         client.providerModelPreferences,
         defaultInstanceId,
       ),
       favorites: withoutProviderInstanceFavorites(client.favorites ?? [], defaultInstanceId),
     });
-    trackPendingInstanceWrite(defaultInstanceId, null, persist);
   };
 
   return (
@@ -2268,7 +2231,12 @@ export function ProviderSettingsPanel() {
             ) : null;
           return (
             <ProviderInstanceCard
-              key={row.instanceId}
+              // Keyed by environment AND instance: common ids like `codex`
+              // exist on every environment, and a card surviving an
+              // environment switch would carry the previous environment's
+              // in-flight scope overlay (and its project ids) onto the new
+              // one's config.
+              key={`${primaryEnvironment?.environmentId ?? "none"}:${row.instanceId}`}
               instanceId={row.instanceId}
               instance={row.instance}
               driverOption={driverOption}
@@ -2325,6 +2293,7 @@ export function ProviderSettingsPanel() {
               isUpdating={showInlineUpdateButton ? isDriverUpdateRunning : undefined}
               projects={scopeProjectOptions}
               peerInstances={scopePeerInstances}
+              onPendingScopeChange={reportPendingPeerScope}
             />
           );
         })}

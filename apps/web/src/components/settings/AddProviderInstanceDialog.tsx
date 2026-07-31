@@ -144,6 +144,7 @@ export function AddProviderInstanceDialog({
   // Errors are suppressed until the user has tried to submit once. After that
   // they update live so fixing the problem clears the message in place.
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   const existingIds = useMemo(
     () => new Set(Object.keys(settings.providerInstances ?? {})),
@@ -189,9 +190,9 @@ export function AddProviderInstanceDialog({
     );
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     setHasAttemptedSubmit(true);
-    if (instanceIdError !== null) return;
+    if (instanceIdError !== null || isSaving) return;
 
     const config = configByDriver[driver] ?? {};
     const hasConfig = Object.keys(config).length > 0;
@@ -209,8 +210,26 @@ export function AddProviderInstanceDialog({
     // keeps the type boundary honest and guards against any future drift in
     // the slug rules.
     const brandedId = ProviderInstanceId.make(instanceId);
+    setIsSaving(true);
     try {
-      onCreateInstance(brandedId, nextInstance);
+      // The persist settles with an AtomCommandResult rather than throwing;
+      // success is only reported (and the dialog only closed) once the
+      // server acknowledged the write. Failure keeps the dialog open with
+      // the entered values intact.
+      const settled = await Promise.resolve(onCreateInstance(brandedId, nextInstance));
+      const failed =
+        typeof settled === "object" &&
+        settled !== null &&
+        "_tag" in settled &&
+        settled._tag === "Failure";
+      if (failed) {
+        toastManager.add({
+          type: "error",
+          title: "Could not add provider instance",
+          description: "The settings update was rejected by the server.",
+        });
+        return;
+      }
       toastManager.add({
         type: "success",
         title: "Provider instance added",
@@ -223,6 +242,8 @@ export function AddProviderInstanceDialog({
         title: "Could not add provider instance",
         description: error instanceof Error ? error.message : "Update failed.",
       });
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -431,8 +452,8 @@ export function AddProviderInstanceDialog({
                 Next
               </Button>
             ) : (
-              <Button size="sm" onClick={handleSave}>
-                Add instance
+              <Button size="sm" disabled={isSaving} onClick={() => void handleSave()}>
+                {isSaving ? "Adding…" : "Add instance"}
               </Button>
             )}
           </DialogFooter>

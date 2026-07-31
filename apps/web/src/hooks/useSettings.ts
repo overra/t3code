@@ -15,7 +15,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type EnvironmentId,
   ServerSettings,
-  type ServerSettingsPatch,
+  ServerSettingsPatch,
 } from "@t3tools/contracts";
 import {
   type ClientSettingsPatch,
@@ -147,7 +147,12 @@ function persistClientSettings(settings: ClientSettings): void {
 
 // ── Key sets for routing patches ─────────────────────────────────────
 
-const SERVER_SETTINGS_KEYS = new Set<string>(Struct.keys(ServerSettings.fields));
+// Patch-only keys (e.g. `providerInstancesPatch`) are not ServerSettings
+// fields but must still route to the server, so the set unions both shapes.
+const SERVER_SETTINGS_KEYS = new Set<string>([
+  ...Struct.keys(ServerSettings.fields),
+  ...Struct.keys(ServerSettingsPatch.fields),
+]);
 
 function splitPatch(patch: UnifiedSettingsPatch): {
   serverPatch: ServerSettingsPatch;

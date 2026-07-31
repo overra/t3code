@@ -842,6 +842,29 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  // Deliberately unfiltered: access checks must resolve soft-deleted
+  // projects too (see ProjectionSnapshotQueryShape docs).
+  const getProjectRowByIdAnyState = SqlSchema.findOneOption({
+    Request: ProjectIdLookupInput,
+    Result: ProjectionProjectLookupRowSchema,
+    execute: ({ projectId }) =>
+      sql`
+        SELECT
+          project_id AS "projectId",
+          title,
+          workspace_root AS "workspaceRoot",
+          default_model_selection_json AS "defaultModelSelection",
+          allowed_provider_instances_json AS "allowedProviderInstances",
+          scripts_json AS "scripts",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          deleted_at AS "deletedAt"
+        FROM projection_projects
+        WHERE project_id = ${projectId}
+        LIMIT 1
+      `,
+  });
+
   const getFirstActiveThreadIdByProject = SqlSchema.findOneOption({
     Request: ProjectIdLookupInput,
     Result: ProjectionThreadIdLookupRowSchema,
@@ -1967,6 +1990,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const getProjectAccessById: ProjectionSnapshotQueryShape["getProjectAccessById"] = (projectId) =>
+    getProjectRowByIdAnyState({ projectId }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getProjectAccessById:query",
+          "ProjectionSnapshotQuery.getProjectAccessById:decodeRow",
+        ),
+      ),
+      Effect.map(
+        Option.map((row) => ({
+          id: row.projectId,
+          title: row.title,
+          workspaceRoot: row.workspaceRoot,
+          allowedProviderInstances: row.allowedProviderInstances ?? null,
+        })),
+      ),
+    );
+
   const getFirstActiveThreadIdByProjectId: ProjectionSnapshotQueryShape["getFirstActiveThreadIdByProjectId"] =
     (projectId) =>
       getFirstActiveThreadIdByProject({ projectId }).pipe(
@@ -2307,6 +2348,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getCounts,
     getActiveProjectByWorkspaceRoot,
     getProjectShellById,
+    getProjectAccessById,
     getFirstActiveThreadIdByProjectId,
     getThreadCheckpointContext,
     getFullThreadDiffContext,

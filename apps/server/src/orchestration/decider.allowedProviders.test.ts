@@ -251,6 +251,64 @@ it.layer(NodeServices.layer)("decider project provider allowlist", (it) => {
     }),
   );
 
+  it.effect("thread.create rejects a soft-deleted project outright", () =>
+    Effect.gen(function* () {
+      const withProject = yield* restrictedProjectReadModel();
+      // Soft-delete the project; the read model retains the entry.
+      const readModel = yield* projectEvent(withProject, {
+        sequence: 2,
+        eventId: EventId.make("evt-project-delete"),
+        aggregateKind: "project",
+        aggregateId: PROJECT_ID,
+        type: "project.deleted",
+        occurredAt: NOW,
+        commandId: CommandId.make("cmd-project-delete"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-delete"),
+        metadata: {},
+        payload: { projectId: PROJECT_ID, deletedAt: NOW },
+      });
+      const failure = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: threadCreateCommand(CODEX_INSTANCE),
+          readModel,
+        }),
+      );
+      expect(failure.message).toContain("is deleted and cannot handle command");
+    }),
+  );
+
+  it.effect("thread.create recreates a soft-deleted thread id (bootstrap retry)", () =>
+    Effect.gen(function* () {
+      const withThread = yield* restrictedProjectReadModel({ withThread: true });
+      // Bootstrap cleanup soft-deletes the partially created thread; the
+      // retry reuses the same pinned thread id and must be able to recreate.
+      const readModel = yield* projectEvent(withThread, {
+        sequence: 3,
+        eventId: EventId.make("evt-thread-delete"),
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        type: "thread.deleted",
+        occurredAt: NOW,
+        commandId: CommandId.make("cmd-thread-delete"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-thread-delete"),
+        metadata: {},
+        payload: { threadId: THREAD_ID, deletedAt: NOW },
+      });
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          ...threadCreateCommand(CODEX_INSTANCE),
+          commandId: CommandId.make("cmd-thread-recreate"),
+          threadId: THREAD_ID,
+        },
+        readModel,
+      });
+      const event = Array.isArray(result) ? result[0] : result;
+      expect(event.type).toBe("thread.created");
+    }),
+  );
+
   it.effect("thread.create rejects a provider instance outside the project allowlist", () =>
     Effect.gen(function* () {
       const readModel = yield* restrictedProjectReadModel();

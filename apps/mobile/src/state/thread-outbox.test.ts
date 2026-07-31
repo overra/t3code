@@ -209,6 +209,54 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("keeps recovery markers monotonic across rewrites and marks the CURRENT entry", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const message = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(message);
+
+    // mark() applies to the CURRENT stored entry — including edits made
+    // after the recovery flow captured its snapshot — so marking can never
+    // clobber concurrently edited content.
+    await manager.update({ ...message, text: "edited while rejection was in flight" });
+    expect(
+      await manager.mark(message.messageId, { recoveryStartedAt: "2026-06-08T10:00:05.000Z" }),
+    ).toBe(true);
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "edited while rejection was in flight",
+      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
+    });
+
+    // An editor save that reconstructs the record WITHOUT the marker cannot
+    // erase it: markers are monotonic through update().
+    expect(await manager.update({ ...message, text: "editor save" })).toBe(true);
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "editor save",
+      recoveryStartedAt: "2026-06-08T10:00:05.000Z",
+    });
+
+    // Marking an entry deleted concurrently writes nothing and reports false.
+    await manager.remove(message);
+    expect(await manager.mark(message.messageId, { restoredAt: "2026-06-08T10:00:06.000Z" })).toBe(
+      false,
+    );
+    expect(stored.size).toBe(0);
+    registry.dispose();
+  });
+
   it("reports structured load failures and permits a retry", async () => {
     const registry = AtomRegistry.make();
     const loadCause = new Error("storage unavailable");

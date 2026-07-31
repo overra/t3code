@@ -12,6 +12,7 @@ import type * as PlatformError from "effect/PlatformError";
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
 import {
   listThreadsByProjectId,
+  requireActiveProject,
   requireActiveProjectWorkspaceRootAbsent,
   requireProject,
   requireProjectAbsent,
@@ -272,7 +273,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "project.meta.update": {
-      const project = yield* requireProject({
+      const project = yield* requireActiveProject({
         readModel,
         command,
         projectId: command.projectId,
@@ -391,7 +392,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.create": {
-      const project = yield* requireProject({
+      // Active only: a soft-deleted project must not accept new threads —
+      // its row is absent from live projections, so the dispatch validator
+      // and reactor gate would have no allowlist/scope context to check.
+      const project = yield* requireActiveProject({
         readModel,
         command,
         projectId: command.projectId,

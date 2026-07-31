@@ -377,6 +377,16 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  // Unfiltered variant for the ACCESS gate: a thread can outlive its
+  // project's soft deletion, and the deleted project's rules must still gate
+  // executing instances — the active-only lookup above would skip the gate
+  // for them entirely.
+  const resolveProjectAccess = Effect.fnUntraced(function* (projectId: ProjectId) {
+    return yield* projectionSnapshotQuery
+      .getProjectAccessById(projectId)
+      .pipe(Effect.map(Option.getOrUndefined));
+  });
+
   const resolveThread = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
       .getThreadDetailById(threadId)
@@ -617,8 +627,10 @@ const make = Effect.gen(function* () {
     // session must stay possible. Without an explicit request, the executing
     // instance depends on whether the restart above will fire; gating only
     // that one means a revoked-but-unused counterpart never blocks a safe
-    // turn or a safe restart.
-    if (project !== undefined) {
+    // turn or a safe restart. The project is resolved WITHOUT the deleted
+    // filter — a soft-deleted project's rules still bind its threads.
+    const projectAccess = yield* resolveProjectAccess(thread.projectId);
+    if (projectAccess !== undefined) {
       const gatedInstanceId =
         requestedModelSelection !== undefined
           ? desiredInstanceId
@@ -632,13 +644,13 @@ const make = Effect.gen(function* () {
           gatedInstanceId,
         ),
         projectId: thread.projectId,
-        projectAllowedProviderInstances: project.allowedProviderInstances,
+        projectAllowedProviderInstances: projectAccess.allowedProviderInstances,
       });
       if (restriction === "project-allowlist") {
         return yield* new ProviderAdapterRequestError({
           provider: preferredProvider,
           method: "thread.turn.start",
-          detail: `Provider instance '${gatedInstanceId}' is not allowed for project '${project.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+          detail: `Provider instance '${gatedInstanceId}' is not allowed for project '${projectAccess.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
         });
       }
       if (restriction === "instance-scope") {

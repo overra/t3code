@@ -24,8 +24,8 @@ import { useProjects, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
+  markThreadOutboxMessageRecovery,
   removeThreadOutboxMessage,
-  updateThreadOutboxMessage,
 } from "./thread-outbox";
 import {
   mergeComposerDraftContentIfFits,
@@ -157,17 +157,48 @@ export function useThreadOutboxDrain(): void {
      * draft for a queued creation (that thread was never created). The
      * poisoned entry is then removed so it stops blocking the FIFO.
      *
-     * Returns whether the entry was fully resolved (restored AND removed);
-     * `false` keeps it queued for a later pass with backoff.
+     * Recovery is a DURABLE PHASE MACHINE ordered for crash safety, with
+     * each marker written to the CURRENT stored entry (so it cannot clobber
+     * concurrent edits) and each phase gating the next:
+     *   1. `recoveryStartedAt` commits the entry to recovery BEFORE any
+     *      draft write — a crash right after leaves an entry that restart
+     *      reconciliation routes back here (never to delivery), and the
+     *      restore below is idempotent.
+     *   2. The draft restore itself (durable, all-or-nothing).
+     *   3. `restoredAt` records completion — a crash before it re-runs the
+     *      idempotent restore; after it, only removal remains even if the
+     *      user sends the recovered draft (clearing its receipt).
+     *   4. Removal.
+     *
+     * Returns whether the entry was fully resolved; `false` keeps it queued
+     * for a later pass with backoff.
      */
     const discardPoisonedEntry = async (): Promise<boolean> => {
       const receiptId = `thread-outbox:${queuedMessage.messageId}`;
-      // A durable restoredAt marker means a prior pass restored the content
-      // and only the removal failed. The draft receipt alone cannot carry
-      // this fact — sending the recovered draft clears the draft and its
-      // receipt — so without the marker that sequence would restore the
-      // same task a second time.
       if (queuedMessage.restoredAt === undefined) {
+        if (queuedMessage.recoveryStartedAt === undefined) {
+          let committed: boolean;
+          try {
+            committed = await markThreadOutboxMessageRecovery(queuedMessage.messageId, {
+              recoveryStartedAt: new Date().toISOString(),
+            });
+          } catch (error) {
+            // Not committed: nothing was restored, the entry stays whole and
+            // deliverable-after-retry semantics are unchanged.
+            console.warn("[thread-outbox] failed to commit poisoned queued message recovery", {
+              environmentId: queuedMessage.environmentId,
+              threadId: queuedMessage.threadId,
+              messageId: queuedMessage.messageId,
+              error,
+            });
+            return false;
+          }
+          if (!committed) {
+            // Deleted concurrently by the user before recovery began — the
+            // deletion wins and nothing is restored into the composer.
+            return true;
+          }
+        }
         try {
           if (queuedMessage.creation !== undefined) {
             // A queued creation restores into the project's new-task draft
@@ -253,11 +284,12 @@ export function useThreadOutboxDrain(): void {
           return false;
         }
         // The restore is durable — record that ON THE ENTRY before removal.
-        // If this marker write fails the draft receipt still guards the
-        // common retry path, so removal proceeds regardless.
+        // A failed marker write keeps the entry in the recovery phase (the
+        // restore above is idempotent on retry); a false result means the
+        // entry was deleted concurrently mid-restore, and the deletion wins.
+        let marked: boolean;
         try {
-          await updateThreadOutboxMessage({
-            ...queuedMessage,
+          marked = await markThreadOutboxMessageRecovery(queuedMessage.messageId, {
             restoredAt: new Date().toISOString(),
           });
         } catch (error) {
@@ -267,6 +299,10 @@ export function useThreadOutboxDrain(): void {
             messageId: queuedMessage.messageId,
             error,
           });
+          return false;
+        }
+        if (!marked) {
+          return true;
         }
       }
       try {
@@ -470,11 +506,15 @@ export function useThreadOutboxDrain(): void {
         (candidate) => candidate.environmentId === nextQueuedMessage.environmentId,
       );
       const shellStatus = shellStatuses.get(nextQueuedMessage.environmentId) ?? "empty";
-      // An entry already durably restored to a draft must never be delivered
-      // again — the user may have edited and resent that content. Its only
-      // remaining work is the removal that failed on the earlier pass.
+      // Restart reconciliation for the recovery phase machine: an entry
+      // already restored needs only removal; an entry that COMMITTED to
+      // recovery (crash or failure between marker and restore) must resume
+      // the idempotent recovery flow — and neither may ever be delivered.
+      const recoveryResumePending =
+        nextQueuedMessage.restoredAt === undefined &&
+        nextQueuedMessage.recoveryStartedAt !== undefined;
       const deliveryAction: ThreadOutboxDeliveryAction =
-        nextQueuedMessage.restoredAt !== undefined
+        nextQueuedMessage.restoredAt !== undefined || recoveryResumePending
           ? "remove"
           : resolveThreadOutboxDeliveryAction({
               isCreation: creation !== undefined,
@@ -546,19 +586,23 @@ export function useThreadOutboxDrain(): void {
         if (deliveryAction === "send" && creation === undefined && freshThreadBusy) {
           return true;
         }
-        return deliveryAction === "remove"
-          ? removeQueuedMessage(
-              nextQueuedMessage.restoredAt !== undefined
-                ? "[thread-outbox] failed to remove already-restored message"
-                : "[thread-outbox] failed to remove message for a missing thread",
-            )
-          : creation !== undefined
-            ? creationProjectCwd !== null
-              ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
-              : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
-            : thread !== undefined
-              ? sendQueuedMessage(nextQueuedMessage, thread)
-              : Promise.resolve(false);
+        return recoveryResumePending
+          ? // Resume the durable recovery flow (idempotent restore → mark →
+            // remove); the entry is already committed to never deliver.
+            makeDeliveryHelpers(nextQueuedMessage).discardPoisonedEntry()
+          : deliveryAction === "remove"
+            ? removeQueuedMessage(
+                nextQueuedMessage.restoredAt !== undefined
+                  ? "[thread-outbox] failed to remove already-restored message"
+                  : "[thread-outbox] failed to remove message for a missing thread",
+              )
+            : creation !== undefined
+              ? creationProjectCwd !== null
+                ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
+                : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
+              : thread !== undefined
+                ? sendQueuedMessage(nextQueuedMessage, thread)
+                : Promise.resolve(false);
       });
       void delivery
         .then((sent) => {

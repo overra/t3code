@@ -23,6 +23,13 @@ export function usePendingNewTasks(): ReadonlyArray<PendingNewTask> {
       if (!message.creation) {
         continue;
       }
+      // An entry committed to recovery is mid-removal: its content is (or is
+      // about to be) the project's new-task draft. Listing it would open the
+      // editor over a record the recovery flow is concurrently marking and
+      // deleting — edits there would be lost the moment removal lands.
+      if (message.recoveryStartedAt !== undefined || message.restoredAt !== undefined) {
+        continue;
+      }
       tasks.push({
         message,
         creation: message.creation,

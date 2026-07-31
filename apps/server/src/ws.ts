@@ -1049,7 +1049,7 @@ const makeWsRpcLayer = (
               yield* validateCommandProviderAccess(command, {
                 getSettings: serverSettings.getSettings,
                 getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
-                getProjectShellById: projectionSnapshotQuery.getProjectShellById,
+                getProjectAccess: projectionSnapshotQuery.getProjectAccessById,
               });
               const normalizedCommand = yield* normalizeDispatchCommand(command);
               const shouldStopSessionAfterArchive =

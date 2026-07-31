@@ -1,8 +1,8 @@
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, MessageId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import { createThreadOutboxManager } from "./thread-outbox-manager";
-import type { QueuedThreadMessage } from "./thread-outbox-model";
+import type { QueuedThreadMessage, ThreadOutboxRecoveryMarkers } from "./thread-outbox-model";
 import { expoThreadOutboxStorage } from "./thread-outbox-storage";
 
 export * from "./thread-outbox-model";
@@ -28,6 +28,18 @@ export function confirmThreadOutboxMessageQueued(message: QueuedThreadMessage): 
 /** Rewrite a queued message; no-op (false) if it was removed in the meantime. */
 export function updateThreadOutboxMessage(message: QueuedThreadMessage): Promise<boolean> {
   return threadOutboxManager.update(message);
+}
+
+/**
+ * Durably applies recovery markers to the CURRENT stored entry (never a
+ * captured snapshot). Returns false — writing nothing — when the entry no
+ * longer exists.
+ */
+export function markThreadOutboxMessageRecovery(
+  messageId: MessageId,
+  markers: ThreadOutboxRecoveryMarkers,
+): Promise<boolean> {
+  return threadOutboxManager.mark(messageId, markers);
 }
 
 export function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {

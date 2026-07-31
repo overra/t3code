@@ -80,8 +80,17 @@ export function ProviderProjectScopeSection(props: {
   peerInstances: ReadonlyArray<ProviderScopePeerInstance>;
   /** May return the settings-persist promise; used to roll back a rejected edit. */
   onChange: (allowedProjects: ReadonlyArray<ProjectId> | null) => unknown;
+  /**
+   * Reports this editor's pending (submitted, not yet echoed) scope so
+   * SIBLING cards' stranded-project warnings see local intent instead of
+   * lagging echoes. `undefined` clears the report (overlay resolved or the
+   * editor unmounted).
+   */
+  onPendingScopeChange?:
+    | ((instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => void)
+    | undefined;
 }) {
-  const { projects, onChange } = props;
+  const { projects, onChange, onPendingScopeChange } = props;
   // Optimistic overlay: rapid toggles must chain off the value just written,
   // not the settings prop (which lags the settings round-trip and would
   // resurrect the previous edit). There is deliberately NO
@@ -103,13 +112,25 @@ export function ProviderProjectScopeSection(props: {
   useEffect(() => {
     if (pendingScope === undefined) return;
     const generation = generationRef.current;
+    // The quiet period must observe STREAMED ECHOES, not just request
+    // settlement: `props.allowedProjects` in the deps re-arms the window on
+    // every incoming echo, so a delayed intermediate echo landing just
+    // before expiry restarts the clock instead of being exposed by an early
+    // clear.
     const timer = window.setTimeout(() => {
       if (generationRef.current === generation && inflightRef.current === 0) {
         setPendingScope(undefined);
       }
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [pendingScope, settledTick]);
+  }, [pendingScope, settledTick, props.allowedProjects]);
+  // Mirror this editor's pending scope to the panel for cross-card stranded
+  // warnings; cleared on resolution and on unmount.
+  useEffect(() => {
+    if (onPendingScopeChange === undefined) return;
+    onPendingScopeChange(props.instanceId, pendingScope);
+    return () => onPendingScopeChange(props.instanceId, undefined);
+  }, [onPendingScopeChange, pendingScope, props.instanceId]);
   const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
   const submit = (next: ReadonlyArray<ProjectId> | null) => {
     generationRef.current += 1;

@@ -121,6 +121,32 @@ function mergeModelSelectionOptionsById(input: {
   return [...merged.entries()].map(([id, value]) => ({ id, value }));
 }
 
+/**
+ * Applies per-instance upserts/deletes onto a provider-instances map. `null`
+ * deletes the entry; a config value replaces that entry whole. Runs against
+ * the map the SERVER holds at apply time (under its settings write lock), so
+ * two clients editing different instances can never revert each other.
+ */
+export function applyProviderInstancesPatch(
+  current: ServerSettings["providerInstances"],
+  patches: NonNullable<ServerSettingsPatch["providerInstancesPatch"]>,
+): ServerSettings["providerInstances"] {
+  const next = { ...current } as Record<
+    keyof ServerSettings["providerInstances"],
+    ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+  >;
+  for (const [instanceId, value] of Object.entries(patches) as Array<
+    [keyof typeof next, (typeof patches)[keyof typeof patches]]
+  >) {
+    if (value === null) {
+      delete next[instanceId];
+    } else {
+      next[instanceId] = value;
+    }
+  }
+  return next;
+}
+
 export function applyServerSettingsPatch(
   current: ServerSettings,
   patch: ServerSettingsPatch,
@@ -131,6 +157,7 @@ export function applyServerSettingsPatch(
     providerHealthRefreshInterval,
     backgroundActivityProfile,
     backgroundActivity,
+    providerInstancesPatch,
     ...patchForMerge
   } = patch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
@@ -186,6 +213,16 @@ export function applyServerSettingsPatch(
       : {}),
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
+      : {}),
+    // Applied after (and on top of) any whole-map replacement so per-instance
+    // patches win when a caller inexplicably sends both.
+    ...(providerInstancesPatch !== undefined
+      ? {
+          providerInstances: applyProviderInstancesPatch(
+            patch.providerInstances ?? current.providerInstances,
+            providerInstancesPatch,
+          ),
+        }
       : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
