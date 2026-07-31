@@ -285,9 +285,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           exceptProjectId: command.projectId,
         });
       }
-      // Validate the post-update pair, not the command fields in isolation:
-      // either field may arrive alone and must stay consistent with the
-      // other's current value.
+      // Keep the (allowlist, default) pair consistent SERVER-SIDE: either
+      // field may arrive alone from a client whose view of the other is
+      // stale — deriving the clear on the client races its own writes (an
+      // A→B→A allowlist sequence would resurrect nothing but silently rely
+      // on stale state). When the post-update allowlist excludes the
+      // post-update default, the default is cleared in the same event.
       const nextAllowedProviderInstances =
         command.allowedProviderInstances !== undefined
           ? command.allowedProviderInstances
@@ -296,16 +299,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.defaultModelSelection !== undefined
           ? command.defaultModelSelection
           : project.defaultModelSelection;
-      if (
+      const defaultBecomesDisallowed =
         nextAllowedProviderInstances !== null &&
         nextDefaultModelSelection !== null &&
-        !nextAllowedProviderInstances.includes(nextDefaultModelSelection.instanceId)
-      ) {
-        return yield* new OrchestrationCommandInvariantError({
-          commandType: command.type,
-          detail: `Default provider instance '${nextDefaultModelSelection.instanceId}' is not in the project's allowed provider instances.`,
-        });
-      }
+        !nextAllowedProviderInstances.includes(nextDefaultModelSelection.instanceId);
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -325,6 +322,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           ...(command.allowedProviderInstances !== undefined
             ? { allowedProviderInstances: command.allowedProviderInstances }
             : {}),
+          ...(defaultBecomesDisallowed ? { defaultModelSelection: null } : {}),
           ...(command.scripts !== undefined ? { scripts: command.scripts } : {}),
           updatedAt: occurredAt,
         },

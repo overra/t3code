@@ -26,7 +26,7 @@ import {
   ensureThreadOutboxLoaded,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
-import { mergeComposerDraftContent, updateComposerDraftSettings } from "./use-composer-drafts";
+import { mergeComposerDraftContent, restoreComposerDraftSnapshotOnce } from "./use-composer-drafts";
 import {
   isQueuedThreadCreationSendable,
   modelSelectionsEqual,
@@ -153,44 +153,81 @@ export function useThreadOutboxDrain(): void {
      * poisoned entry is then removed so it stops blocking the FIFO.
      */
     const discardPoisonedEntry = async (): Promise<void> => {
-      // Mirrors the new-task flow's draft key shape
-      // (`new-task:${scopedProjectKey(...)}` in new-task-flow-provider).
-      const restoreDraftKey =
-        queuedMessage.creation !== undefined
-          ? `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`
-          : scopedThreadKey(queuedMessage.environmentId, queuedMessage.threadId);
+      const receiptId = `thread-outbox:${queuedMessage.messageId}`;
       try {
-        // Durable, idempotent restore FIRST: the merge awaits its persisted
-        // write and dedupes via the receipt (this message id), so a crash
-        // between restore and removal — or a failed removal retried on the
-        // next drain pass — cannot lose or duplicate the content.
-        await mergeComposerDraftContent(restoreDraftKey, {
-          text: queuedMessage.text,
-          attachments: queuedMessage.attachments,
-          sourceShareId: `thread-outbox:${queuedMessage.messageId}`,
-        });
         if (queuedMessage.creation !== undefined) {
-          // A queued creation also carries its task shape; restoring it
-          // means the recovered draft resubmits as the same kind of task
-          // instead of an unrelated default-local one. The revoked model
-          // selection is deliberately NOT restored — the flow's clamp picks
-          // a usable one.
-          updateComposerDraftSettings(restoreDraftKey, {
-            workspaceSelection: {
-              mode: queuedMessage.creation.workspaceMode,
-              branch: queuedMessage.creation.branch,
-              worktreePath: queuedMessage.creation.worktreePath,
-              ...(queuedMessage.creation.startFromOrigin !== undefined
-                ? { startFromOrigin: queuedMessage.creation.startFromOrigin }
+          // A queued creation restores into the project's new-task draft
+          // (mirrors the flow's `new-task:${scopedProjectKey(...)}` key) as
+          // ONE durable snapshot write: content plus its task shape —
+          // workspace selection with startFromOrigin pinned to the value the
+          // task would have sent with, runtime and interaction modes — so
+          // the recovered draft resubmits as the same kind of task. The
+          // revoked model selection is deliberately NOT restored; the flow's
+          // clamp picks a usable one. The restore refuses to touch a draft
+          // where the user has typed content, keeping the entry queued
+          // instead of clobbering or truncating their work.
+          const restoreDraftKey = `new-task:${scopedProjectKey(queuedMessage.environmentId, queuedMessage.creation.projectId)}`;
+          const { restored } = await restoreComposerDraftSnapshotOnce(
+            restoreDraftKey,
+            {
+              text: queuedMessage.text,
+              attachments: queuedMessage.attachments,
+              workspaceSelection: {
+                mode: queuedMessage.creation.workspaceMode,
+                branch: queuedMessage.creation.branch,
+                worktreePath: queuedMessage.creation.worktreePath,
+                startFromOrigin: queuedMessage.creation.startFromOrigin ?? false,
+              },
+              ...(queuedMessage.runtimeMode !== undefined
+                ? { runtimeMode: queuedMessage.runtimeMode }
+                : {}),
+              ...(queuedMessage.interactionMode !== undefined
+                ? { interactionMode: queuedMessage.interactionMode }
                 : {}),
             },
-            ...(queuedMessage.runtimeMode !== undefined
-              ? { runtimeMode: queuedMessage.runtimeMode }
-              : {}),
-            ...(queuedMessage.interactionMode !== undefined
-              ? { interactionMode: queuedMessage.interactionMode }
-              : {}),
+            receiptId,
+          );
+          if (!restored) {
+            console.warn(
+              "[thread-outbox] deferred poisoned pending-task restore; the new-task draft has content",
+              {
+                environmentId: queuedMessage.environmentId,
+                threadId: queuedMessage.threadId,
+                messageId: queuedMessage.messageId,
+              },
+            );
+            return;
+          }
+        } else {
+          // Durable, idempotent restore FIRST: the merge awaits its persisted
+          // write and dedupes via the receipt (this message id), so a crash
+          // between restore and removal — or a failed removal retried on the
+          // next drain pass — cannot lose or duplicate the content.
+          const restoreDraftKey = scopedThreadKey(
+            queuedMessage.environmentId,
+            queuedMessage.threadId,
+          );
+          const { skippedAttachmentCount } = await mergeComposerDraftContent(restoreDraftKey, {
+            text: queuedMessage.text,
+            attachments: queuedMessage.attachments,
+            sourceShareId: receiptId,
           });
+          if (skippedAttachmentCount > 0) {
+            // The thread draft is at the attachment cap, so part of this
+            // message did NOT make it back. Keep the entry queued — the next
+            // pass re-attempts once the user sends or trims the draft — so
+            // attachments are never permanently dropped.
+            console.warn(
+              "[thread-outbox] kept poisoned queued message; draft truncated its attachments",
+              {
+                environmentId: queuedMessage.environmentId,
+                threadId: queuedMessage.threadId,
+                messageId: queuedMessage.messageId,
+                skippedAttachmentCount,
+              },
+            );
+            return;
+          }
         }
       } catch (error) {
         // Content is NOT saved; keep the outbox entry rather than lose the

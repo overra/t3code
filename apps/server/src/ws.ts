@@ -464,6 +464,11 @@ const makeWsRpcLayer = (
           ? cause
           : new OrchestrationDispatchCommandError({
               message: cause instanceof Error ? cause.message : fallbackMessage,
+              // A generic wrap covers unknown infrastructure failures
+              // (startup, database, engine) — not policy decisions. Retry
+              // queues must not discard commands rejected this way; policy
+              // denials are constructed directly and stay unmarked.
+              retryable: true,
               cause,
             });
       const randomUUID = crypto.randomUUIDv4.pipe(

@@ -504,6 +504,66 @@ export async function mergeComposerDraftContent(
   return { skippedAttachmentCount };
 }
 
+export function restoreComposerDraftSnapshotOnceState(
+  current: Record<string, ComposerDraft>,
+  draftKey: string,
+  snapshot: ComposerDraft,
+  receiptId: string,
+): { readonly next: Record<string, ComposerDraft>; readonly restored: boolean } {
+  const existing = normalizeDraft(current[draftKey]);
+  if (existing.importedShareIds?.includes(receiptId)) {
+    return { next: current, restored: true };
+  }
+  if (existing.text.length > 0 || existing.attachments.length > 0) {
+    return { next: current, restored: false };
+  }
+  return {
+    next: restoreComposerDraftSnapshotState(current, draftKey, {
+      ...snapshot,
+      importedShareIds: [...(snapshot.importedShareIds ?? []), receiptId],
+    }),
+    restored: true,
+  };
+}
+
+/**
+ * Restores a queued task's full draft — content, task-shape settings, and its
+ * recovery receipt — as ONE durable write, but only when the target draft has
+ * no user content to clobber or truncate. A draft already carrying
+ * `receiptId` counts as restored (a crash between restore and outbox removal
+ * lands here on the retry), which keeps the call idempotent. Returns whether
+ * the draft now holds the restored task.
+ */
+export async function restoreComposerDraftSnapshotOnce(
+  draftKey: string,
+  snapshot: ComposerDraft,
+  receiptId: string,
+): Promise<{ readonly restored: boolean }> {
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) {
+    await loadPromise;
+  }
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const { next, restored } = restoreComposerDraftSnapshotOnceState(
+    current,
+    draftKey,
+    snapshot,
+    receiptId,
+  );
+  if (!restored) {
+    return { restored };
+  }
+  if (next !== current) {
+    appAtomRegistry.set(composerDraftsAtom, next);
+    await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+  }
+  return { restored };
+}
+
 /** Restores the exact content/settings captured before an interrupted import. */
 export async function restoreComposerDraftSnapshot(
   draftKey: string,

@@ -118,11 +118,18 @@ export function ProviderProjectScopeSection(props: {
   useEffect(() => {
     if (pendingScope === undefined) return;
     const generation = generationRef.current;
+    // The timeout only backstops a LOST echo, so it must not fire while a
+    // write is still in flight — a slow persist is not a lost echo, and
+    // clearing under it would resurrect the pre-edit prop value. settledTick
+    // in the deps re-arms the timer after each settle, so the backstop window
+    // starts once the write is done rather than racing it.
     const timer = window.setTimeout(() => {
-      if (generationRef.current === generation) setPendingScope(undefined);
+      if (generationRef.current === generation && inflightRef.current === 0) {
+        setPendingScope(undefined);
+      }
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [pendingScope]);
+  }, [pendingScope, settledTick]);
   const allowedProjects = pendingScope !== undefined ? pendingScope : props.allowedProjects;
   const submit = (next: ReadonlyArray<ProjectId> | null) => {
     generationRef.current += 1;

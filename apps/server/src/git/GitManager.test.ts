@@ -5,6 +5,7 @@ import * as NodeChildProcess from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -684,6 +685,30 @@ function makeManager(input?: {
 }
 
 const asThreadId = (threadId: string) => threadId as ThreadId;
+
+it("relates normalized repository paths across separators for the writer clamp", () => {
+  // POSIX containment in both directions, and the classic prefix trap: a
+  // sibling whose name string-prefixes the root must NOT be related.
+  expect(GitManager.areNormalizedPathsRelated("/repo/packages/app", "/repo")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/repo", "/repo/packages/app")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/repo-sibling", "/repo")).toBe(false);
+
+  // Windows drive paths normalize to lowercase backslashes; containment must
+  // use the backslash separator or ownership silently misses.
+  const winRoot = normalizeProjectPathForComparison("C:/Repo");
+  const winNested = normalizeProjectPathForComparison("C:\\Repo\\Packages\\App");
+  const winSibling = normalizeProjectPathForComparison("C:/Repo2");
+  expect(winNested).toBe("c:\\repo\\packages\\app");
+  expect(GitManager.areNormalizedPathsRelated(winNested, winRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winRoot, winNested)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winSibling, winRoot)).toBe(false);
+
+  // UNC shares take the same backslash form.
+  const uncRoot = normalizeProjectPathForComparison("\\\\server\\share\\repo");
+  const uncNested = normalizeProjectPathForComparison("\\\\server\\share\\repo\\sub");
+  expect(GitManager.areNormalizedPathsRelated(uncNested, uncRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(uncRoot, uncNested)).toBe(true);
+});
 
 const GitManagerTestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-git-manager-test-" })),

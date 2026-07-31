@@ -38,7 +38,18 @@ import * as Option from "effect/Option";
 
 export type ProviderScopeCheckTarget =
   | { readonly kind: "project"; readonly projectId: ProjectId }
-  | { readonly kind: "thread"; readonly threadId: ThreadId };
+  | { readonly kind: "thread"; readonly threadId: ThreadId }
+  /**
+   * A bootstrap-bearing turn: when the thread already exists its project is
+   * authoritative (the decider ignores the bootstrap for existing threads,
+   * so a caller must not be able to spoof a permissive bootstrap project);
+   * the bootstrap project applies only when the thread is genuinely new.
+   */
+  | {
+      readonly kind: "thread-else-project";
+      readonly threadId: ThreadId;
+      readonly fallbackProjectId: ProjectId;
+    };
 
 export interface ProviderScopeCheck {
   readonly instanceId: ProviderInstanceId;
@@ -67,10 +78,12 @@ export function collectProviderScopeChecks(
           ];
     case "thread.turn.start": {
       const createThread = command.bootstrap?.createThread;
-      // With a bootstrap the thread does not exist yet; the bootstrap's
-      // projectId is the authoritative target for both selections.
       const turnTarget: ProviderScopeCheckTarget = createThread
-        ? { kind: "project", projectId: createThread.projectId }
+        ? {
+            kind: "thread-else-project",
+            threadId: command.threadId,
+            fallbackProjectId: createThread.projectId,
+          }
         : { kind: "thread", threadId: command.threadId };
       const checks: ProviderScopeCheck[] = [];
       if (command.modelSelection !== undefined) {
@@ -82,7 +95,7 @@ export function collectProviderScopeChecks(
       ) {
         checks.push({
           instanceId: createThread.modelSelection.instanceId,
-          target: { kind: "project", projectId: createThread.projectId },
+          target: turnTarget,
         });
       }
       return checks;
@@ -126,16 +139,23 @@ export const validateCommandProviderAccess = Effect.fnUntraced(function* <E1, E2
   );
 
   for (const check of checks) {
+    const target = check.target;
     const projectId =
-      check.target.kind === "project"
-        ? check.target.projectId
-        : yield* deps.getThreadShellById(check.target.threadId).pipe(
+      target.kind === "project"
+        ? target.projectId
+        : yield* deps.getThreadShellById(target.threadId).pipe(
             Effect.map(Option.getOrUndefined),
-            Effect.map((thread) => thread?.projectId),
+            Effect.map((thread) =>
+              thread !== undefined
+                ? thread.projectId
+                : target.kind === "thread-else-project"
+                  ? target.fallbackProjectId
+                  : undefined,
+            ),
             Effect.mapError(() => verificationFailure("thread state")),
           );
-    // A cleanly missing thread is the decider's error to report with
-    // proper context, not this gate's.
+    // A cleanly missing thread without a bootstrap fallback is the
+    // decider's error to report with proper context, not this gate's.
     if (projectId === undefined) continue;
     const project = yield* deps.getProjectShellById(projectId).pipe(
       Effect.map(Option.getOrUndefined),

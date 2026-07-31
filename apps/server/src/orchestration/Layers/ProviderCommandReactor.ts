@@ -386,20 +386,25 @@ const make = Effect.gen(function* () {
   /**
    * Auxiliary text generation (thread titles, branch names) sends project
    * content to the selected instance, so the globally configured selection
-   * must also pass the thread's project access rules. Falls back to the
-   * thread's own selection when the global one is restricted; returns
-   * undefined when neither is usable — callers skip generation entirely (a
-   * seed title or temporary branch name is an acceptable outcome, a
-   * restricted provider receiving the prompt is not).
+   * must also pass the thread's project access rules. Falls back through
+   * the turn's explicit selection (already access-checked by the gates),
+   * the thread's own selection, then the project default; returns undefined
+   * when nothing usable remains — callers skip generation entirely (a seed
+   * title or temporary branch name is an acceptable outcome, a restricted
+   * provider receiving the prompt is not). Missing attribution — the thread
+   * or project was deleted between the turn and this forked job — also
+   * skips: without a project there is no rule to check, and captured prompt
+   * data must not default to the unclamped global writer.
    */
   const resolveProjectScopedTextGenerationSelection = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly candidate: ModelSelection;
+    readonly turnSelection?: ModelSelection | undefined;
   }) {
     const thread = yield* resolveThread(input.threadId);
-    if (!thread) return input.candidate;
+    if (!thread) return undefined;
     const project = yield* resolveProject(thread.projectId);
-    if (project === undefined) return input.candidate;
+    if (project === undefined) return undefined;
     const providerInstances = (yield* serverSettingsService.getSettings).providerInstances;
     const usable = (instanceId: ModelSelection["instanceId"]) =>
       isProviderInstanceUsableInProject({
@@ -409,6 +414,9 @@ const make = Effect.gen(function* () {
         projectAllowedProviderInstances: project.allowedProviderInstances,
       });
     if (usable(input.candidate.instanceId)) return input.candidate;
+    if (input.turnSelection !== undefined && usable(input.turnSelection.instanceId)) {
+      return input.turnSelection;
+    }
     if (usable(thread.modelSelection.instanceId)) return thread.modelSelection;
     if (
       project.defaultModelSelection !== null &&
@@ -825,6 +833,8 @@ const make = Effect.gen(function* () {
     readonly worktreePath: string | null;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly turnSelection?: ModelSelection;
+    readonly titleSeed?: string;
   }) {
     if (!input.branch || !input.worktreePath) {
       return;
@@ -848,6 +858,7 @@ const make = Effect.gen(function* () {
       const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
         threadId: input.threadId,
         candidate,
+        ...(input.turnSelection !== undefined ? { turnSelection: input.turnSelection } : {}),
       });
       if (modelSelection === undefined) return;
 
@@ -889,6 +900,7 @@ const make = Effect.gen(function* () {
       readonly cwd: string;
       readonly messageText: string;
       readonly attachments?: ReadonlyArray<ChatAttachment>;
+      readonly turnSelection?: ModelSelection;
       readonly titleSeed?: string;
     }) {
       const attachments = input.attachments ?? [];
@@ -897,6 +909,7 @@ const make = Effect.gen(function* () {
         const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
           threadId: input.threadId,
           candidate: textGenerationModelSelection,
+          ...(input.turnSelection !== undefined ? { turnSelection: input.turnSelection } : {}),
         });
         if (modelSelection === undefined) return;
 
@@ -1141,6 +1154,9 @@ const make = Effect.gen(function* () {
         messageText: message.text,
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+        ...(event.payload.modelSelection !== undefined
+          ? { turnSelection: event.payload.modelSelection }
+          : {}),
       };
 
       yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({

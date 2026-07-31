@@ -10,6 +10,7 @@ import {
   getComposerDraftSnapshot,
   mergeComposerDraftContentState,
   removeComposerDraftsForEnvironment,
+  restoreComposerDraftSnapshotOnceState,
   restoreComposerDraftSnapshotState,
 } from "./use-composer-drafts";
 
@@ -193,6 +194,45 @@ describe("mobile composer drafts", () => {
     expect(merged[draftKey]?.attachments).toHaveLength(8);
     expect(merged[draftKey]?.attachments[0]).toEqual(existingImage);
     expect(merged[draftKey]?.attachments.at(-1)?.id).toBe("shared-6");
+  });
+
+  it("restores a poisoned queued task only into an empty draft, exactly once", () => {
+    const draftKey = "new-task:environment-1:project-1";
+    const receiptId = "thread-outbox:message-1";
+    const snapshot: ComposerDraft = {
+      text: "Queued task",
+      attachments: [],
+      runtimeMode: "approval-required",
+      workspaceSelection: {
+        mode: "worktree",
+        branch: "main",
+        worktreePath: null,
+        startFromOrigin: false,
+      },
+    };
+
+    // Empty target: the full task shape and the receipt land in one state.
+    const restored = restoreComposerDraftSnapshotOnceState({}, draftKey, snapshot, receiptId);
+    expect(restored.restored).toBe(true);
+    expect(restored.next[draftKey]).toEqual({
+      ...snapshot,
+      importedShareIds: [receiptId],
+    });
+
+    // Receipt already present (crash between restore and outbox removal):
+    // idempotent, even after the user edited the restored content.
+    const edited = {
+      [draftKey]: { ...restored.next[draftKey]!, text: "Queued task, edited" },
+    };
+    const repeat = restoreComposerDraftSnapshotOnceState(edited, draftKey, snapshot, receiptId);
+    expect(repeat.restored).toBe(true);
+    expect(repeat.next).toBe(edited);
+
+    // A draft with user content and no receipt is refused, not clobbered.
+    const occupied = { [draftKey]: { text: "User draft", attachments: [] } };
+    const refused = restoreComposerDraftSnapshotOnceState(occupied, draftKey, snapshot, receiptId);
+    expect(refused.restored).toBe(false);
+    expect(refused.next).toBe(occupied);
   });
 
   it("restores the exact draft captured before an interrupted share import", () => {

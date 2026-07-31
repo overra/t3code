@@ -127,6 +127,20 @@ type StripProgressContext<T> = T extends any ? Omit<T, "actionId" | "cwd" | "act
 type GitActionProgressPayload = StripProgressContext<GitActionProgressEvent>;
 type GitActionProgressEmitter = (event: GitActionProgressPayload) => Effect.Effect<void, never>;
 
+/**
+ * Containment over paths already canonicalized with
+ * `normalizeProjectPathForComparison`: normalized Windows/UNC paths use
+ * backslashes, POSIX paths use slashes, and containment must respect
+ * whichever separator the normalizer produced or Windows ownership silently
+ * misses (`C:\repo` would otherwise not own `C:\repo\packages\app`).
+ */
+export const isNormalizedPathWithin = (child: string, parent: string): boolean =>
+  child.startsWith(`${parent}/`) || child.startsWith(`${parent}\\`);
+
+/** Ownership for the writer clamp: equal, or containment in either direction. */
+export const areNormalizedPathsRelated = (a: string, b: string): boolean =>
+  a === b || isNormalizedPathWithin(a, b) || isNormalizedPathWithin(b, a);
+
 function isNotGitRepositoryError(error: GitCommandError): boolean {
   return error.message.toLowerCase().includes("not a git repository");
 }
@@ -617,8 +631,10 @@ export const make = Effect.gen(function* () {
     }) {
       // Git accepts any repository subdirectory as cwd; project and worktree
       // records store the repository root, so match on the resolved toplevel
-      // rather than the literal cwd. When resolution fails, the literal cwd
-      // is still tried — it may itself be the root.
+      // rather than the literal cwd. Root resolution FAILS CLOSED: a cwd
+      // whose repository cannot be identified cannot have its ownership
+      // verified, and guessing with the literal cwd can miss a restricted
+      // subproject from a sibling directory.
       const repositoryRoot = yield* gitCore
         .execute({
           operation: "GitManager.resolveWriterRepositoryRoot",
@@ -626,10 +642,19 @@ export const make = Effect.gen(function* () {
           args: ["rev-parse", "--show-toplevel"],
         })
         .pipe(
-          Effect.map((result) => result.stdout.trim()),
-          Effect.map((root) => (root.length > 0 ? root : input.cwd)),
-          Effect.orElseSucceed(() => input.cwd),
+          Effect.map((result) => {
+            const root = result.stdout.trim();
+            return root.length > 0 ? root : undefined;
+          }),
+          Effect.orElseSucceed(() => undefined),
         );
+      if (repositoryRoot === undefined) {
+        yield* Effect.logWarning(
+          "git manager could not resolve the repository root for writer clamping",
+          { cwd: input.cwd },
+        );
+        return undefined;
+      }
       // Fail CLOSED on projection failures: this clamp protects repository
       // content from restricted providers, so "cannot verify" must block
       // generation (callers surface guidance; manual messages still work)
@@ -656,12 +681,10 @@ export const make = Effect.gen(function* () {
           Effect.map(normalizeProjectPathForComparison),
         );
       const canonicalRoot = yield* canonicalize(repositoryRoot);
-      const isRelated = (a: string, b: string) =>
-        a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
       const owningThreads: Array<(typeof snapshot.threads)[number]> = [];
       for (const thread of snapshot.threads) {
         if (thread.worktreePath === null) continue;
-        if (isRelated(yield* canonicalize(thread.worktreePath), canonicalRoot)) {
+        if (areNormalizedPathsRelated(yield* canonicalize(thread.worktreePath), canonicalRoot)) {
           owningThreads.push(thread);
         }
       }
@@ -670,7 +693,7 @@ export const make = Effect.gen(function* () {
       for (const entry of snapshot.projects) {
         if (
           owningProjectIds.has(entry.id) ||
-          isRelated(yield* canonicalize(entry.workspaceRoot), canonicalRoot)
+          areNormalizedPathsRelated(yield* canonicalize(entry.workspaceRoot), canonicalRoot)
         ) {
           owningProjects.push(entry);
         }

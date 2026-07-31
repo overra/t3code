@@ -23,10 +23,16 @@ one.
 ## From the terminal
 
 Builds using the classic sidebar do not have the project-settings editor;
-the CLI covers the same policy everywhere:
+the CLI covers the same policy everywhere. `<project>` is a project id or
+its workspace path — from inside the project, `.` works:
 
 ```sh
-t3 project providers <project-id-or-path>                 # show the allowlist
-t3 project providers <project> --allow codex,claude_work  # restrict
-t3 project providers <project> --all                      # clear the restriction
+npx t3@latest project providers .                                 # show the allowlist
+npx t3@latest project providers . --allow codex,claudeAgent_work  # restrict
+npx t3@latest project providers . --all                           # clear the restriction
 ```
+
+The `--allow` list takes provider _instance_ ids as shown by the show
+command — the default instance for a driver is the driver name itself
+(`codex`, `claudeAgent`), and additional instances use the name they were
+created with (for example `claudeAgent_work`).

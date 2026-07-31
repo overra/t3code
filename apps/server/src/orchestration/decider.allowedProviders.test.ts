@@ -158,24 +158,27 @@ it.layer(NodeServices.layer)("decider project provider allowlist", (it) => {
     }),
   );
 
-  it.effect("project.meta.update rejects an allowlist excluding the current default", () =>
-    Effect.gen(function* () {
-      const readModel: OrchestrationReadModel = yield* restrictedProjectReadModel();
-      const failure = yield* Effect.flip(
-        decideOrchestrationCommand({
+  it.effect(
+    "project.meta.update auto-clears a default the new allowlist excludes (server-side, race-free)",
+    () =>
+      Effect.gen(function* () {
+        const readModel: OrchestrationReadModel = yield* restrictedProjectReadModel();
+        const result = yield* decideOrchestrationCommand({
           command: {
             type: "project.meta.update",
-            commandId: CommandId.make("cmd-project-update-conflict"),
+            commandId: CommandId.make("cmd-project-update-narrowing"),
             projectId: PROJECT_ID,
             allowedProviderInstances: [CODEX_INSTANCE],
           },
           readModel,
-        }),
-      );
-      expect(failure.message).toContain(
-        "Default provider instance 'claudeAgent_work' is not in the project's allowed provider instances.",
-      );
-    }),
+        });
+        const event = Array.isArray(result) ? result[0] : result;
+        expect(event.type).toBe("project.meta-updated");
+        expect(event.payload).toMatchObject({
+          allowedProviderInstances: [CODEX_INSTANCE],
+          defaultModelSelection: null,
+        });
+      }),
   );
 
   it.effect(

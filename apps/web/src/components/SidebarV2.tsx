@@ -1129,11 +1129,18 @@ function ProjectAllowedProvidersControl(props: {
   useEffect(() => {
     if (pendingAllowed === undefined) return;
     const generation = generationRef.current;
+    // The timeout only backstops a LOST echo, so it must not fire while a
+    // write is still in flight — a slow persist is not a lost echo, and
+    // clearing under it would resurrect the pre-edit prop value. settledTick
+    // in the deps re-arms the timer after each settle, so the backstop window
+    // starts once the write is done rather than racing it.
     const timer = window.setTimeout(() => {
-      if (generationRef.current === generation) setPendingAllowed(undefined);
+      if (generationRef.current === generation && inflightRef.current === 0) {
+        setPendingAllowed(undefined);
+      }
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [pendingAllowed]);
+  }, [pendingAllowed, settledTick]);
   const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
   const checkedIds = useMemo(
     () =>
@@ -1657,20 +1664,14 @@ export default function SidebarV2() {
       member: SidebarProjectGroupMember,
       allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
     ): Promise<boolean> => {
-      const defaultSelection = member.defaultModelSelection ?? null;
-      const defaultDisallowed =
-        allowedProviderInstances !== null &&
-        defaultSelection !== null &&
-        !allowedProviderInstances.includes(defaultSelection.instanceId);
+      // The decider auto-clears a default the new allowlist excludes;
+      // deriving that clear here from possibly-stale member state raced the
+      // dialog's own rapid edits.
       const result = await updateProject({
         environmentId: member.environmentId,
         input: {
           projectId: member.id,
           allowedProviderInstances,
-          // The server rejects an allowlist that excludes the project's
-          // default model selection; dropping the default in the same
-          // command keeps the pair consistent.
-          ...(defaultDisallowed ? { defaultModelSelection: null } : {}),
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {

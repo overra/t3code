@@ -667,20 +667,13 @@ const projectProvidersCommand = Command.make("providers", {
           });
         }
 
-        // Mirror the dialog: an allowlist that excludes the project's
-        // default selection clears the default in the same command, since
-        // the decider rejects the inconsistent pair.
-        const defaultSelection =
-          snapshot.projects.find((entry) => entry.id === project.id)?.defaultModelSelection ?? null;
+        // The decider auto-clears a project default the new allowlist
+        // excludes, so no client-side pair bookkeeping is needed here.
         yield* dispatch({
           type: "project.meta.update",
           commandId: CommandId.make(yield* projectCommandUuid),
           projectId: project.id,
           allowedProviderInstances,
-          ...(defaultSelection !== null &&
-          !allowedProviderInstances.includes(defaultSelection.instanceId)
-            ? { defaultModelSelection: null }
-            : {}),
         });
         return `Project ${project.id} now allows: ${allowedProviderInstances.join(", ")}.`;
       }),

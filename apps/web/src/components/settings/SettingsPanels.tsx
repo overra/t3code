@@ -81,8 +81,10 @@ import { ensureLocalApi, readLocalApi } from "../../localApi";
 import {
   primaryServerObservabilityAtom,
   primaryServerProvidersAtom,
+  primaryServerSettingsAtom,
   serverEnvironment,
 } from "../../state/server";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { usePrimaryEnvironment } from "../../state/environments";
 import { useProjects } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
@@ -314,6 +316,12 @@ function withoutProviderInstanceFavorites(
 const PROVIDER_SETTINGS = DRIVER_OPTIONS.map((definition) => ({
   provider: definition.value,
 }));
+
+// How long a sent provider-instance value keeps overriding patch composition
+// after its persist acknowledges. The config echo that makes the server state
+// catch up normally arrives well inside this window; after it, the overlay
+// entry is a no-op and expires.
+const PENDING_INSTANCE_WRITE_TTL_MS = 10_000;
 
 function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }) {
   useRelativeTimeTick();
@@ -1930,6 +1938,60 @@ export function ProviderSettingsPanel() {
     allowedProjects: row.instance.allowedProjects ?? null,
   }));
 
+  // Settings updates replace the WHOLE providerInstances map, so a patch
+  // built from render-captured settings can resurrect the previous value of
+  // an instance whose own edit is still round-tripping (narrow instance W,
+  // quickly toggle instance X → X's patch re-widens W). Patches are instead
+  // built from the freshest server settings at write time, overlaid with this
+  // panel's not-yet-echoed writes. An entry clears immediately when its
+  // persist is rejected (so a denied value stops riding along) and otherwise
+  // lingers briefly past the ack to bridge the gap until the config echo
+  // lands — by then the overlay is a no-op.
+  const pendingInstanceWritesRef = useRef(
+    new Map<ProviderInstanceId, { readonly value: ProviderInstanceConfig | null }>(),
+  );
+
+  const composeProviderInstancesForWrite = () => {
+    const fresh = appAtomRegistry.get(primaryServerSettingsAtom);
+    let providerInstances = { ...fresh.providerInstances } as Record<
+      ProviderInstanceId,
+      ProviderInstanceConfig
+    >;
+    for (const [pendingId, write] of pendingInstanceWritesRef.current) {
+      if (write.value === null) {
+        providerInstances = withoutProviderInstanceKey(providerInstances, pendingId);
+      } else {
+        providerInstances[pendingId] = write.value;
+      }
+    }
+    return { fresh, providerInstances };
+  };
+
+  const trackPendingInstanceWrite = (
+    instanceId: ProviderInstanceId,
+    value: ProviderInstanceConfig | null,
+    persist: Promise<unknown> | undefined,
+  ) => {
+    const entry = { value };
+    pendingInstanceWritesRef.current.set(instanceId, entry);
+    const clearIfCurrent = () => {
+      if (pendingInstanceWritesRef.current.get(instanceId) === entry) {
+        pendingInstanceWritesRef.current.delete(instanceId);
+      }
+    };
+    void Promise.resolve(persist).then((outcome) => {
+      const rejected =
+        typeof outcome === "object" &&
+        outcome !== null &&
+        (outcome as { _tag?: unknown })._tag === "Failure";
+      if (rejected) {
+        clearIfCurrent();
+        return;
+      }
+      setTimeout(clearIfCurrent, PENDING_INSTANCE_WRITE_TTL_MS);
+    }, clearIfCurrent);
+  };
+
   const updateProviderInstance = (
     row: InstanceRow,
     next: ProviderInstanceConfig,
@@ -1938,10 +2000,11 @@ export function ProviderSettingsPanel() {
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
     },
-  ) =>
-    updateSettings(
+  ) => {
+    const { fresh, providerInstances } = composeProviderInstancesForWrite();
+    const persist = updateSettings(
       buildProviderInstanceUpdatePatch({
-        settings,
+        settings: { providers: fresh.providers, providerInstances },
         instanceId: row.instanceId,
         instance: next,
         driver: row.driver,
@@ -1949,13 +2012,18 @@ export function ProviderSettingsPanel() {
         textGenerationModelSelection: options?.textGenerationModelSelection,
       }),
     );
+    trackPendingInstanceWrite(row.instanceId, next, persist);
+    return persist;
+  };
 
   const deleteProviderInstance = (id: ProviderInstanceId) => {
-    updateSettings({
-      providerInstances: withoutProviderInstanceKey(settings.providerInstances, id),
-      providerModelPreferences: withoutProviderInstanceKey(settings.providerModelPreferences, id),
-      favorites: withoutProviderInstanceFavorites(settings.favorites ?? [], id),
+    const { fresh, providerInstances } = composeProviderInstancesForWrite();
+    const persist = updateSettings({
+      providerInstances: withoutProviderInstanceKey(providerInstances, id),
+      providerModelPreferences: withoutProviderInstanceKey(fresh.providerModelPreferences, id),
+      favorites: withoutProviderInstanceFavorites(fresh.favorites ?? [], id),
     });
+    trackPendingInstanceWrite(id, null, persist);
   };
 
   const updateProviderModelPreferences = (
@@ -1967,7 +2035,10 @@ export function ProviderSettingsPanel() {
   ) => {
     const hiddenModels = [...new Set(next.hiddenModels.filter((slug) => slug.trim().length > 0))];
     const modelOrder = [...new Set(next.modelOrder.filter((slug) => slug.trim().length > 0))];
-    const rest = withoutProviderInstanceKey(settings.providerModelPreferences, instanceId);
+    const rest = withoutProviderInstanceKey(
+      appAtomRegistry.get(primaryServerSettingsAtom).providerModelPreferences,
+      instanceId,
+    );
     updateSettings({
       providerModelPreferences:
         hiddenModels.length === 0 && modelOrder.length === 0
@@ -1996,7 +2067,10 @@ export function ProviderSettingsPanel() {
     ];
     updateSettings({
       favorites: [
-        ...withoutProviderInstanceFavorites(settings.favorites ?? [], instanceId),
+        ...withoutProviderInstanceFavorites(
+          appAtomRegistry.get(primaryServerSettingsAtom).favorites ?? [],
+          instanceId,
+        ),
         ...favoriteModels.map((model) => ({ provider: instanceId, model })),
       ],
     });
@@ -2011,18 +2085,20 @@ export function ProviderSettingsPanel() {
     const defaultInstanceId = defaultInstanceIdForDriver(driverKind);
     const defaultLegacyProvider = defaultLegacyProviders[driverKind];
     if (defaultLegacyProvider === undefined) return;
-    updateSettings({
+    const { fresh, providerInstances } = composeProviderInstancesForWrite();
+    const persist = updateSettings({
       providers: {
-        ...settings.providers,
+        ...fresh.providers,
         [driverKind]: defaultLegacyProvider,
       } as typeof settings.providers,
-      providerInstances: withoutProviderInstanceKey(settings.providerInstances, defaultInstanceId),
+      providerInstances: withoutProviderInstanceKey(providerInstances, defaultInstanceId),
       providerModelPreferences: withoutProviderInstanceKey(
-        settings.providerModelPreferences,
+        fresh.providerModelPreferences,
         defaultInstanceId,
       ),
-      favorites: withoutProviderInstanceFavorites(settings.favorites ?? [], defaultInstanceId),
+      favorites: withoutProviderInstanceFavorites(fresh.favorites ?? [], defaultInstanceId),
     });
+    trackPendingInstanceWrite(defaultInstanceId, null, persist);
   };
 
   return (
