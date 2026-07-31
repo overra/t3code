@@ -47,16 +47,16 @@ Settings → Providers.
 
 ## Known limitations
 
-Deliberate trade-offs in the current implementation; each is an
-eventual-consistency or crash-window edge, not a policy bypass:
+Deliberate trade-offs in the current implementation:
 
 - **Instance deletion vs. a concurrent stale edit.** Per-instance writes
   are granular upserts merged under the server's settings lock, but an
   upsert carries no "must already exist" expectation: a device editing an
   instance that another device deleted moments earlier recreates it (with
-  its stored scope preserved when the write omits one, or scope-less if
-  the instance was recreated from a client that never saw a scope).
-  Closing this needs conditional create-vs-update mutations.
+  its stored scope preserved when the write omits one, or scope-less —
+  and therefore unrestricted — if the recreating client never saw a
+  scope). This one CAN briefly widen access after a delete; closing it
+  needs conditional create-vs-update mutations.
 - **Pre-capability clients cannot delete restricted instances.** Whole-map
   writes from older clients retain any restricted instance they omit (the
   alternative silently converts "restricted" into "unrestricted default").
@@ -64,11 +64,14 @@ eventual-consistency or crash-window edge, not a policy bypass:
 - **Task-creation retries after a lost acknowledgment.** A new-task
   bootstrap that succeeds but whose acknowledgment is lost cannot be
   replayed verbatim: the thread id is now occupied, so the retry surfaces
-  as a rejection with the content restored for resubmission rather than
-  deduplicating against the original. Worktree/branch cleanup after a
-  mid-bootstrap failure is best-effort, not transactional.
-- **Mobile offline queue.** A queued task rejected by policy is kept in
-  place marked **Failed** — visible, editable (saving re-queues it), and
-  deletable. A failed entry intentionally holds later messages queued
+  as a rejection rather than deduplicating against the original. The web
+  composer restores the content for resubmission; on mobile the queued
+  task stays in the outbox marked **Failed**, and editing it re-queues
+  under fresh identifiers. Worktree/branch cleanup after a mid-bootstrap
+  failure is best-effort, not transactional.
+- **Mobile offline queue.** A queued task or message rejected by policy is
+  kept in place marked **Failed** — visible with its failure reason,
+  editable (re-queued under fresh identifiers for creations), retryable,
+  and deletable. A failed entry intentionally holds later messages queued
   behind it in the same thread, since delivering around it would reorder
   the conversation.

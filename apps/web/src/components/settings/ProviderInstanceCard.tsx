@@ -350,7 +350,10 @@ interface ProviderInstanceCardProps {
    * project scope popover) can roll back on rejection; other callers ignore
    * the return value.
    */
-  readonly onUpdate: (nextInstance: ProviderInstanceConfig) => unknown;
+  readonly onUpdate: (
+    nextInstance: ProviderInstanceConfig,
+    options?: { readonly scopeWrite?: boolean },
+  ) => unknown;
   /**
    * Pass `undefined` to hide the delete button entirely. Built-in default
    * instance slots use `undefined` — they can't be deleted without losing
@@ -510,7 +513,9 @@ export function ProviderInstanceCard({
   };
 
   const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) =>
-    onUpdate(buildAllowedProjectsUpdate(instance, value));
+    // scopeWrite: this write's intent IS the scope — it must never be
+    // stripped, even when it matches the (possibly stale) streamed value.
+    onUpdate(buildAllowedProjectsUpdate(instance, value), { scopeWrite: true });
 
   const updateAccentColor = (value: string) => {
     const normalized = normalizeProviderAccentColor(value);

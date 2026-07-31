@@ -38,6 +38,9 @@ import Animated, {
 import { useThemeColor } from "../../lib/useThemeColor";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import { scopedThreadKey } from "../../lib/scopedEntities";
+import { isQueuedThreadMessageFailed } from "../../state/thread-outbox";
+import { useThreadOutboxMessages } from "../../state/use-thread-outbox";
+import { FailedQueuedMessages } from "./FailedQueuedMessages";
 
 import { AppText as Text } from "../../components/AppText";
 import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStrip";
@@ -287,6 +290,15 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
+  // Deterministically rejected queued messages hold this thread's queue and
+  // will never send on their own — they get a recovery card (edit / retry /
+  // delete) instead of being counted as "will send automatically".
+  const queuedByThreadKey = useThreadOutboxMessages();
+  const failedQueuedMessages = useMemo(() => {
+    const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
+    return (queuedByThreadKey[threadKey] ?? []).filter(isQueuedThreadMessageFailed);
+  }, [props.environmentId, props.selectedThread.id, queuedByThreadKey]);
+  const pendingQueueCount = props.queueCount - failedQueuedMessages.length;
   // A thread whose persisted selection the project's provider access rules
   // no longer admit must not send (or queue) — the server rejects the turn,
   // and a queued one would poison the outbox. The model menu only offers
@@ -956,12 +968,18 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           </Animated.View>
         ) : null}
 
+        {/* Failed queued messages need user resolution before the queue moves */}
+        <FailedQueuedMessages failedMessages={failedQueuedMessages} />
+
         {/* Queue count */}
-        {props.queueCount > 0 ? (
+        {pendingQueueCount > 0 ? (
           <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
             <Text className="pt-2 text-xs text-foreground-muted">
-              {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
-              automatically.
+              {`${pendingQueueCount} queued message${pendingQueueCount === 1 ? "" : "s"} will send ${
+                failedQueuedMessages.length > 0
+                  ? "once the failed message is resolved."
+                  : "automatically."
+              }`}
             </Text>
           </Animated.View>
         ) : null}

@@ -137,9 +137,9 @@ import {
   hasChangedBackgroundActivitySettings,
   isProjectGroupingEnabled,
   projectGroupingModeFromToggle,
+  omitInstanceScope,
   readLastEnabledProjectGroupingMode,
   rememberEnabledProjectGroupingMode,
-  stripUnchangedScope,
   resolveBackgroundActivityProfileOption,
 } from "./SettingsPanels.logic";
 import {
@@ -2036,14 +2036,22 @@ export function ProviderSettingsPanel() {
       readonly textGenerationModelSelection?: Parameters<
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
+      /** This write's PURPOSE is a scope change: send the key untouched. */
+      readonly scopeWrite?: boolean;
     },
   ) => {
     const withPendingEdit = trackPendingInstanceEdit(row.instanceId, next);
+    // Scope routing is by INTENT, not by comparing against the (possibly
+    // stale) streamed row: a scope-originated write always carries the key
+    // (explicit null included) — comparing against a lagging echo dropped
+    // the final write of a rapid A→B→A sequence — while every other edit
+    // omits it unconditionally so the server preserves the stored scope.
     const persist = updateSettings(
       buildProviderInstanceUpdatePatch(
         {
           instanceId: row.instanceId,
-          instance: supportsProviderScopes ? stripUnchangedScope(row.instance, next) : next,
+          instance:
+            supportsProviderScopes && options?.scopeWrite !== true ? omitInstanceScope(next) : next,
           driver: row.driver,
           isDefault: row.isDefault,
           textGenerationModelSelection: options?.textGenerationModelSelection,
@@ -2334,7 +2342,7 @@ export function ProviderSettingsPanel() {
                   [row.instanceId]: open,
                 }))
               }
-              onUpdate={(next) => {
+              onUpdate={(next, updateOptions) => {
                 const wasEnabled = row.instance.enabled ?? true;
                 const isDisabling = next.enabled === false && wasEnabled;
                 const shouldClearTextGen = isDisabling && textGenInstanceId === row.instanceId;
@@ -2342,9 +2350,14 @@ export function ProviderSettingsPanel() {
                   return updateProviderInstance(row, next, {
                     textGenerationModelSelection:
                       DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+                    ...(updateOptions?.scopeWrite ? { scopeWrite: true } : {}),
                   });
                 }
-                return updateProviderInstance(row, next);
+                return updateProviderInstance(
+                  row,
+                  next,
+                  updateOptions?.scopeWrite ? { scopeWrite: true } : undefined,
+                );
               }}
               onDelete={row.isDefault ? undefined : () => deleteProviderInstance(row.instanceId)}
               headerAction={headerAction}

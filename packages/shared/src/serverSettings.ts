@@ -166,7 +166,10 @@ export function applyProviderInstancesPatch(
     if (value === null) {
       delete next[instanceId];
     } else {
-      next[instanceId] = withPreservedInstanceScope(current[instanceId], value);
+      next[instanceId] = withPreservedInstanceScope(
+        Object.hasOwn(current, instanceId) ? current[instanceId] : undefined,
+        value,
+      );
     }
   }
   return next;
@@ -201,7 +204,12 @@ export function replaceProviderInstancesPreservingScopes(
     ]
   >) {
     next[instanceId] =
-      value === undefined ? value : withPreservedInstanceScope(current[instanceId], value);
+      value === undefined
+        ? value
+        : withPreservedInstanceScope(
+            Object.hasOwn(current, instanceId) ? current[instanceId] : undefined,
+            value,
+          );
   }
   for (const [instanceId, value] of Object.entries(current) as Array<
     [
@@ -209,7 +217,10 @@ export function replaceProviderInstancesPreservingScopes(
       ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]],
     ]
   >) {
-    if (instanceId in next || value === undefined) continue;
+    // Object.hasOwn, not `in`: instance ids are user-chosen strings, and a
+    // prototype-named id ("constructor", "toString") would match inherited
+    // properties and skip retention.
+    if (Object.hasOwn(next, instanceId) || value === undefined) continue;
     // `allowedProjects: null` means "all projects" — deleting such an entry
     // cannot widen access, so legacy deletes of it still go through.
     if (value.allowedProjects != null) {

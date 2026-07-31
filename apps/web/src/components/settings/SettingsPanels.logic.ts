@@ -160,26 +160,15 @@ export function formatDiagnosticsDescription(input: {
 /**
  * Access scope is SECURITY POLICY with its own write channel: an instance
  * value that does not explicitly carry `allowedProjects` leaves the stored
- * scope untouched server-side. Stripping the key from writes whose scope is
- * UNCHANGED means a name/enabled/config edit composed from a stale render
- * can never write an outdated scope back — while a genuine change (an
- * explicit `null` clearing to "all projects" included) keeps the key and
- * reaches the server.
+ * scope untouched server-side. Every NON-scope edit therefore omits the key
+ * unconditionally — deciding by comparison against the streamed row would
+ * race its echo lag (a rapid A→B→A sequence's final write looks "unchanged"
+ * against the stale row and gets dropped). Scope-originated writes bypass
+ * this entirely and always carry the key, explicit `null` included.
  */
-export function stripUnchangedScope(
-  current: ProviderInstanceConfig,
-  next: ProviderInstanceConfig,
-): ProviderInstanceConfig {
+export function omitInstanceScope(next: ProviderInstanceConfig): ProviderInstanceConfig {
   if (!("allowedProjects" in next)) return next;
-  const currentScope = current.allowedProjects ?? null;
-  const nextScope = next.allowedProjects ?? null;
-  const unchanged =
-    currentScope === null || nextScope === null
-      ? currentScope === nextScope
-      : currentScope.length === nextScope.length &&
-        nextScope.every((id) => currentScope.includes(id));
-  if (!unchanged) return next;
-  const { allowedProjects: _unchangedScope, ...rest } = next;
+  const { allowedProjects: _scope, ...rest } = next;
   return rest;
 }
 

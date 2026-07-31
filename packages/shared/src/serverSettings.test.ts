@@ -350,6 +350,28 @@ describe("serverSettings helpers", () => {
     expect(next[openId]).toBeUndefined();
   });
 
+  it("retains restricted instances with prototype-named ids", () => {
+    // Instance ids are user-chosen strings: "constructor" must behave like
+    // any other id, not match Object.prototype via `in`/property reads.
+    const protoId = ProviderInstanceId.make("constructor");
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [protoId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: [ProjectId.make("project-work")],
+        },
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      providerInstances: {},
+    }).providerInstances;
+    expect(Object.hasOwn(next, protoId)).toBe(true);
+    expect(next[protoId]).toEqual(current.providerInstances[protoId]);
+  });
+
   it("replaces providerInstances maps so omitted instance fields are cleared", () => {
     const codexId = ProviderInstanceId.make("codex");
     const current = {

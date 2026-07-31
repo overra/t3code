@@ -39,11 +39,15 @@ import {
 } from "../../state/use-composer-drafts";
 import { useBranches } from "../../state/queries";
 import {
+  enqueueThreadOutboxMessage,
   flattenQueuedThreadMessages,
+  isQueuedThreadMessageFailed,
+  removeThreadOutboxMessage,
   threadOutboxManager,
   updateThreadOutboxMessage,
   type QueuedThreadMessage,
 } from "../../state/thread-outbox";
+import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import {
   holdEditingQueuedMessage,
   releaseEditingQueuedMessage,
@@ -801,12 +805,25 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         activeEditingMessageId = null;
       }
 
-      const message = buildPendingTaskMessage({
-        threadId: editing.threadId,
-        commandId: editing.commandId,
-        messageId: editing.messageId,
-        createdAt: editing.createdAt,
-      });
+      // A FAILED creation's identifiers are burned: its bootstrap may have
+      // failed after creating the thread, whose (soft-deleted) id stays
+      // occupied forever — requeuing under the same ids would be rejected
+      // on every retry. Requeue it as a NEW entry with fresh turn metadata,
+      // then retire the failed record.
+      const storedEntry = flattenQueuedThreadMessages(
+        appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+      ).find((candidate) => candidate.messageId === editing.messageId);
+      const requeueAsFresh = storedEntry !== undefined && isQueuedThreadMessageFailed(storedEntry);
+      const message = buildPendingTaskMessage(
+        requeueAsFresh
+          ? makeTurnCommandMetadata()
+          : {
+              threadId: editing.threadId,
+              commandId: editing.commandId,
+              messageId: editing.messageId,
+              createdAt: editing.createdAt,
+            },
+      );
 
       if (!message) {
         // The edits are currently unsendable (e.g. the prompt was cleared).
@@ -817,8 +834,18 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
 
       // update() rewrites the task only if it is still queued — a concurrent
-      // delete or delivery wins, so the flush cannot resurrect it.
-      void updateThreadOutboxMessage(message)
+      // delete or delivery wins, so the flush cannot resurrect it. The
+      // fresh-id requeue enqueues the new entry FIRST and only then removes
+      // the failed original: a crash between the two shows a duplicate the
+      // user can delete, never lost content.
+      const persistEdits: Promise<unknown> = requeueAsFresh
+        ? enqueueThreadOutboxMessage(message).then(() =>
+            removeThreadOutboxMessage(storedEntry).catch((error) => {
+              console.warn("[new-task] failed to retire failed task after fresh requeue", error);
+            }),
+          )
+        : updateThreadOutboxMessage(message);
+      void persistEdits
         .then(() => {
           // If this task was reopened (possibly in a fresh provider) while
           // the save was in flight, that session owns the draft and the lock.

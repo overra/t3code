@@ -45,7 +45,11 @@ import {
 import { useProjects } from "../../state/entities";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
-import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "../../state/thread-outbox";
+import {
+  enqueueThreadOutboxMessage,
+  isQueuedThreadMessageFailed,
+  removeThreadOutboxMessage,
+} from "../../state/thread-outbox";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { branchBadgeLabel, useNewTaskFlow } from "./new-task-flow-provider";
 import { useCreateProjectThread } from "./use-project-actions";
@@ -824,19 +828,26 @@ export function NewTaskDraftScreen(props: {
     }
 
     const editingPendingTask = flow.editingPendingTask;
+    // A FAILED task's identifiers are burned (its bootstrap may have created
+    // the thread before failing, and that soft-deleted id stays occupied
+    // forever). Resubmitting it always mints fresh turn metadata; the failed
+    // record is retired after the fresh submission lands.
+    const editingFailed =
+      editingPendingTask !== null && isQueuedThreadMessageFailed(editingPendingTask);
 
     if (!environmentConnected) {
       // Offline: park the task in the outbox; the drain sends it when the
       // environment reconnects. Editing an existing pending task re-queues it
-      // under its original identifiers.
-      const metadata = editingPendingTask
-        ? {
-            threadId: editingPendingTask.threadId,
-            commandId: editingPendingTask.commandId,
-            messageId: editingPendingTask.messageId,
-            createdAt: editingPendingTask.createdAt,
-          }
-        : makeTurnCommandMetadata();
+      // under its original identifiers — unless it failed (fresh ids above).
+      const metadata =
+        editingPendingTask && !editingFailed
+          ? {
+              threadId: editingPendingTask.threadId,
+              commandId: editingPendingTask.commandId,
+              messageId: editingPendingTask.messageId,
+              createdAt: editingPendingTask.createdAt,
+            }
+          : makeTurnCommandMetadata();
       const message = flow.buildPendingTaskMessage(metadata);
       if (!message) {
         return;
@@ -854,6 +865,14 @@ export function NewTaskDraftScreen(props: {
         flow.setSubmitting(false);
       }
       if (editingPendingTask) {
+        if (editingFailed) {
+          // Enqueued under NEW ids; retire the failed original.
+          try {
+            await removeThreadOutboxMessage(editingPendingTask);
+          } catch (error) {
+            console.warn("[new-task] failed to retire failed task after fresh requeue", error);
+          }
+        }
         flow.finishEditingPendingTask();
       } else {
         clearComposerDraftContent(draftKey);
@@ -882,7 +901,9 @@ export function NewTaskDraftScreen(props: {
       interactionMode,
       initialMessageText,
       initialAttachments: draft.attachments,
-      ...(editingPendingTask
+      // A failed task's original identifiers are never reused (see above);
+      // omitting turnMetadata lets the creation mint fresh ones.
+      ...(editingPendingTask && !editingFailed
         ? {
             turnMetadata: {
               threadId: editingPendingTask.threadId,

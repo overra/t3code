@@ -323,6 +323,99 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("rolls chained failed re-enqueues back to the durable baseline", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failWrites = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (failWrites) throw new Error("disk full");
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // Both replacements fail durably. The rollback target is the COMMITTED
+    // baseline, not the previous optimistic entry — restoring optimistic B
+    // (whose own write failed) would leave the atom showing content disk
+    // never accepted.
+    failWrites = true;
+    const second = manager.enqueue({ ...original, text: "replacement-b" }).catch((error) => error);
+    const third = manager.enqueue({ ...original, text: "replacement-c" }).catch((error) => error);
+    expect(await second).toBeInstanceOf(ThreadOutboxManagerError);
+    expect(await third).toBeInstanceOf(ThreadOutboxManagerError);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toBe(original);
+    expect(stored.get(original.messageId)?.text).toBe("message-1");
+    registry.dispose();
+  });
+
+  it("keeps atom and disk aligned when a failure mark races an optimistic re-enqueue", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let gate: Promise<void> | null = null;
+    let releaseGate!: () => void;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (gate !== null) {
+          const pending = gate;
+          gate = null;
+          await pending;
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // The failure marker's write blocks while an optimistic re-enqueue of
+    // the same id lands. The resubmission postdates the failure, so BOTH
+    // stores must end unfailed with the resubmitted content — never atom
+    // "failed A" over disk "unfailed B".
+    gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const marking = manager.markFailed(original.messageId, {
+      failedAt: "2026-06-08T10:00:05.000Z",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const enqueueing = manager.enqueue({ ...original, text: "resubmitted" });
+    releaseGate();
+    await Promise.all([marking, enqueueing]);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toBe("resubmitted");
+    expect(messages[0]?.failedAt).toBeUndefined();
+    expect(stored.get(original.messageId)?.text).toBe("resubmitted");
+    expect(stored.get(original.messageId)?.failedAt).toBeUndefined();
+    registry.dispose();
+  });
+
   it("reports structured load failures and permits a retry", async () => {
     const registry = AtomRegistry.make();
     const loadCause = new Error("storage unavailable");

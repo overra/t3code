@@ -49,6 +49,13 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     });
   let loadPromise: Promise<void> | null = null;
   let mutationQueue: Promise<void> = Promise.resolve();
+  // Last DURABLY COMMITTED entry per id — maintained inside the serialized
+  // mutation queue. The queued atom may briefly run ahead of it (enqueue
+  // publishes optimistically), so this map — never the atom — is the
+  // baseline that failed writes roll back to and that awaited publications
+  // are validated against. Without it, chained/interleaved mutations can
+  // leave the atom and disk permanently divergent.
+  const committedById = new Map<MessageId, QueuedThreadMessage>();
 
   const serialize = <A>(mutation: () => Promise<A>): Promise<A> => {
     const result = mutationQueue.then(mutation, mutation);
@@ -72,6 +79,9 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     }
     loadPromise = serialize(async () => {
       const persistedMessages = await options.storage.load();
+      for (const message of persistedMessages) {
+        committedById.set(message.messageId, message);
+      }
       setMessages([...persistedMessages, ...currentMessages()]);
     }).catch((cause) => {
       loadPromise = null;
@@ -120,16 +130,18 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     return serialize(async () => {
       try {
         await options.storage.write(merged);
+        committedById.set(merged.messageId, merged);
       } catch (cause) {
         // Roll back by reference, not messageId: a retry enqueue with the same
         // id may have optimistically replaced this attempt while the write was
         // in flight, and its entry must survive this attempt's failure. When
-        // this attempt is still the live entry, the one it displaced comes
-        // back — the failed write left it durably stored, and dropping it
-        // from memory would strand disk and atom divergent until reload.
+        // this attempt is still the live entry, what comes back is the last
+        // DURABLY COMMITTED entry — not the optimistic one it displaced,
+        // whose own write may also have failed. Disk and atom stay aligned.
+        const committed = committedById.get(merged.messageId);
         setMessages(
           currentMessages().flatMap((candidate) =>
-            candidate === merged ? (displaced !== undefined ? [displaced] : []) : [candidate],
+            candidate === merged ? (committed !== undefined ? [committed] : []) : [candidate],
           ),
         );
         throw new ThreadOutboxManagerError({
@@ -164,6 +176,14 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (existing === undefined) {
         return false;
       }
+      // An entry that differs from the committed baseline is an OPTIMISTIC
+      // resubmission whose durable write is still queued behind this op —
+      // that write owns the final disk and atom state for this id. Writing
+      // or publishing over it would leave disk and atom divergent; report
+      // "not updated" so the caller keeps its draft.
+      if (committedById.get(message.messageId) !== existing) {
+        return false;
+      }
       const merged = withPreservedRestoredMarker(message, existing);
       try {
         await options.storage.write(merged);
@@ -175,6 +195,16 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           messageId: message.messageId,
           cause,
         });
+      }
+      committedById.set(merged.messageId, merged);
+      // An optimistic enqueue may also have replaced this id DURING the
+      // awaited write. Its serialized write runs after this one, so it owns
+      // the outcome; republishing the pre-await merge would stomp it.
+      const successor = currentMessages().find(
+        (candidate) => candidate.messageId === message.messageId,
+      );
+      if (successor !== existing) {
+        return true;
       }
       setMessages([
         ...currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
@@ -196,6 +226,13 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (existing === undefined) {
         return "missing";
       }
+      // The current entry is an optimistic resubmission whose durable write
+      // is still queued behind this op: the failure being reported belongs
+      // to the attempt that resubmission superseded. Marking it would strand
+      // the atom failed while the pending write leaves disk unfailed.
+      if (committedById.get(messageId) !== existing) {
+        return "marked";
+      }
       const merged: QueuedThreadMessage = { ...existing, ...markers };
       try {
         await options.storage.write(merged);
@@ -208,6 +245,13 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           cause,
         });
       }
+      committedById.set(messageId, merged);
+      // Superseded by an optimistic re-enqueue mid-await: its write follows
+      // and legitimately clears the markers — do not stomp it in the atom.
+      const successor = currentMessages().find((candidate) => candidate.messageId === messageId);
+      if (successor !== existing) {
+        return "marked";
+      }
       setMessages([
         ...currentMessages().filter((candidate) => candidate.messageId !== messageId),
         merged,
@@ -217,6 +261,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
 
   const remove = (message: QueuedThreadMessage): Promise<void> =>
     serialize(async () => {
+      const committedAtStart = committedById.get(message.messageId);
+      const existing = currentMessages().find(
+        (candidate) => candidate.messageId === message.messageId,
+      );
       try {
         await options.storage.remove(message);
       } catch (cause) {
@@ -228,9 +276,13 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           cause,
         });
       }
-      setMessages(
-        currentMessages().filter((candidate) => candidate.messageId !== message.messageId),
-      );
+      committedById.delete(message.messageId);
+      // Drop the entry from the atom only when it is the committed one this
+      // removal targeted. An optimistic resubmission (whose serialized write
+      // follows and re-creates the id on disk) stays published.
+      if (existing !== undefined && existing === committedAtStart) {
+        setMessages(currentMessages().filter((candidate) => candidate !== existing));
+      }
     });
 
   const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
@@ -260,6 +312,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
             try {
               await options.storage.remove(message);
               removedMessageIds.add(message.messageId);
+              committedById.delete(message.messageId);
             } catch (cause) {
               warn(
                 "[thread-outbox] failed to clear persisted message",
