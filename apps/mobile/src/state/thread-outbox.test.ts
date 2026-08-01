@@ -15,6 +15,7 @@ import {
   flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   isQueuedThreadCreationSendable,
+  isQueuedThreadMessagePendingCleanup,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
@@ -442,6 +443,57 @@ describe("thread outbox", () => {
     expect(stored.has(doomed.messageId)).toBe(false);
     expect(stored.has(sibling.messageId)).toBe(true);
     registry.dispose();
+  });
+
+  it("keeps a durable cleanup intent when a deleted thread's removal fails", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failRemoval = true;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        if (failRemoval) throw new Error("remove failed");
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+    await manager.markFailed(doomed.messageId, { failedAt: "2026-06-08T10:00:02.000Z" });
+
+    // The removal fails, but the intent was written first: the entry stays
+    // MARKED in both stores rather than silently stranded, so the drain can
+    // resume the deletion — including after a restart.
+    await manager.clearThread(doomed.environmentId, doomed.threadId);
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const marked = flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom));
+    expect(marked).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(marked[0]!)).toBe(true);
+
+    // A fresh process reloads the marked entry and resumes the removal.
+    registry.dispose();
+    const registry2 = AtomRegistry.make();
+    const manager2 = createThreadOutboxManager({ registry: registry2, storage });
+    await manager2.load();
+    const reloaded = flattenQueuedThreadMessages(
+      registry2.get(manager2.queuedMessagesByThreadKeyAtom),
+    );
+    expect(isQueuedThreadMessagePendingCleanup(reloaded[0]!)).toBe(true);
+
+    failRemoval = false;
+    await manager2.remove(reloaded[0]!);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry2.get(manager2.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry2.dispose();
   });
 
   it("installs the persisted rollback baseline for an enqueue racing load", async () => {

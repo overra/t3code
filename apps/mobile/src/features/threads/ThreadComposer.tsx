@@ -38,7 +38,10 @@ import Animated, {
 import { useThemeColor } from "../../lib/useThemeColor";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import { scopedThreadKey } from "../../lib/scopedEntities";
-import { isQueuedThreadMessageFailed } from "../../state/thread-outbox";
+import {
+  isQueuedThreadMessageFailed,
+  isQueuedThreadMessagePendingCleanup,
+} from "../../state/thread-outbox";
 import { useThreadOutboxMessages } from "../../state/use-thread-outbox";
 import { FailedQueuedMessages } from "./FailedQueuedMessages";
 
@@ -296,7 +299,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const queuedByThreadKey = useThreadOutboxMessages();
   const failedQueuedMessages = useMemo(() => {
     const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
-    return (queuedByThreadKey[threadKey] ?? []).filter(isQueuedThreadMessageFailed);
+    return (queuedByThreadKey[threadKey] ?? []).filter(
+      (message) =>
+        isQueuedThreadMessageFailed(message) && !isQueuedThreadMessagePendingCleanup(message),
+    );
   }, [props.environmentId, props.selectedThread.id, queuedByThreadKey]);
   const pendingQueueCount = props.queueCount - failedQueuedMessages.length;
   // A thread whose persisted selection the project's provider access rules

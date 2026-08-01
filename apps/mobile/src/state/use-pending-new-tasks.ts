@@ -4,6 +4,7 @@ import { deriveThreadTitleFromPrompt } from "../lib/projectThreadStartTurn";
 import {
   flattenQueuedThreadMessages,
   isQueuedThreadMessageFailed,
+  isQueuedThreadMessagePendingCleanup,
   type QueuedThreadCreation,
   type QueuedThreadMessage,
 } from "./thread-outbox-model";
@@ -29,10 +30,11 @@ export function usePendingNewTasks(): ReadonlyArray<PendingNewTask> {
       if (!message.creation) {
         continue;
       }
-      // Hide only entries the LEGACY recovery machine already restored into
-      // a composer draft (removal is imminent; showing them would present
-      // the same content twice). Failed entries stay visible and editable.
-      if (message.restoredAt !== undefined) {
+      // Hide entries the LEGACY recovery machine already restored into a
+      // composer draft (removal is imminent; showing them would present the
+      // same content twice), and entries awaiting deleted-thread cleanup.
+      // Failed entries stay visible and editable.
+      if (message.restoredAt !== undefined || isQueuedThreadMessagePendingCleanup(message)) {
         continue;
       }
       tasks.push({

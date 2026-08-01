@@ -58,6 +58,11 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   // cross-store draft-restore handoff.
   failedAt: Schema.optional(IsoDateTime),
   failureReason: Schema.optional(Schema.String),
+  // Durable cleanup INTENT, written before removing an explicitly deleted
+  // thread's entries. It survives a failed removal (and a restart), so the
+  // drain can resume the deletion — without it, one failed file removal
+  // would strand the entry forever, since its thread has no UI left.
+  threadDeletedAt: Schema.optional(IsoDateTime),
   // LEGACY (schema v3 recovery phase machine, since removed) — retained so
   // stored entries decode. `restoredAt` means the old version durably
   // restored the content into a composer draft: only removal remains. A bare
@@ -96,6 +101,7 @@ export interface QueuedThreadMessage {
   /** See the failure/legacy-recovery markers on `QueuedThreadMessageSchema`. */
   readonly failedAt?: string;
   readonly failureReason?: string;
+  readonly threadDeletedAt?: string;
   readonly recoveryStartedAt?: string;
   readonly restoredAt?: string;
 }
@@ -116,6 +122,15 @@ export interface ThreadOutboxFailureMarkers {
 export function isQueuedThreadMessageFailed(message: QueuedThreadMessage): boolean {
   if (message.failedAt !== undefined) return true;
   return message.recoveryStartedAt !== undefined && message.restoredAt === undefined;
+}
+
+/**
+ * Its thread was explicitly deleted and removal is owed: the entry is
+ * hidden from every surface and the drain retries its removal (resuming
+ * across restarts) until the storage delete finally succeeds.
+ */
+export function isQueuedThreadMessagePendingCleanup(message: QueuedThreadMessage): boolean {
+  return message.threadDeletedAt !== undefined;
 }
 
 export interface ThreadSettingsSnapshot {

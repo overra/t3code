@@ -30,6 +30,7 @@ import {
 import {
   isQueuedThreadCreationSendable,
   isQueuedThreadMessageFailed,
+  isQueuedThreadMessagePendingCleanup,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
@@ -362,6 +363,48 @@ export function useThreadOutboxDrain(): void {
       }
       if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
         continue;
+      }
+      // A durable cleanup intent outranks everything else: the thread was
+      // explicitly deleted and only the storage removal is still owed. This
+      // resumes a removal that failed earlier (or before a restart); the
+      // entry is hidden from every surface until it lands.
+      if (isQueuedThreadMessagePendingCleanup(nextQueuedMessage)) {
+        beginDispatchingQueuedMessage(nextQueuedMessage.messageId);
+        void removeThreadOutboxMessage(nextQueuedMessage)
+          .then(
+            () => {
+              retryAttemptRef.current.delete(nextQueuedMessage.messageId);
+              retryNotBeforeRef.current.delete(nextQueuedMessage.messageId);
+            },
+            (error) => {
+              console.warn("[thread-outbox] failed to resume deleted-thread cleanup", {
+                environmentId: nextQueuedMessage.environmentId,
+                threadId: nextQueuedMessage.threadId,
+                messageId: nextQueuedMessage.messageId,
+                error,
+              });
+              const retryAttempt =
+                (retryAttemptRef.current.get(nextQueuedMessage.messageId) ?? 0) + 1;
+              retryAttemptRef.current.set(nextQueuedMessage.messageId, retryAttempt);
+              const retryDelayMs = threadOutboxRetryDelayMs(retryAttempt);
+              retryNotBeforeRef.current.set(nextQueuedMessage.messageId, Date.now() + retryDelayMs);
+              const pendingTimer = retryTimersRef.current.get(nextQueuedMessage.messageId);
+              if (pendingTimer !== undefined) {
+                clearTimeout(pendingTimer);
+              }
+              retryTimersRef.current.set(
+                nextQueuedMessage.messageId,
+                setTimeout(() => {
+                  retryTimersRef.current.delete(nextQueuedMessage.messageId);
+                  setRetryTick((current) => current + 1);
+                }, retryDelayMs),
+              );
+            },
+          )
+          .finally(() => {
+            finishDispatchingQueuedMessage(nextQueuedMessage.messageId);
+          });
+        return;
       }
 
       const thread = findThread(threads, nextQueuedMessage);

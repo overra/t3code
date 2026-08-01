@@ -3,6 +3,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   type EnvironmentId,
+  getInstanceKeyedEntry,
   ModelSelection,
   ProjectId,
   ProviderInstanceId,
@@ -1000,10 +1001,12 @@ export function deriveEffectiveComposerModelState(input: {
   // `ProviderDriverKind` literal is a valid `ProviderInstanceId` slug, so the
   // cast to the branded type is safe.
   const instanceSelection = input.selectedInstanceId
-    ? input.draft?.modelSelectionByProvider?.[input.selectedInstanceId]
+    ? getInstanceKeyedEntry(input.draft?.modelSelectionByProvider, input.selectedInstanceId)
     : undefined;
-  const legacySelection =
-    input.draft?.modelSelectionByProvider?.[ProviderInstanceId.make(input.selectedProvider)];
+  const legacySelection = getInstanceKeyedEntry(
+    input.draft?.modelSelectionByProvider,
+    input.selectedProvider,
+  );
   const activeSelection = instanceSelection ?? legacySelection;
   const activeSelectionInstanceId = instanceSelection
     ? (input.selectedInstanceId ?? ProviderInstanceId.make(input.selectedProvider))
@@ -2721,7 +2724,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
 
             // Update the map entry for this provider
             const nextMap = { ...base.modelSelectionByProvider };
-            const currentForProvider = nextMap[instanceKey];
+            const currentForProvider = getInstanceKeyedEntry(nextMap, instanceKey);
             if (providerOpts) {
               nextMap[instanceKey] = createModelSelection(
                 instanceKey,
@@ -2739,8 +2742,8 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             if (options?.persistSticky === true) {
               nextStickyMap = { ...state.stickyModelSelectionByProvider };
               const stickyBase =
-                nextStickyMap[instanceKey] ??
-                base.modelSelectionByProvider[instanceKey] ??
+                getInstanceKeyedEntry(nextStickyMap, instanceKey) ??
+                getInstanceKeyedEntry(base.modelSelectionByProvider, instanceKey) ??
                 createModelSelection(instanceKey, fallbackModel);
               if (providerOpts) {
                 nextStickyMap[instanceKey] = createModelSelection(

@@ -301,14 +301,41 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // included) for a thread the user just DELETED. This is the only path
   // that resolves failed entries without user action on the entry itself —
   // the deletion is the lifecycle evidence the drain deliberately lacks.
+  //
+  // Each entry is first marked with a DURABLE cleanup intent, then removed.
+  // The intent is what makes a failed removal recoverable: the entry stays
+  // marked on disk, hidden from every surface, and the drain retries the
+  // removal (across restarts) until it succeeds. Without it, one failed
+  // file delete would strand the entry forever — its thread is gone, so no
+  // UI could ever reach it.
   const clearThread = (environmentId: EnvironmentId, threadId: ThreadId): Promise<void> =>
     serialize(async () => {
       const targets = currentMessages().filter(
         (message) => message.environmentId === environmentId && message.threadId === threadId,
       );
+      const threadDeletedAt = new Date().toISOString();
       const removedMessageIds = new Set<MessageId>();
+      const markedById = new Map<MessageId, QueuedThreadMessage>();
       await Promise.all(
         targets.map(async (message) => {
+          const marked: QueuedThreadMessage = { ...message, threadDeletedAt };
+          try {
+            await options.storage.write(marked);
+            committedById.set(message.messageId, marked);
+            markedById.set(message.messageId, marked);
+          } catch (cause) {
+            // Intent not durable; still attempt the removal below, and warn.
+            warn(
+              "[thread-outbox] failed to record deleted-thread cleanup intent",
+              new ThreadOutboxManagerError({
+                operation: "update",
+                environmentId: message.environmentId,
+                threadId: message.threadId,
+                messageId: message.messageId,
+                cause,
+              }),
+            );
+          }
           try {
             await options.storage.remove(message);
             removedMessageIds.add(message.messageId);
@@ -327,7 +354,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           }
         }),
       );
-      setMessages(currentMessages().filter((message) => !removedMessageIds.has(message.messageId)));
+      setMessages(
+        currentMessages().flatMap((message) => {
+          if (removedMessageIds.has(message.messageId)) return [];
+          const marked = markedById.get(message.messageId);
+          // Removal failed but the intent is durable: keep the MARKED entry
+          // so the drain resumes its removal.
+          return marked !== undefined && message.messageId === marked.messageId
+            ? [marked]
+            : [message];
+        }),
+      );
     });
 
   const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
