@@ -477,6 +477,22 @@ describe("thread outbox", () => {
     expect(marked).toHaveLength(1);
     expect(isQueuedThreadMessagePendingCleanup(marked[0]!)).toBe(true);
 
+    // `threadDeletedAt` is TERMINAL. A trailing editor flush is refused
+    // outright, and a same-id requeue cannot un-delete the thread: the
+    // marker survives in both stores, so the entry stays hidden and on the
+    // cleanup path instead of becoming dispatchable again.
+    expect(await manager.update({ ...doomed, text: "trailing editor flush" })).toBe(false);
+    expect(stored.get(doomed.messageId)?.text).toBe("message-1");
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+
+    await manager.enqueue({ ...doomed, text: "same-id requeue" });
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const afterRequeue = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(afterRequeue).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(afterRequeue[0]!)).toBe(true);
+
     // A fresh process reloads the marked entry and resumes the removal.
     registry.dispose();
     const registry2 = AtomRegistry.make();

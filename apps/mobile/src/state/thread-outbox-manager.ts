@@ -113,17 +113,31 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
 
   // Returns `message` by IDENTITY when nothing needs preserving: enqueue's
   // rollback and confirmQueued compare by reference, and wrapping every
-  // message in a copy would break both. Only the LEGACY `restoredAt` marker
-  // is monotonic (its content already lives in a composer draft; the entry
-  // must never redeliver). Failure markers are deliberately NOT preserved:
-  // an editor save or a re-enqueue of the same id is an explicit requeue.
-  const withPreservedRestoredMarker = (
+  // message in a copy would break both.
+  //
+  // TERMINAL markers are monotonic — no content write may clear them:
+  //   - `threadDeletedAt`: the thread is gone and only the storage removal
+  //     is owed. A same-id requeue cannot un-delete it; dropping the marker
+  //     would make deleted content dispatchable again and cancel restart
+  //     cleanup.
+  //   - `restoredAt` (legacy): the content already lives in a composer
+  //     draft, so the entry must never redeliver.
+  // FAILURE markers are deliberately NOT preserved: an editor save or a
+  // re-enqueue of the same id is an explicit requeue.
+  const withPreservedTerminalMarkers = (
     message: QueuedThreadMessage,
     existing: QueuedThreadMessage | undefined,
   ): QueuedThreadMessage => {
     if (existing === undefined) return message;
-    if (message.restoredAt !== undefined || existing.restoredAt === undefined) return message;
-    return { ...message, restoredAt: existing.restoredAt };
+    const preserveRestored = message.restoredAt === undefined && existing.restoredAt !== undefined;
+    const preserveThreadDeleted =
+      message.threadDeletedAt === undefined && existing.threadDeletedAt !== undefined;
+    if (!preserveRestored && !preserveThreadDeleted) return message;
+    return {
+      ...message,
+      ...(preserveRestored ? { restoredAt: existing.restoredAt } : {}),
+      ...(preserveThreadDeleted ? { threadDeletedAt: existing.threadDeletedAt } : {}),
+    };
   };
 
   // The queued atom drives the composer's immediate "queued" feedback, so it
@@ -134,7 +148,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     const displaced = currentMessages().find(
       (candidate) => candidate.messageId === message.messageId,
     );
-    const merged = withPreservedRestoredMarker(message, displaced);
+    const merged = withPreservedTerminalMarkers(message, displaced);
     setMessages([
       ...currentMessages().filter((candidate) => candidate.messageId !== merged.messageId),
       merged,
@@ -177,15 +191,21 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
   // Rewrites an already-queued message. A no-op when the message has been
   // removed in the meantime (e.g. deleted or delivered), so a trailing editor
   // flush can never resurrect it. An update CLEARS failure markers — saving
-  // an edit is the explicit requeue gesture for a failed entry — while the
-  // legacy `restoredAt` marker stays monotonic. Returns whether the message
-  // was updated.
+  // an edit is the explicit requeue gesture for a failed entry — while
+  // terminal markers stay monotonic. Returns whether the message was
+  // updated.
   const update = (message: QueuedThreadMessage): Promise<boolean> =>
     serialize(async () => {
       const existing = currentMessages().find(
         (candidate) => candidate.messageId === message.messageId,
       );
       if (existing === undefined) {
+        return false;
+      }
+      // Its thread was deleted and only the removal is owed: treat this
+      // exactly like an already-removed entry so a trailing editor flush
+      // cannot write content back into a doomed record.
+      if (existing.threadDeletedAt !== undefined) {
         return false;
       }
       // An entry that differs from the committed baseline is an OPTIMISTIC
@@ -196,7 +216,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (committedById.get(message.messageId) !== existing) {
         return false;
       }
-      const merged = withPreservedRestoredMarker(message, existing);
+      const merged = withPreservedTerminalMarkers(message, existing);
       try {
         await options.storage.write(merged);
       } catch (cause) {
