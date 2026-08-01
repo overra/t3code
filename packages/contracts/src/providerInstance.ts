@@ -146,20 +146,29 @@ export const ProviderInstanceConfig = Schema.Struct({
 export type ProviderInstanceConfig = typeof ProviderInstanceConfig.Type;
 
 /**
- * Prototype-safe read of an instance envelope. Instance ids are user-chosen
- * strings, so a bare indexed read of a prototype-named id ("constructor",
- * "toString") would match inherited Object properties and make a nonexistent
- * instance look configured — enabled and unrestricted. Every dynamic-key
- * read of a provider-instances map must go through this accessor.
+ * Prototype-safe read of ANY record keyed by user-chosen instance ids. A
+ * bare indexed read of a prototype-named id ("constructor", "toString")
+ * matches inherited Object properties — making a nonexistent instance look
+ * configured, a pending-edit map return a function, or a preference lookup
+ * yield garbage. Every dynamic-key read of an instance-keyed record must go
+ * through this accessor (or `getProviderInstanceConfig` for config maps).
  */
+export function getInstanceKeyedEntry<Value>(
+  record: Readonly<Record<string, Value>> | undefined,
+  instanceId: string,
+): Value | undefined {
+  if (record === undefined || !Object.hasOwn(record, instanceId)) {
+    return undefined;
+  }
+  return record[instanceId];
+}
+
+/** Prototype-safe read of an instance envelope; see `getInstanceKeyedEntry`. */
 export function getProviderInstanceConfig(
   providerInstances: ProviderInstanceConfigMap | undefined,
   instanceId: string,
 ): ProviderInstanceConfig | undefined {
-  if (providerInstances === undefined || !Object.hasOwn(providerInstances, instanceId)) {
-    return undefined;
-  }
-  return providerInstances[instanceId as ProviderInstanceId];
+  return getInstanceKeyedEntry(providerInstances, instanceId);
 }
 
 /**

@@ -403,6 +403,97 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("clears exactly one deleted thread's entries, failed ones included", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const sibling = queuedMessage({
+      threadId: "thread-kept",
+      messageId: "message-2",
+      createdAt: "2026-06-08T10:00:02.000Z",
+    });
+    await manager.enqueue(doomed);
+    await manager.enqueue(sibling);
+    await manager.markFailed(doomed.messageId, { failedAt: "2026-06-08T10:00:03.000Z" });
+
+    // Explicit thread deletion is the lifecycle evidence the drain lacks:
+    // it clears the deleted thread's queue — failed entries included —
+    // while other threads' entries are untouched.
+    await manager.clearThread(doomed.environmentId, doomed.threadId);
+    const remaining = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.messageId).toBe(sibling.messageId);
+    expect(stored.has(doomed.messageId)).toBe(false);
+    expect(stored.has(sibling.messageId)).toBe(true);
+    registry.dispose();
+  });
+
+  it("installs the persisted rollback baseline for an enqueue racing load", async () => {
+    const registry = AtomRegistry.make();
+    const durable = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const stored = new Map<MessageId, QueuedThreadMessage>([[durable.messageId, durable]]);
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    let failWrites = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => {
+        await loadGate;
+        return [...stored.values()].map((message) => ({ ...message }));
+      },
+      write: async (message) => {
+        if (failWrites) throw new Error("disk full");
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+
+    // A same-id optimistic enqueue lands while load() is still reading. The
+    // persisted entry must still become the committed rollback baseline: if
+    // it were skipped for being "live", this failing write would drop the
+    // atom entry while its durable predecessor stays on disk.
+    const loading = manager.load();
+    await Promise.resolve();
+    failWrites = true;
+    const enqueueing = manager
+      .enqueue({ ...durable, text: "optimistic-replacement" })
+      .catch((error) => error);
+    releaseLoad();
+    await loading;
+    expect(await enqueueing).toBeInstanceOf(ThreadOutboxManagerError);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toBe("message-1");
+    expect(stored.get(durable.messageId)?.text).toBe("message-1");
+    registry.dispose();
+  });
+
   it("keeps atom and disk aligned when a failure mark races an optimistic re-enqueue", async () => {
     const registry = AtomRegistry.make();
     const stored = new Map<MessageId, QueuedThreadMessage>();

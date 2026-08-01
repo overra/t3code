@@ -2,6 +2,7 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  getInstanceKeyedEntry,
   getProviderInstanceConfig,
   type ModelSelection,
   ProviderDriverKind,
@@ -96,7 +97,7 @@ function readInstanceModelPreferences(
   instanceId: ProviderInstanceId,
 ): { readonly hiddenModels: ReadonlyArray<string>; readonly modelOrder: ReadonlyArray<string> } {
   return (
-    settings.providerModelPreferences?.[instanceId] ?? {
+    getInstanceKeyedEntry(settings.providerModelPreferences, instanceId) ?? {
       hiddenModels: [],
       modelOrder: [],
     }

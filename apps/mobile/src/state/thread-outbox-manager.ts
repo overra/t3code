@@ -80,15 +80,17 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     loadPromise = serialize(async () => {
       const persistedMessages = await options.storage.load();
       // The committed baseline is tracked BY IDENTITY against the published
-      // atom objects. Ids already live in the atom keep their existing
-      // mapping: overwriting them with the freshly DECODED (equal but
-      // different) object would make every later update/mark/remove treat
-      // the atom entry as an uncommitted optimistic resubmission forever.
-      // For an optimistic entry enqueued before this load, its own
-      // serialized write — queued behind this op — commits it.
+      // atom objects. Ids already live in the atom AND committed keep their
+      // existing mapping: overwriting them with the freshly DECODED (equal
+      // but different) object would make every later update/mark/remove
+      // treat the atom entry as an uncommitted optimistic resubmission
+      // forever. A live id with NO committed entry, though, is an optimistic
+      // enqueue that raced this load — the persisted entry IS its rollback
+      // baseline, and skipping it would let that enqueue's write failure
+      // drop the atom entry while its durable predecessor stays on disk.
       const liveMessageIds = new Set(currentMessages().map((message) => message.messageId));
       for (const message of persistedMessages) {
-        if (!liveMessageIds.has(message.messageId)) {
+        if (!liveMessageIds.has(message.messageId) || !committedById.has(message.messageId)) {
           committedById.set(message.messageId, message);
         }
       }
@@ -295,6 +297,39 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       }
     });
 
+  // Explicit-lifecycle cleanup: removes every queued entry (failed ones
+  // included) for a thread the user just DELETED. This is the only path
+  // that resolves failed entries without user action on the entry itself —
+  // the deletion is the lifecycle evidence the drain deliberately lacks.
+  const clearThread = (environmentId: EnvironmentId, threadId: ThreadId): Promise<void> =>
+    serialize(async () => {
+      const targets = currentMessages().filter(
+        (message) => message.environmentId === environmentId && message.threadId === threadId,
+      );
+      const removedMessageIds = new Set<MessageId>();
+      await Promise.all(
+        targets.map(async (message) => {
+          try {
+            await options.storage.remove(message);
+            removedMessageIds.add(message.messageId);
+            committedById.delete(message.messageId);
+          } catch (cause) {
+            warn(
+              "[thread-outbox] failed to clear queued message for deleted thread",
+              new ThreadOutboxManagerError({
+                operation: "remove",
+                environmentId: message.environmentId,
+                threadId: message.threadId,
+                messageId: message.messageId,
+                cause,
+              }),
+            );
+          }
+        }),
+      );
+      setMessages(currentMessages().filter((message) => !removedMessageIds.has(message.messageId)));
+    });
+
   const clearEnvironment = (environmentId: EnvironmentId): Promise<void> =>
     serialize(async () => {
       const persisted = await options.storage.load().catch((cause) => {
@@ -350,6 +385,7 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     update,
     markFailed,
     remove,
+    clearThread,
     clearEnvironment,
   };
 }

@@ -79,4 +79,7 @@ Deliberate trade-offs in the current implementation:
   the conversation; choosing **Edit** dequeues it into the composer, which
   lets those later messages resume (confirmed first when any are waiting),
   and the edited message re-enters at the tail when sent. Deleting a
-  thread discards its queued messages, failed ones included.
+  thread on this device discards its queued messages, failed ones
+  included; archiving keeps them (they resurface with the thread on
+  unarchive). A thread deleted from a different device leaves this
+  device's failed entries parked until they are deleted here too.

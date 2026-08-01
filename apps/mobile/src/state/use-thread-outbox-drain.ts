@@ -388,13 +388,15 @@ export function useThreadOutboxDrain(): void {
               threadBusy:
                 thread?.session?.status === "running" || thread?.session?.status === "starting",
             });
-      // A failed entry holds its thread's queue (visible and editable in
-      // place) until an editor save clears its markers or the user deletes
-      // it — but cleanup REMOVALS still apply: its thread being deleted
-      // discards it like any other queued message (there is no composer
-      // left to recover into), and a failed creation whose thread exists
-      // actually succeeded and needs only cleanup.
-      if (isQueuedThreadMessageFailed(nextQueuedMessage) && deliveryAction !== "remove") {
+      // A failed entry is NEVER auto-resolved by the drain: shell presence
+      // is not lifecycle evidence. A thread absent from the shell may be
+      // archived, not deleted (discarding would lose content that returns
+      // on unarchive), and a thread PRESENT may be a failed bootstrap's
+      // transient row awaiting server cleanup (removing would mistake the
+      // doomed attempt for delivery). Explicit user deletion of a thread
+      // clears its outbox queue at delete time; everything else waits for
+      // the user to edit, retry, or delete the entry.
+      if (isQueuedThreadMessageFailed(nextQueuedMessage)) {
         continue;
       }
       if (deliveryAction === "wait") {

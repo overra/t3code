@@ -152,6 +152,7 @@ type NewTaskFlowContextValue = {
   readonly beginEditingPendingTask: (messageId: string) => boolean;
   readonly finishEditingPendingTask: () => void;
   readonly cancelEditingPendingTask: () => void;
+  readonly setEditingTaskSubmission: (messageId: string | null) => void;
   readonly buildPendingTaskMessage: (metadata: TurnCommandMetadata) => QueuedThreadMessage | null;
   readonly setPrompt: (value: string) => void;
   readonly replaceAttachments: (attachments: ReadonlyArray<DraftComposerImageAttachment>) => void;
@@ -219,6 +220,13 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   // Mirrors `editingPendingTask` synchronously so the unmount flush cannot act
   // on a task whose editing session already ended this render.
   const editingPendingTaskRef = useRef<QueuedThreadMessage | null>(null);
+  // While Start OWNS the editing session's persistence (its submission is
+  // in flight), the dismissal flush must not independently requeue the
+  // task — that path minted a second fresh creation for failed tasks.
+  const editingSubmissionMessageIdRef = useRef<string | null>(null);
+  const setEditingTaskSubmission = useCallback((messageId: string | null) => {
+    editingSubmissionMessageIdRef.current = messageId;
+  }, []);
 
   const reset = useCallback(() => {
     setSelectedEnvironmentId(null);
@@ -762,6 +770,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const finishEditingPendingTask = useCallback(() => {
     const editing = editingPendingTaskRef.current;
     editingPendingTaskRef.current = null;
+    editingSubmissionMessageIdRef.current = null;
     if (editing) {
       if (activeEditingMessageId === editing.messageId) {
         activeEditingMessageId = null;
@@ -797,6 +806,13 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     editingFlushRef.current = () => {
       const editing = editingPendingTaskRef.current;
       if (!editing) {
+        return;
+      }
+      // Start owns this session: its in-flight submission (and its own
+      // cleanup on success or failure) supersedes the dismissal flush.
+      // Everything — refs, drain lock, pending-task draft — is left intact
+      // for that continuation.
+      if (editingSubmissionMessageIdRef.current === editing.messageId) {
         return;
       }
       editingPendingTaskRef.current = null;
@@ -911,6 +927,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       beginEditingPendingTask,
       finishEditingPendingTask,
       cancelEditingPendingTask,
+      setEditingTaskSubmission,
       buildPendingTaskMessage,
       setPrompt,
       replaceAttachments,
@@ -933,6 +950,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       branchesLoading,
       buildPendingTaskMessage,
       cancelEditingPendingTask,
+      setEditingTaskSubmission,
       editingPendingTask,
       environments,
       expandedProvider,

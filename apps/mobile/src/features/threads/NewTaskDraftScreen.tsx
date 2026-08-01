@@ -865,8 +865,13 @@ export function NewTaskDraftScreen(props: {
       }
       // `submitting` stays true through retirement of the failed original —
       // clearing it earlier would let a second tap mint yet another fresh
-      // creation from the same editor session.
+      // creation from the same editor session — and Start OWNS the editing
+      // session for the duration: a sheet dismissal mid-submission must not
+      // run the flush, which would independently requeue the task.
       flow.setSubmitting(true);
+      if (editingPendingTask) {
+        flow.setEditingTaskSubmission(editingPendingTask.messageId);
+      }
       try {
         try {
           await enqueueThreadOutboxMessage(message);
@@ -891,6 +896,7 @@ export function NewTaskDraftScreen(props: {
           clearComposerDraftContent(draftKey);
         }
       } finally {
+        flow.setEditingTaskSubmission(null);
         flow.setSubmitting(false);
       }
       navigation.getParent()?.goBack();
@@ -898,6 +904,11 @@ export function NewTaskDraftScreen(props: {
     }
 
     flow.setSubmitting(true);
+    // Start owns the editing session while the creation is in flight — a
+    // sheet dismissal must not flush-requeue the task it is submitting.
+    if (editingPendingTask) {
+      flow.setEditingTaskSubmission(editingPendingTask.messageId);
+    }
     // Arm the lock-screen card before the async thread creation: backgrounding
     // the app right after tapping submit would otherwise reject the foreground
     // -only Activity start. If creation fails, the token registration's replay
@@ -932,6 +943,10 @@ export function NewTaskDraftScreen(props: {
     });
 
     if (result._tag === "Failure") {
+      // Ownership ends with the failed attempt: if the sheet was dismissed
+      // meanwhile, the editing session simply stays parked (lock held, draft
+      // kept) until the task is reopened — never independently requeued.
+      flow.setEditingTaskSubmission(null);
       flow.setSubmitting(false);
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
@@ -955,6 +970,7 @@ export function NewTaskDraftScreen(props: {
     } else {
       clearComposerDraftContent(draftKey);
     }
+    flow.setEditingTaskSubmission(null);
     flow.setSubmitting(false);
     navigation.dispatch(
       StackActions.replace("Thread", {

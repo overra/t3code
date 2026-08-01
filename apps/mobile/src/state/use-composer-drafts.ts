@@ -102,6 +102,12 @@ export const composerDraftsAtom = Atom.make<Record<string, ComposerDraft>>({}).p
 );
 
 let loadPromise: Promise<void> | null = null;
+// True only after persisted drafts were actually read (or the file was
+// absent). Ordinary draft edits stay best-effort when hydration failed, but
+// operations that write a WHOLE-FILE snapshot conditioned on current state
+// (the failed-outbox placement) must fail closed on it — writing from an
+// unhydrated atom would overwrite every persisted draft.
+let hydrated = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 const persistenceQueue = new SerializedAsyncQueue();
 
@@ -161,16 +167,12 @@ async function loadPersistedComposerDrafts(): Promise<Record<string, ComposerDra
     operation = "decode";
     return decodePersistedComposerDrafts(JSON.parse(raw) as unknown);
   } catch (cause) {
-    console.warn(
-      "[composer-drafts] ignored persisted draft failure",
-      new ComposerDraftPersistenceError({
-        operation,
-        directory: COMPOSER_DRAFTS_DIRECTORY,
-        fileName: COMPOSER_DRAFTS_FILE,
-        cause,
-      }),
-    );
-    return {};
+    throw new ComposerDraftPersistenceError({
+      operation,
+      directory: COMPOSER_DRAFTS_DIRECTORY,
+      fileName: COMPOSER_DRAFTS_FILE,
+      cause,
+    });
   }
 }
 
@@ -222,11 +224,12 @@ function schedulePersistComposerDrafts(drafts: Record<string, ComposerDraft>): v
 }
 
 export function ensureComposerDraftsLoaded(): void {
-  if (loadPromise !== null) {
+  if (loadPromise !== null || hydrated) {
     return;
   }
   loadPromise = loadPersistedComposerDrafts()
     .then((persistedDrafts) => {
+      hydrated = true;
       if (Object.keys(persistedDrafts).length === 0) {
         return;
       }
@@ -236,17 +239,12 @@ export function ensureComposerDraftsLoaded(): void {
         ...current,
       });
     })
-    .catch((cause) => {
-      console.warn(
-        "[composer-drafts] failed to hydrate drafts",
-        new ComposerDraftPersistenceError({
-          operation: "hydrate",
-          directory: COMPOSER_DRAFTS_DIRECTORY,
-          fileName: COMPOSER_DRAFTS_FILE,
-          cause,
-        }),
-      );
-      // Draft loading is best-effort; in-memory drafts still keep working.
+    .catch((error) => {
+      console.warn("[composer-drafts] failed to hydrate drafts", error);
+      // Draft loading is best-effort for ordinary edits; in-memory drafts
+      // keep working. Resetting the promise lets a later call retry, and
+      // `hydrated` stays false so fail-closed operations refuse meanwhile.
+      loadPromise = null;
     });
 }
 
@@ -506,13 +504,16 @@ export async function mergeComposerDraftContent(
 
 /**
  * ONE conditional transaction for moving failed-outbox content into a
- * composer draft: awaits hydration (an unhydrated snapshot can look empty
- * while disk holds content), refuses when the draft holds any content
- * ("occupied") or when any attachment would be dropped by the send cap
- * ("does-not-fit"), and otherwise publishes and durably persists the
- * content — draft settings preserved — before resolving "placed". Nothing
- * is written on either refusal, so the caller can safely keep the outbox
- * entry as the only copy.
+ * composer draft: requires successful hydration (an unhydrated snapshot can
+ * look empty while disk holds content, and the persist below writes a
+ * WHOLE-FILE snapshot — writing it unhydrated would overwrite every
+ * persisted draft), refuses when the draft holds any content ("occupied")
+ * or when any attachment would be dropped by the send cap ("does-not-fit"),
+ * and otherwise publishes and durably persists the content — draft settings
+ * preserved — before resolving "placed". Nothing is written on any refusal,
+ * and a failed durable write ROLLS THE ATOM BACK (unless the user already
+ * edited the placed content) before rejecting, so the caller can always
+ * keep the outbox entry as the only actionable copy.
  */
 export async function placeContentInEmptyComposerDraft(
   draftKey: string,
@@ -520,10 +521,13 @@ export async function placeContentInEmptyComposerDraft(
     readonly text: string;
     readonly attachments: ReadonlyArray<DraftComposerImageAttachment>;
   },
-): Promise<"placed" | "occupied" | "does-not-fit"> {
+): Promise<"placed" | "occupied" | "does-not-fit" | "hydration-failed"> {
   ensureComposerDraftsLoaded();
   if (loadPromise !== null) {
     await loadPromise;
+  }
+  if (!hydrated) {
+    return "hydration-failed";
   }
   const current = appAtomRegistry.get(composerDraftsAtom);
   const existing = normalizeDraft(current[draftKey]);
@@ -542,7 +546,32 @@ export async function placeContentInEmptyComposerDraft(
     persistTimer = null;
   }
   appAtomRegistry.set(composerDraftsAtom, next);
-  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+  try {
+    await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+  } catch (error) {
+    // Not durable: retract the placed copy so the retained outbox entry
+    // stays the ONLY actionable one — unless the user already edited the
+    // placement, which makes the content theirs.
+    const after = appAtomRegistry.get(composerDraftsAtom);
+    const placed = after[draftKey];
+    const untouched =
+      placed !== undefined &&
+      placed.text === content.text &&
+      placed.attachments.length === content.attachments.length &&
+      placed.attachments.every(
+        (attachment, index) => attachment.id === content.attachments[index]?.id,
+      );
+    if (untouched) {
+      const rolledBack = { ...after };
+      if (draftKey in current) {
+        rolledBack[draftKey] = current[draftKey]!;
+      } else {
+        delete rolledBack[draftKey];
+      }
+      appAtomRegistry.set(composerDraftsAtom, rolledBack);
+    }
+    throw error;
+  }
   return "placed";
 }
 

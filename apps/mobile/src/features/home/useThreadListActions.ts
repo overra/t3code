@@ -10,6 +10,7 @@ import { scopedThreadKey } from "../../lib/scopedEntities";
 import { refreshArchivedThreadsForEnvironment } from "../archive/useArchivedThreadSnapshots";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { environmentServerConfigsAtom } from "../../state/server";
+import { clearThreadOutboxForDeletedThread } from "../../state/thread-outbox";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -134,6 +135,13 @@ function useThreadActionExecutor(
         // lifecycle still feeds the archived-snapshot surface.
         if (action === "archive" || action === "unarchive" || action === "delete") {
           refreshArchivedThreadsForEnvironment(thread.environmentId);
+        }
+        // Explicit deletion is the lifecycle evidence the outbox drain
+        // deliberately lacks: it clears the thread's queued entries here
+        // (failed ones included) instead of inferring deletion from shell
+        // absence, which cannot distinguish deleted from archived.
+        if (action === "delete") {
+          void clearThreadOutboxForDeletedThread(thread.environmentId, thread.id);
         }
         onCompleted?.(action, thread);
         return true;

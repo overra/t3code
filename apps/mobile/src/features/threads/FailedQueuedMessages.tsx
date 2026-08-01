@@ -70,6 +70,13 @@ async function editIntoComposer(
       );
       return;
     }
+    if (placement === "hydration-failed") {
+      Alert.alert(
+        "Could not read saved drafts",
+        "Your saved drafts could not be loaded, so the message was left in place. Try again.",
+      );
+      return;
+    }
     await removeThreadOutboxMessage(message);
   } catch (error) {
     Alert.alert(

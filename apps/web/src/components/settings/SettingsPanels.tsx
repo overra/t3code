@@ -13,6 +13,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   defaultInstanceIdForDriver,
+  getInstanceKeyedEntry,
+  getProviderInstanceConfig,
   isProviderAvailable,
   type BackgroundActivityProfile,
   type BackgroundActivitySettings,
@@ -1957,7 +1959,10 @@ export function ProviderSettingsPanel() {
     >;
     const driver = providerSettings.provider;
     const defaultInstanceId = defaultInstanceIdForDriver(driver);
-    const explicitInstance = settings.providerInstances?.[defaultInstanceId];
+    const explicitInstance = getProviderInstanceConfig(
+      settings.providerInstances,
+      defaultInstanceId,
+    );
     const legacyConfig = legacyProviders[providerSettings.provider]!;
     const defaultLegacyConfig = defaultLegacyProviders[providerSettings.provider]!;
     const effectiveInstance: ProviderInstanceConfig =
@@ -2006,11 +2011,11 @@ export function ProviderSettingsPanel() {
     serverProviders.map((snapshot) => [snapshot.instanceId, isProviderAvailable(snapshot)]),
   );
   const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.flatMap((row) => {
-    const pendingEdit = pendingInstanceEdits[row.instanceId];
+    const pendingEdit = getInstanceKeyedEntry(pendingInstanceEdits, row.instanceId);
     // A pending delete removes the peer from the warning computation.
     if (pendingEdit === null) return [];
     const instance = pendingEdit ?? row.instance;
-    const pendingScope = pendingPeerScopes[row.instanceId];
+    const pendingScope = getInstanceKeyedEntry(pendingPeerScopes, row.instanceId);
     return [
       {
         instanceId: row.instanceId,
@@ -2308,7 +2313,10 @@ export function ProviderSettingsPanel() {
             updateCandidate !== undefined &&
             canOneClickUpdateProviderCandidate(updateCandidate, serverProviders) &&
             !updatingProviderDrivers.has(updateCandidate.driver);
-          const modelPreferences = settings.providerModelPreferences?.[row.instanceId] ?? {
+          const modelPreferences = getInstanceKeyedEntry(
+            settings.providerModelPreferences,
+            row.instanceId,
+          ) ?? {
             hiddenModels: [],
             modelOrder: [],
           };
@@ -2335,7 +2343,7 @@ export function ProviderSettingsPanel() {
               instance={row.instance}
               driverOption={driverOption}
               liveProvider={liveProvider}
-              isExpanded={openInstanceDetails[row.instanceId] ?? false}
+              isExpanded={getInstanceKeyedEntry(openInstanceDetails, row.instanceId) ?? false}
               onExpandedChange={(open) =>
                 setOpenInstanceDetails((existing) => ({
                   ...existing,
