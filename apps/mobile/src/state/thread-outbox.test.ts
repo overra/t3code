@@ -512,6 +512,67 @@ describe("thread outbox", () => {
     registry2.dispose();
   });
 
+  it("applies the terminal marker to an enqueue that raced the cleanup write", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let releaseWrite: () => void = () => {};
+    let gateNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        if (gateNextWrite) {
+          gateNextWrite = false;
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve;
+          });
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        // Removal keeps failing at first, so the marked entry stays queued
+        // for the cleanup retry.
+        if (failRemoval) throw new Error("remove failed");
+        stored.delete(message.messageId);
+      },
+    };
+    let failRemoval = true;
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+
+    // clearThread's marker write is in flight when a same-id enqueue starts:
+    // it snapshots the still-unmarked entry before entering the mutation
+    // queue. Committing that stale snapshot would leave disk unmarked while
+    // the atom shows marked — deleted content dispatchable again.
+    gateNextWrite = true;
+    const clearing = manager.clearThread(doomed.environmentId, doomed.threadId);
+    await Promise.resolve();
+    await Promise.resolve();
+    const requeueing = manager.enqueue({ ...doomed, text: "racing requeue" });
+    releaseWrite();
+    await Promise.all([clearing, requeueing]);
+
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const live = flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom));
+    expect(live).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(live[0]!)).toBe(true);
+    // Atom and disk agree, so the resumed removal clears BOTH once storage
+    // recovers — the published identity still matches the committed entry,
+    // rather than stranding a ghost the drain can never remove.
+    expect(live[0]?.text).toBe(stored.get(doomed.messageId)?.text);
+    failRemoval = false;
+    await manager.remove(live[0]!);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
   it("installs the persisted rollback baseline for an enqueue racing load", async () => {
     const registry = AtomRegistry.make();
     const durable = queuedMessage({

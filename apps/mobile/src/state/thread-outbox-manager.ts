@@ -148,15 +148,23 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
     const displaced = currentMessages().find(
       (candidate) => candidate.messageId === message.messageId,
     );
-    const merged = withPreservedTerminalMarkers(message, displaced);
+    const optimistic = withPreservedTerminalMarkers(message, displaced);
     setMessages([
-      ...currentMessages().filter((candidate) => candidate.messageId !== merged.messageId),
-      merged,
+      ...currentMessages().filter((candidate) => candidate.messageId !== optimistic.messageId),
+      optimistic,
     ]);
     return serialize(async () => {
+      // Re-apply terminal markers against the CURRENT committed entry, not
+      // the pre-queue snapshot: a clearThread that marked this id while
+      // this enqueue waited in the mutation queue would otherwise be undone
+      // by committing the stale unmarked value.
+      const commit = withPreservedTerminalMarkers(
+        optimistic,
+        committedById.get(optimistic.messageId),
+      );
       try {
-        await options.storage.write(merged);
-        committedById.set(merged.messageId, merged);
+        await options.storage.write(commit);
+        committedById.set(commit.messageId, commit);
       } catch (cause) {
         // Roll back by reference, not messageId: a retry enqueue with the same
         // id may have optimistically replaced this attempt while the write was
@@ -164,10 +172,10 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
         // this attempt is still the live entry, what comes back is the last
         // DURABLY COMMITTED entry — not the optimistic one it displaced,
         // whose own write may also have failed. Disk and atom stay aligned.
-        const committed = committedById.get(merged.messageId);
+        const committed = committedById.get(optimistic.messageId);
         setMessages(
           currentMessages().flatMap((candidate) =>
-            candidate === merged ? (committed !== undefined ? [committed] : []) : [candidate],
+            candidate === optimistic ? (committed !== undefined ? [committed] : []) : [candidate],
           ),
         );
         throw new ThreadOutboxManagerError({
@@ -177,6 +185,21 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           messageId: message.messageId,
           cause,
         });
+      }
+      // Markers were re-applied, so this commit — the last serialized write
+      // for this id — is authoritative for BOTH stores. Publish it by id,
+      // not by reference: the concurrent clearThread already replaced our
+      // optimistic entry with its own marked object, and leaving that in
+      // the atom would diverge from disk and from `committedById` (whose
+      // identity a later remove compares against, otherwise stranding a
+      // ghost entry). Only pending-cleanup entries take this path, and they
+      // must not deliver anyway, so the drain's reference-based queue
+      // confirmation correctly reports the entry as no longer queued.
+      if (commit !== optimistic) {
+        setMessages([
+          ...currentMessages().filter((candidate) => candidate.messageId !== commit.messageId),
+          commit,
+        ]);
       }
     });
   };
