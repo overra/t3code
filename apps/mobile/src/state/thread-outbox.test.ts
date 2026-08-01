@@ -573,6 +573,53 @@ describe("thread outbox", () => {
     registry.dispose();
   });
 
+  it("abandons an enqueue whose entry a completed cleanup already removed", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let releaseWrite: () => void = () => {};
+    let gateNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        if (gateNextWrite) {
+          gateNextWrite = false;
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve;
+          });
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+
+    // Same race as above, but cleanup's removal SUCCEEDS: it drops the
+    // committed marker and the atom entry. The queued enqueue must not then
+    // commit its stale snapshot — that would recreate the deleted content
+    // on disk as a ghost no surface can show or remove.
+    gateNextWrite = true;
+    const clearing = manager.clearThread(doomed.environmentId, doomed.threadId);
+    await Promise.resolve();
+    await Promise.resolve();
+    const requeueing = manager.enqueue({ ...doomed, text: "racing requeue" });
+    releaseWrite();
+    await Promise.all([clearing, requeueing]);
+
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
   it("installs the persisted rollback baseline for an enqueue racing load", async () => {
     const registry = AtomRegistry.make();
     const durable = queuedMessage({

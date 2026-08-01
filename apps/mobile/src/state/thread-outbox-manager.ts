@@ -154,6 +154,15 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       optimistic,
     ]);
     return serialize(async () => {
+      // A REMOVAL queued ahead of this enqueue won: the id is gone from the
+      // atom (a completed clearThread, delete, or environment clear also
+      // deleted it from storage). Committing our pre-queue snapshot would
+      // recreate deleted content as a disk ghost that no surface shows —
+      // the deletion is authoritative, so abandon the write. Resolving
+      // quietly is correct: the entry was deliberately removed, not failed.
+      if (!currentMessages().some((candidate) => candidate.messageId === optimistic.messageId)) {
+        return;
+      }
       // Re-apply terminal markers against the CURRENT committed entry, not
       // the pre-queue snapshot: a clearThread that marked this id while
       // this enqueue waited in the mutation queue would otherwise be undone
