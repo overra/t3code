@@ -22,7 +22,11 @@ import { useEnvironmentServerConfig, useProjects, useThreadShells } from "../../
 import type { TurnCommandMetadata } from "../../lib/commandMetadata";
 import type { DraftComposerImageAttachment } from "../../lib/composerImages";
 import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
-import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
+import {
+  buildModelOptions,
+  groupByProvider,
+  resolveSelectableModelSelection,
+} from "../../lib/modelOptions";
 import { groupProjectsByRepository } from "../../lib/repositoryGroups";
 import { scopedProjectKey } from "../../lib/scopedEntities";
 import { appAtomRegistry } from "../../state/atom-registry";
@@ -359,7 +363,11 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const selectedProjectDraft = useComposerDraft(selectedProjectDraftKey);
   const prompt = selectedProjectDraft.text;
   const attachments = selectedProjectDraft.attachments;
-  const workspaceMode = selectedProjectDraft.workspaceSelection?.mode ?? "local";
+  // The server's configured default decides the mode until the user picks one
+  // explicitly — same resolution web uses for new draft threads.
+  const defaultWorkspaceMode: WorkspaceMode =
+    selectedEnvironmentServerConfig?.settings.defaultThreadEnvMode ?? "local";
+  const workspaceMode = selectedProjectDraft.workspaceSelection?.mode ?? defaultWorkspaceMode;
   const selectedBranchName = selectedProjectDraft.workspaceSelection?.branch ?? null;
   const selectedWorktreePath = selectedProjectDraft.workspaceSelection?.worktreePath ?? null;
   // Keep the user's explicit choice separate from the resolved display value:
@@ -373,11 +381,22 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const runtimeMode = selectedProjectDraft.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const interactionMode = selectedProjectDraft.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE;
 
+  // Stored selections (draft and project default) only count while their
+  // provider is usable on the server; otherwise the server's default model
+  // wins instead of silently targeting a disabled provider.
+  const draftModelSelection = resolveSelectableModelSelection(
+    selectedEnvironmentServerConfig,
+    selectedProjectDraft.modelSelection ?? null,
+  );
+  const projectDefaultModelSelection = resolveSelectableModelSelection(
+    selectedEnvironmentServerConfig,
+    selectedProject?.defaultModelSelection ?? null,
+  );
   const modelOptions = useMemo(
     () =>
       buildModelOptions(
         selectedEnvironmentServerConfig,
-        selectedProjectDraft.modelSelection ?? selectedProject?.defaultModelSelection ?? null,
+        draftModelSelection ?? projectDefaultModelSelection,
         selectedProject
           ? {
               id: selectedProject.id,
@@ -385,7 +404,12 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
             }
           : null,
       ),
-    [selectedEnvironmentServerConfig, selectedProject, selectedProjectDraft.modelSelection],
+    [
+      selectedEnvironmentServerConfig,
+      draftModelSelection,
+      projectDefaultModelSelection,
+      selectedProject,
+    ],
   );
 
   // The draft and project default are only candidates while their instance
@@ -397,14 +421,15 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     () => new Set(modelOptions.map((option) => option.selection.instanceId)),
     [modelOptions],
   );
-  const draftSelection = selectedProjectDraft.modelSelection ?? null;
-  const projectDefaultSelection = selectedProject?.defaultModelSelection ?? null;
   const selectedModel =
-    (draftSelection !== null && usableInstanceIds.has(draftSelection.instanceId)
-      ? draftSelection
+    // Server usability is already applied above; project access rules are
+    // applied here, since `modelOptions` is restricted to them.
+    (draftModelSelection !== null && usableInstanceIds.has(draftModelSelection.instanceId)
+      ? draftModelSelection
       : null) ??
-    (projectDefaultSelection !== null && usableInstanceIds.has(projectDefaultSelection.instanceId)
-      ? projectDefaultSelection
+    (projectDefaultModelSelection !== null &&
+    usableInstanceIds.has(projectDefaultModelSelection.instanceId)
+      ? projectDefaultModelSelection
       : null) ??
     modelOptions.find((option) => option.isDefault)?.selection ??
     modelOptions[0]?.selection ??
@@ -704,11 +729,15 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
       const draft = getComposerDraftSnapshot(selectedProjectDraftKey);
       const text = draft.text.trim();
-      // Same clamp as the online path: the raw draft selection is only
-      // trusted while its instance survives the project's access filtering
-      // (membership in the already-filtered options); otherwise the flow's
-      // clamped resolution queues instead of a revoked selection.
-      const rawDraftSelection = draft.modelSelection;
+      // Both gates the composer display applies: a stored selection must
+      // target a provider that is still usable on the server AND still
+      // permitted by the project's access rules (membership in the
+      // already-filtered options). Otherwise the flow's clamped resolution
+      // queues instead of a disabled or revoked selection.
+      const rawDraftSelection = resolveSelectableModelSelection(
+        selectedEnvironmentServerConfig,
+        draft.modelSelection ?? null,
+      );
       const draftModelSelection =
         (rawDraftSelection && usableInstanceIds.has(rawDraftSelection.instanceId)
           ? rawDraftSelection
@@ -717,7 +746,9 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         return null;
       }
       const workspaceSelection = draft.workspaceSelection;
-      const mode = workspaceSelection?.mode ?? "local";
+      // Fall back to the resolved mode (server default) so queued tasks drain
+      // with the same mode the composer displayed.
+      const mode = workspaceSelection?.mode ?? workspaceMode;
       // When the selection is the stand-in built from the queued snapshot,
       // persist the original (possibly absent) snapshot values — the
       // stand-in's placeholder title/workspaceRoot must never be written back
@@ -759,11 +790,13 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     [
       editingPendingProject,
       editingPendingTask,
+      selectedEnvironmentServerConfig,
       selectedModel,
       selectedProject,
       selectedProjectDraftKey,
       startFromOrigin,
       usableInstanceIds,
+      workspaceMode,
     ],
   );
 

@@ -42,7 +42,8 @@ import {
   restoreComposerDraftSnapshot,
   type ComposerDraft,
 } from "../../state/use-composer-drafts";
-import { useProjects } from "../../state/entities";
+import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
+import { resolveSelectableModelSelection } from "../../lib/modelOptions";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import {
@@ -97,6 +98,9 @@ export function NewTaskDraftScreen(props: {
   const controlsBottomPadding = isKeyboardVisible ? 8 : Math.max(insets.bottom, 10);
   const { logicalProjects, selectedProject, setProject } = flow;
   const { connectedEnvironments } = useRemoteConnectionStatus();
+  const selectedEnvironmentServerConfig = useEnvironmentServerConfig(
+    selectedProject?.environmentId ?? null,
+  );
   const environmentConnected =
     selectedProject !== null &&
     connectedEnvironments.find(
@@ -802,11 +806,14 @@ export function NewTaskDraftScreen(props: {
       return;
     }
     const draft = getComposerDraftSnapshot(draftKey);
-    // The raw draft snapshot may hold a selection the project's provider
-    // access rules no longer admit; accept it only while its instance is
-    // still among the (filtered) options, otherwise use the flow's clamped
-    // resolution.
-    const draftSelection = draft.modelSelection;
+    // Snapshot read keeps just-typed selector state; both gates still apply
+    // so a stored selection on a disabled provider — or one the project's
+    // access rules no longer admit (membership in the already-filtered
+    // options) — falls back to the flow's clamped resolution.
+    const draftSelection = resolveSelectableModelSelection(
+      selectedEnvironmentServerConfig,
+      draft.modelSelection ?? null,
+    );
     const modelSelection =
       draftSelection &&
       flow.modelOptions.some((option) => option.selection.instanceId === draftSelection.instanceId)
@@ -893,7 +900,10 @@ export function NewTaskDraftScreen(props: {
           }
           flow.finishEditingPendingTask();
         } else {
-          clearComposerDraftContent(draftKey);
+          // Drop the workspace selection with the content: the next task should
+          // re-resolve mode/branch/origin from the server's configured defaults
+          // instead of resurrecting this task's picks.
+          clearComposerDraftContent(draftKey, { clearWorkspaceSelection: true });
         }
       } finally {
         flow.setEditingTaskSubmission(null);
@@ -968,7 +978,7 @@ export function NewTaskDraftScreen(props: {
       }
       flow.finishEditingPendingTask();
     } else {
-      clearComposerDraftContent(draftKey);
+      clearComposerDraftContent(draftKey, { clearWorkspaceSelection: true });
     }
     flow.setEditingTaskSubmission(null);
     flow.setSubmitting(false);
