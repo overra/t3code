@@ -9,18 +9,23 @@ import {
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import type { CSSProperties } from "react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   defaultInstanceIdForDriver,
+  getInstanceKeyedEntry,
+  getProviderInstanceConfig,
+  isProviderAvailable,
   type BackgroundActivityProfile,
   type BackgroundActivitySettings,
   type DesktopUpdateChannel,
   PROVIDER_DISPLAY_NAMES,
+  type ProjectId,
   ProviderDriverKind,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
   type ScopedThreadRef,
+  type ServerSettingsPatch,
   type SidebarProjectGroupingMode,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -64,7 +69,11 @@ import {
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
 import { useTheme } from "../../hooks/useTheme";
-import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import {
+  getClientSettings,
+  usePrimarySettings,
+  useUpdatePrimarySettings,
+} from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import {
@@ -78,6 +87,7 @@ import {
 } from "../../providerInstances";
 import { ensureLocalApi, readLocalApi } from "../../localApi";
 import {
+  environmentServerConfigsAtom,
   primaryServerObservabilityAtom,
   primaryServerProvidersAtom,
   serverEnvironment,
@@ -117,6 +127,10 @@ import {
   type ProviderUpdateCandidate,
 } from "../ProviderUpdateLaunchNotification.logic";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
+import type {
+  ProviderScopePeerInstance,
+  ProviderScopeProjectOption,
+} from "./ProviderProjectScopeSection";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import {
   backgroundActivitySharedPolicySettings,
@@ -125,6 +139,7 @@ import {
   hasChangedBackgroundActivitySettings,
   isProjectGroupingEnabled,
   projectGroupingModeFromToggle,
+  omitInstanceScope,
   readLastEnabledProjectGroupingMode,
   rememberEnabledProjectGroupingMode,
   resolveBackgroundActivityProfileOption,
@@ -1695,6 +1710,23 @@ export function ProviderSettingsPanel() {
   const updateSettings = useUpdatePrimarySettings();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
   const primaryEnvironment = usePrimaryEnvironment();
+  const allProjects = useProjects();
+  // Project options for the per-instance "Projects" scope control. Provider
+  // settings edit the primary environment's settings, so only its projects
+  // are meaningful scope targets.
+  const scopeProjectOptions = useMemo<ReadonlyArray<ProviderScopeProjectOption>>(
+    () =>
+      primaryEnvironment === null
+        ? []
+        : allProjects
+            .filter((project) => project.environmentId === primaryEnvironment.environmentId)
+            .map((project) => ({
+              id: project.id,
+              title: project.title,
+              allowedProviderInstances: project.allowedProviderInstances ?? null,
+            })),
+    [allProjects, primaryEnvironment],
+  );
   const refreshServerProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
@@ -1703,6 +1735,77 @@ export function ProviderSettingsPanel() {
   });
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [isAddInstanceDialogOpen, setIsAddInstanceDialogOpen] = useState(false);
+  const environmentConfigs = useAtomValue(environmentServerConfigsAtom);
+  // Version-skew gate: older servers strip the unknown scope fields and the
+  // granular patch key, silently acknowledging no-ops (or dropping scopes
+  // they never knew about). Without the capability, the scope editors are
+  // hidden and instance writes fall back to the legacy whole-map shape.
+  const supportsProviderScopes =
+    primaryEnvironment !== null &&
+    environmentConfigs.get(primaryEnvironment.environmentId)?.environment.capabilities
+      .providerProjectScopes === true;
+  // Pending (submitted, not yet echoed) scope edits reported by each card's
+  // Projects editor — DISPLAY-ONLY state feeding the cross-card
+  // stranded-project warnings, so quickly narrowing two instances warns
+  // against local intent instead of lagging echoes. Reset on environment
+  // change so one environment's edits never overlay another's configs.
+  const [pendingPeerScopes, setPendingPeerScopes] = useState<
+    Partial<Record<ProviderInstanceId, ReadonlyArray<ProjectId> | null>>
+  >({});
+  // Same idea for whole-instance edits (disable, delete, reset): the
+  // stranded warnings must also see a just-disabled or just-deleted peer.
+  // DISPLAY-ONLY; cleared wholesale when a settings echo lands (the echo is
+  // then the truth) or when the write is rejected.
+  const [pendingInstanceEdits, setPendingInstanceEdits] = useState<
+    Partial<Record<ProviderInstanceId, ProviderInstanceConfig | null>>
+  >({});
+  const primaryEnvironmentIdForScopes = primaryEnvironment?.environmentId ?? null;
+  useEffect(() => {
+    setPendingPeerScopes({});
+    setPendingInstanceEdits({});
+  }, [primaryEnvironmentIdForScopes]);
+  useEffect(() => {
+    setPendingInstanceEdits({});
+  }, [settings.providerInstances]);
+  const reportPendingPeerScope = useCallback(
+    (instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => {
+      setPendingPeerScopes((previous) => {
+        if (scope === undefined) {
+          if (!(instanceId in previous)) return previous;
+          const next = { ...previous };
+          delete next[instanceId];
+          return next;
+        }
+        return { ...previous, [instanceId]: scope };
+      });
+    },
+    [],
+  );
+  const trackPendingInstanceEdit = (
+    instanceId: ProviderInstanceId,
+    value: ProviderInstanceConfig | null,
+  ) => {
+    setPendingInstanceEdits((previous) => ({ ...previous, [instanceId]: value }));
+    return (persist: Promise<unknown> | undefined) => {
+      void Promise.resolve(persist).then(
+        (outcome) => {
+          const rejected =
+            outcome === undefined ||
+            (typeof outcome === "object" &&
+              outcome !== null &&
+              (outcome as { _tag?: unknown })._tag === "Failure");
+          if (!rejected) return;
+          setPendingInstanceEdits((previous) => {
+            if (!(instanceId in previous)) return previous;
+            const next = { ...previous };
+            delete next[instanceId];
+            return next;
+          });
+        },
+        () => undefined,
+      );
+    };
+  };
   const [updatingProviderDrivers, setUpdatingProviderDrivers] = useState<
     ReadonlySet<ProviderDriverKind>
   >(() => new Set());
@@ -1857,7 +1960,10 @@ export function ProviderSettingsPanel() {
     >;
     const driver = providerSettings.provider;
     const defaultInstanceId = defaultInstanceIdForDriver(driver);
-    const explicitInstance = settings.providerInstances?.[defaultInstanceId];
+    const explicitInstance = getProviderInstanceConfig(
+      settings.providerInstances,
+      defaultInstanceId,
+    );
     const legacyConfig = legacyProviders[providerSettings.provider]!;
     const defaultLegacyConfig = defaultLegacyProviders[providerSettings.provider]!;
     const effectiveInstance: ProviderInstanceConfig =
@@ -1893,6 +1999,42 @@ export function ProviderSettingsPanel() {
     }
   }
 
+  // Effective enabled/availability/scope state of every configured instance,
+  // fed to each card's Projects control so narrowing one instance's scope
+  // can warn about projects that would be left with no usable provider at
+  // all. Availability comes from the live snapshots; an instance with no
+  // snapshot yet counts as unavailable — an unprobed provider must not be
+  // the one thing standing between a project and zero usable providers.
+  // Scopes overlay each card's not-yet-echoed pending edit (reported by the
+  // scope editors below) so quickly narrowing two instances warns against
+  // the freshest local intent, not the lagging echoes.
+  const providerAvailabilityByInstanceId = new Map(
+    serverProviders.map((snapshot) => [snapshot.instanceId, isProviderAvailable(snapshot)]),
+  );
+  const scopePeerInstances: ReadonlyArray<ProviderScopePeerInstance> = rows.flatMap((row) => {
+    const pendingEdit = getInstanceKeyedEntry(pendingInstanceEdits, row.instanceId);
+    // A pending delete removes the peer from the warning computation.
+    if (pendingEdit === null) return [];
+    const instance = pendingEdit ?? row.instance;
+    const pendingScope = getInstanceKeyedEntry(pendingPeerScopes, row.instanceId);
+    return [
+      {
+        instanceId: row.instanceId,
+        enabled: instance.enabled ?? true,
+        available: providerAvailabilityByInstanceId.get(row.instanceId) ?? false,
+        allowedProjects:
+          pendingScope !== undefined ? pendingScope : (instance.allowedProjects ?? null),
+      },
+    ];
+  });
+
+  // Every instance write is a GRANULAR `providerInstancesPatch` (upsert or
+  // null-delete of exactly one entry) that the server merges onto its own
+  // current map under its write lock. No whole-map composition happens on
+  // the client, so there is no pending-write reconciliation state to race,
+  // lose on unmount, or leak across environments. Servers that predate the
+  // capability strip the patch key (a silent no-op), so they get the legacy
+  // whole-map shape instead — they have no scopes to protect.
   const updateProviderInstance = (
     row: InstanceRow,
     next: ProviderInstanceConfig,
@@ -1900,27 +2042,55 @@ export function ProviderSettingsPanel() {
       readonly textGenerationModelSelection?: Parameters<
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
+      /** This write's PURPOSE is a scope change: send the key untouched. */
+      readonly scopeWrite?: boolean;
     },
   ) => {
-    updateSettings(
-      buildProviderInstanceUpdatePatch({
-        settings,
-        instanceId: row.instanceId,
-        instance: next,
-        driver: row.driver,
-        isDefault: row.isDefault,
-        textGenerationModelSelection: options?.textGenerationModelSelection,
-      }),
+    const withPendingEdit = trackPendingInstanceEdit(row.instanceId, next);
+    // Scope routing is by INTENT, not by comparing against the (possibly
+    // stale) streamed row: a scope-originated write always carries the key
+    // (explicit null included) — comparing against a lagging echo dropped
+    // the final write of a rapid A→B→A sequence — while every other edit
+    // omits it unconditionally so the server preserves the stored scope.
+    const persist = updateSettings(
+      buildProviderInstanceUpdatePatch(
+        {
+          instanceId: row.instanceId,
+          instance:
+            supportsProviderScopes && options?.scopeWrite !== true ? omitInstanceScope(next) : next,
+          driver: row.driver,
+          isDefault: row.isDefault,
+          textGenerationModelSelection: options?.textGenerationModelSelection,
+        },
+        supportsProviderScopes ? { granular: true } : { granular: false, settings },
+      ),
     );
+    withPendingEdit(persist);
+    return persist;
   };
 
   const deleteProviderInstance = (id: ProviderInstanceId) => {
-    updateSettings({
-      providerInstances: withoutProviderInstanceKey(settings.providerInstances, id),
-      providerModelPreferences: withoutProviderInstanceKey(settings.providerModelPreferences, id),
-      favorites: withoutProviderInstanceFavorites(settings.favorites ?? [], id),
+    // Preferences and favorites are CLIENT-owned keys: they never appear on
+    // the server settings atom, so they come from the client snapshot (which
+    // is updated synchronously and is therefore already the freshest state).
+    const client = getClientSettings();
+    const withPendingEdit = trackPendingInstanceEdit(id, null);
+    const persist = updateSettings({
+      ...(supportsProviderScopes
+        ? { providerInstancesPatch: { [id]: null } }
+        : { providerInstances: withoutProviderInstanceKey(settings.providerInstances, id) }),
+      providerModelPreferences: withoutProviderInstanceKey(client.providerModelPreferences, id),
+      favorites: withoutProviderInstanceFavorites(client.favorites ?? [], id),
     });
+    withPendingEdit(persist);
   };
+
+  const createProviderInstance = (id: ProviderInstanceId, instance: ProviderInstanceConfig) =>
+    updateSettings(
+      supportsProviderScopes
+        ? { providerInstancesPatch: { [id]: instance } }
+        : { providerInstances: { ...settings.providerInstances, [id]: instance } },
+    );
 
   const updateProviderModelPreferences = (
     instanceId: ProviderInstanceId,
@@ -1931,7 +2101,11 @@ export function ProviderSettingsPanel() {
   ) => {
     const hiddenModels = [...new Set(next.hiddenModels.filter((slug) => slug.trim().length > 0))];
     const modelOrder = [...new Set(next.modelOrder.filter((slug) => slug.trim().length > 0))];
-    const rest = withoutProviderInstanceKey(settings.providerModelPreferences, instanceId);
+    // Client-owned map: the synchronous client snapshot is the freshest.
+    const rest = withoutProviderInstanceKey(
+      getClientSettings().providerModelPreferences,
+      instanceId,
+    );
     updateSettings({
       providerModelPreferences:
         hiddenModels.length === 0 && modelOrder.length === 0
@@ -1960,7 +2134,8 @@ export function ProviderSettingsPanel() {
     ];
     updateSettings({
       favorites: [
-        ...withoutProviderInstanceFavorites(settings.favorites ?? [], instanceId),
+        // Client-owned list: the synchronous client snapshot is the freshest.
+        ...withoutProviderInstanceFavorites(getClientSettings().favorites ?? [], instanceId),
         ...favoriteModels.map((model) => ({ provider: instanceId, model })),
       ],
     });
@@ -1975,18 +2150,36 @@ export function ProviderSettingsPanel() {
     const defaultInstanceId = defaultInstanceIdForDriver(driverKind);
     const defaultLegacyProvider = defaultLegacyProviders[driverKind];
     if (defaultLegacyProvider === undefined) return;
-    updateSettings({
-      providers: {
-        ...settings.providers,
-        [driverKind]: defaultLegacyProvider,
-      } as typeof settings.providers,
-      providerInstances: withoutProviderInstanceKey(settings.providerInstances, defaultInstanceId),
+    const client = getClientSettings();
+    const withPendingEdit = trackPendingInstanceEdit(defaultInstanceId, null);
+    const persist = updateSettings({
+      // Single-driver legacy reset + single-instance delete, both merged
+      // server-side; no client-side map composition (except on pre-scopes
+      // servers, which need the legacy whole-map shape).
+      ...(supportsProviderScopes
+        ? {
+            providers: { [driverKind]: defaultLegacyProvider } as NonNullable<
+              ServerSettingsPatch["providers"]
+            >,
+            providerInstancesPatch: { [defaultInstanceId]: null },
+          }
+        : {
+            providers: {
+              ...settings.providers,
+              [driverKind]: defaultLegacyProvider,
+            } as typeof settings.providers,
+            providerInstances: withoutProviderInstanceKey(
+              settings.providerInstances,
+              defaultInstanceId,
+            ),
+          }),
       providerModelPreferences: withoutProviderInstanceKey(
-        settings.providerModelPreferences,
+        client.providerModelPreferences,
         defaultInstanceId,
       ),
-      favorites: withoutProviderInstanceFavorites(settings.favorites ?? [], defaultInstanceId),
+      favorites: withoutProviderInstanceFavorites(client.favorites ?? [], defaultInstanceId),
     });
+    withPendingEdit(persist);
   };
 
   return (
@@ -2121,7 +2314,10 @@ export function ProviderSettingsPanel() {
             updateCandidate !== undefined &&
             canOneClickUpdateProviderCandidate(updateCandidate, serverProviders) &&
             !updatingProviderDrivers.has(updateCandidate.driver);
-          const modelPreferences = settings.providerModelPreferences?.[row.instanceId] ?? {
+          const modelPreferences = getInstanceKeyedEntry(
+            settings.providerModelPreferences,
+            row.instanceId,
+          ) ?? {
             hiddenModels: [],
             modelOrder: [],
           };
@@ -2138,30 +2334,39 @@ export function ProviderSettingsPanel() {
             ) : null;
           return (
             <ProviderInstanceCard
-              key={row.instanceId}
+              // Keyed by environment AND instance: common ids like `codex`
+              // exist on every environment, and a card surviving an
+              // environment switch would carry the previous environment's
+              // in-flight scope overlay (and its project ids) onto the new
+              // one's config.
+              key={`${primaryEnvironment?.environmentId ?? "none"}:${row.instanceId}`}
               instanceId={row.instanceId}
               instance={row.instance}
               driverOption={driverOption}
               liveProvider={liveProvider}
-              isExpanded={openInstanceDetails[row.instanceId] ?? false}
+              isExpanded={getInstanceKeyedEntry(openInstanceDetails, row.instanceId) ?? false}
               onExpandedChange={(open) =>
                 setOpenInstanceDetails((existing) => ({
                   ...existing,
                   [row.instanceId]: open,
                 }))
               }
-              onUpdate={(next) => {
+              onUpdate={(next, updateOptions) => {
                 const wasEnabled = row.instance.enabled ?? true;
                 const isDisabling = next.enabled === false && wasEnabled;
                 const shouldClearTextGen = isDisabling && textGenInstanceId === row.instanceId;
                 if (shouldClearTextGen) {
-                  updateProviderInstance(row, next, {
+                  return updateProviderInstance(row, next, {
                     textGenerationModelSelection:
                       DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+                    ...(updateOptions?.scopeWrite ? { scopeWrite: true } : {}),
                   });
-                } else {
-                  updateProviderInstance(row, next);
                 }
+                return updateProviderInstance(
+                  row,
+                  next,
+                  updateOptions?.scopeWrite ? { scopeWrite: true } : undefined,
+                );
               }}
               onDelete={row.isDefault ? undefined : () => deleteProviderInstance(row.instanceId)}
               headerAction={headerAction}
@@ -2194,13 +2399,28 @@ export function ProviderSettingsPanel() {
                   : undefined
               }
               isUpdating={showInlineUpdateButton ? isDriverUpdateRunning : undefined}
+              projects={supportsProviderScopes ? scopeProjectOptions : undefined}
+              peerInstances={supportsProviderScopes ? scopePeerInstances : undefined}
+              onPendingScopeChange={reportPendingPeerScope}
+              settingsRevision={settings.settingsRevision ?? 0}
             />
           );
         })}
       </SettingsSection>
 
       {isAddInstanceDialogOpen ? (
-        <AddProviderInstanceDialog open onOpenChange={setIsAddInstanceDialogOpen} />
+        <AddProviderInstanceDialog
+          // Keyed by environment: a primary-environment switch must not
+          // carry the old form (including typed secrets) onto the new server.
+          key={primaryEnvironment?.environmentId ?? "none"}
+          open
+          onOpenChange={setIsAddInstanceDialogOpen}
+          onCreateInstance={createProviderInstance}
+          reservedInstanceIds={[
+            ...DRIVER_OPTIONS.map((option) => defaultInstanceIdForDriver(option.value)),
+            ...serverProviders.map((provider) => provider.instanceId),
+          ]}
+        />
       ) : null}
     </SettingsPageContainer>
   );

@@ -3,6 +3,7 @@ import type {
   EnvironmentId,
   ModelSelection,
   PreviewAnnotationPayload,
+  ProjectId,
   ProviderApprovalDecision,
   ProviderInteractionMode,
   ResolvedKeybindingsConfig,
@@ -19,6 +20,7 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
+import { useNavigate } from "@tanstack/react-router";
 import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import {
@@ -166,6 +168,7 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
   );
 }
 import { Button } from "../ui/button";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
@@ -178,6 +181,7 @@ import {
   LockIcon,
   LockOpenIcon,
   PenLineIcon,
+  SettingsIcon,
   SparklesIcon,
   XIcon,
 } from "lucide-react";
@@ -186,13 +190,19 @@ import { getProviderDisplayName, getProviderInteractionModeToggle } from "../../
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  filterProviderInstanceEntriesForProject,
+  getProviderInstanceProjectRestrictionForEntry,
+  isProviderInstancePickerVisible,
   NO_PROVIDER_MODEL_SELECTION,
   resolveProviderDriverKindForInstanceSelection,
   resolveSelectableProviderInstanceEntry,
   sortProviderInstanceEntries,
   type ProviderInstanceEntry,
+  type ProviderPickerProjectContext,
 } from "../../providerInstances";
 import { type AppModelOption, getAppModelOptionsForInstance } from "../../modelSelection";
+import { RestrictedProvidersNotes } from "./RestrictedProvidersNotes";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 import type { SessionPhase, Thread } from "../../types";
 import type { PendingUserInputDraftAnswer } from "../../pendingUserInput";
@@ -566,6 +576,15 @@ export interface ChatComposerProps {
   lockedProvider: ProviderDriverKind | null;
   providerStatuses: ServerProvider[];
   activeProjectDefaultModelSelection: ModelSelection | null | undefined;
+  activeProjectId: ProjectId | null | undefined;
+  activeProjectAllowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null | undefined;
+  /**
+   * True when the thread names a project id that no longer resolves in the
+   * live shell (the project was deleted). Distinct from "no project":
+   * access rules still exist server-side, this client just cannot read
+   * them — so the picker fails CLOSED instead of offering every provider.
+   */
+  activeProjectMissing?: boolean | undefined;
   activeThreadModelSelection: ModelSelection | null | undefined;
 
   // Context window
@@ -661,6 +680,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     lockedProvider,
     providerStatuses,
     activeProjectDefaultModelSelection,
+    activeProjectId,
+    activeProjectAllowedProviderInstances,
+    activeProjectMissing = false,
     activeThreadModelSelection,
     activeThreadActivities,
     resolvedTheme,
@@ -738,6 +760,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (store) => store.syncPersistedAttachments,
   );
   const getComposerDraft = useComposerDraftStore((store) => store.getComposerDraft);
+  const navigate = useNavigate();
+  // Settings routes edit the PRIMARY environment; offering the shortcut for
+  // a thread in a secondary environment would open an editor for the wrong
+  // server's providers.
+  const isPrimaryEnvironment = usePrimaryEnvironmentId() === environmentId;
+  const openProviderSettings = useCallback(() => {
+    void navigate({ to: "/settings/providers" });
+  }, [navigate]);
 
   // ------------------------------------------------------------------
   // Model state
@@ -745,13 +775,60 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Instance-aware projection of the wire provider list. One entry per
   // configured instance (default built-in + any custom `providerInstances.*`),
   // sorted default-first per driver kind for a stable picker order.
-  const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
+  // Restricted projects narrow the entries here, at the source, so every
+  // downstream selection fallback stays inside the project's provider access
+  // rules (project allowlist ∩ per-instance project scope).
+  const activeProjectProviderContext = useMemo<ProviderPickerProjectContext | null>(
+    () =>
+      activeProjectId == null
+        ? null
+        : { id: activeProjectId, allowedProviderInstances: activeProjectAllowedProviderInstances },
+    [activeProjectAllowedProviderInstances, activeProjectId],
+  );
+  const configuredProviderInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
     () =>
       sortProviderInstanceEntries(
         applyProviderInstanceSettings(deriveProviderInstanceEntries(providerStatuses), settings),
       ),
     [providerStatuses, settings],
   );
+  const providerInstanceEntries = useMemo<ReadonlyArray<ProviderInstanceEntry>>(
+    () =>
+      // A known-but-deleted project fails CLOSED: its rules still exist
+      // server-side (the validator resolves them from the unfiltered row),
+      // this client just cannot read them, so no provider may be offered.
+      activeProjectMissing
+        ? []
+        : filterProviderInstanceEntriesForProject(
+            configuredProviderInstanceEntries,
+            activeProjectProviderContext,
+          ),
+    [activeProjectMissing, activeProjectProviderContext, configuredProviderInstanceEntries],
+  );
+  // Enabled instances hidden by a project rule, with the rule that hid them —
+  // rendered as an explanatory picker footer so restrictions never read as a
+  // provider silently vanishing.
+  const restrictedProviderInstanceNotes = useMemo<
+    ReadonlyArray<{
+      readonly entry: ProviderInstanceEntry;
+      readonly cause: "project-allowlist" | "instance-scope";
+    }>
+  >(() => {
+    if (activeProjectProviderContext === null) return [];
+    const notes: Array<{
+      entry: ProviderInstanceEntry;
+      cause: "project-allowlist" | "instance-scope";
+    }> = [];
+    for (const entry of configuredProviderInstanceEntries) {
+      if (!isProviderInstancePickerVisible(entry)) continue;
+      const cause = getProviderInstanceProjectRestrictionForEntry(
+        entry,
+        activeProjectProviderContext,
+      );
+      if (cause !== null) notes.push({ entry, cause });
+    }
+    return notes;
+  }, [activeProjectProviderContext, configuredProviderInstanceEntries]);
   const selectedProviderByThreadId = composerDraft.activeProvider ?? null;
   const threadProvider =
     activeThread?.session?.providerInstanceId ??
@@ -774,15 +851,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const lockedInstanceId =
       activeThread.session?.providerInstanceId ?? activeThreadModelSelection?.instanceId;
     if (!lockedInstanceId) return null;
+    // Resolve against the UNFILTERED configured entries: the bound instance
+    // may have become restricted for this project (and thus filtered out of
+    // the picker), but its continuation group still constrains which
+    // instances the locked thread could switch to. Losing the key here
+    // would let the composer auto-pick an incompatible same-driver instance
+    // that the server then rejects.
     return (
-      providerInstanceEntries.find((entry) => entry.instanceId === lockedInstanceId)
+      configuredProviderInstanceEntries.find((entry) => entry.instanceId === lockedInstanceId)
         ?.continuationGroupKey ?? null
     );
   }, [
     activeThread,
     activeThreadModelSelection?.instanceId,
     lockedProvider,
-    providerInstanceEntries,
+    configuredProviderInstanceEntries,
   ]);
 
   // Resolve which configured instance the composer is currently targeting.
@@ -3124,17 +3207,109 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             >
               <div className="-m-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                 {noProviderAvailable ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled
-                    data-chat-provider-unavailable="true"
-                    className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
-                  >
-                    <CircleAlertIcon className="size-4" />
-                    No provider available
-                  </Button>
+                  activeProjectMissing ? (
+                    // Known-but-deleted project: the rules that would decide
+                    // provider access are unreadable here, so nothing may be
+                    // offered — a distinct state from "genuinely unscoped".
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled
+                      data-chat-provider-unavailable="true"
+                      className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
+                    >
+                      <CircleAlertIcon className="size-4" />
+                      This thread&apos;s project is no longer available
+                    </Button>
+                  ) : restrictedProviderInstanceNotes.length > 0 ? (
+                    // Restrictions emptied the picker: keep the affordance
+                    // alive so the notes explain what happened and where to
+                    // fix it, instead of a dead "No provider available".
+                    <Popover>
+                      <PopoverTrigger
+                        render={
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            data-chat-provider-unavailable="true"
+                            className="shrink-0 gap-2 px-2 text-muted-foreground sm:px-3"
+                          />
+                        }
+                      >
+                        <CircleAlertIcon className="size-4" />
+                        No provider allowed in this project
+                      </PopoverTrigger>
+                      <PopoverPopup align="start" className="w-80 p-0">
+                        <div className="px-3 py-2">
+                          <RestrictedProvidersNotes notes={restrictedProviderInstanceNotes} />
+                        </div>
+                        {restrictedProviderInstanceNotes.some(
+                          (note) => note.cause === "project-allowlist",
+                        ) ? (
+                          // Provider settings cannot change the project's own
+                          // allowlist — point at the surfaces that can. The
+                          // pasted command KEEPS the currently allowed ids and
+                          // adds the blocked ones, so it never removes valid
+                          // entries as a side effect.
+                          <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                            Allowed providers are set in the project&apos;s settings (project row →
+                            Project settings), or from the project directory with{" "}
+                            <code>
+                              {`npx t3@latest project providers . --allow ${[
+                                ...new Set([
+                                  ...(activeProjectAllowedProviderInstances ?? []),
+                                  ...restrictedProviderInstanceNotes
+                                    .filter((note) => note.cause === "project-allowlist")
+                                    .map((note) => note.entry.instanceId),
+                                ]),
+                              ].join(",")}`}
+                            </code>{" "}
+                            — <code>--all</code> clears the restriction.
+                          </p>
+                        ) : null}
+                        {restrictedProviderInstanceNotes.some(
+                          (note) => note.cause === "instance-scope",
+                        ) ? (
+                          isPrimaryEnvironment ? (
+                            <div className="border-t border-border/70 p-1.5">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+                                onClick={openProviderSettings}
+                              >
+                                <SettingsIcon className="size-4" />
+                                Provider settings
+                              </Button>
+                            </div>
+                          ) : (
+                            // Settings routes edit the primary environment;
+                            // a secondary environment's scope is changed on
+                            // that server.
+                            <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                              Provider project scope is set in that environment&apos;s own provider
+                              settings.
+                            </p>
+                          )
+                        ) : null}
+                      </PopoverPopup>
+                    </Popover>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled
+                      data-chat-provider-unavailable="true"
+                      className="shrink-0 gap-2 px-2 text-muted-foreground/70 sm:px-3"
+                    >
+                      <CircleAlertIcon className="size-4" />
+                      No provider available
+                    </Button>
+                  )
                 ) : (
                   <ProviderModelPicker
                     compact={isComposerFooterCompact}
@@ -3157,6 +3332,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       setIsComposerModelPickerOpen(open);
                     }}
                     getModelDisabledReason={getModelDisabledReason}
+                    restrictedProviderNotes={restrictedProviderInstanceNotes}
+                    {...(isPrimaryEnvironment
+                      ? { onOpenProviderSettings: openProviderSettings }
+                      : {})}
                     onInstanceModelChange={onProviderModelSelect}
                   />
                 )}

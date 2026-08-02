@@ -19,6 +19,7 @@ import type {
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadShell,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -51,6 +52,14 @@ export interface ProjectionFullThreadDiffContext {
   readonly worktreePath: string | null;
   readonly latestCheckpointTurnCount: number;
   readonly toCheckpointRef: CheckpointRef | null;
+}
+
+/** Access-relevant fields of a project row, resolved regardless of deleted state. */
+export interface ProjectionProjectAccess {
+  readonly id: ProjectId;
+  readonly title: string;
+  readonly workspaceRoot: string;
+  readonly allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null;
 }
 
 /**
@@ -161,6 +170,27 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadShellById: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
+
+  /**
+   * Read the owning project id of a thread REGARDLESS of archived/deleted
+   * state. Access checks must resolve any thread the decider still
+   * recognizes: treating an archived thread as "missing" would let a
+   * bootstrap-bearing turn substitute an arbitrary (more permissive) project
+   * for validation while the command still lands on the archived thread.
+   */
+  readonly getThreadProjectIdById: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<ProjectId>, ProjectionRepositoryError>;
+
+  /**
+   * Read a project's access-relevant fields REGARDLESS of deleted state.
+   * Access checks must resolve any project the decider still recognizes:
+   * treating a soft-deleted project as "missing" would skip the provider
+   * allowlist/scope gates entirely for threads that still live under it.
+   */
+  readonly getProjectAccessById: (
+    projectId: ProjectId,
+  ) => Effect.Effect<Option.Option<ProjectionProjectAccess>, ProjectionRepositoryError>;
 
   /**
    * Read a single active thread detail snapshot by id.

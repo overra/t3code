@@ -4,7 +4,11 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_RUNTIME_MODE, type ScopedProjectRef } from "@t3tools/contracts";
+import {
+  DEFAULT_RUNTIME_MODE,
+  getInstanceKeyedEntry,
+  type ScopedProjectRef,
+} from "@t3tools/contracts";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 import {
@@ -86,7 +90,10 @@ export function useNewThreadHandler() {
         : null;
       const composerActiveProvider = carrySourceComposer?.activeProvider ?? null;
       const composerModelSelection = composerActiveProvider
-        ? (carrySourceComposer?.modelSelectionByProvider[composerActiveProvider] ?? null)
+        ? (getInstanceKeyedEntry(
+            carrySourceComposer?.modelSelectionByProvider,
+            composerActiveProvider,
+          ) ?? null)
         : null;
       const carryModelSelection =
         composerModelSelection ?? carrySourceShell?.modelSelection ?? null;

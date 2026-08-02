@@ -15,8 +15,12 @@
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  getProviderInstanceProjectRestriction,
   PROVIDER_DISPLAY_NAMES,
+  getProviderInstanceConfig,
   type ModelSelection,
+  type ProjectAllowedProviderInstances,
+  type ProjectId,
   type ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -60,6 +64,13 @@ export interface ProviderInstanceEntry {
   readonly isDefault: boolean;
   /** True when `availability === "unavailable"` is absent or "available". */
   readonly isAvailable: boolean;
+  /**
+   * Instance project scope from `ServerSettings.providerInstances[id]
+   * .allowedProjects`, overlaid by `applyProviderInstanceSettings`; null =
+   * usable in every project. Streamed snapshots don't carry it, so entries
+   * that skipped the settings overlay always read as unrestricted.
+   */
+  readonly allowedProjects: ReadonlyArray<ProjectId> | null;
   readonly snapshot: ServerProvider;
   readonly models: ReadonlyArray<ServerProviderModel>;
 }
@@ -176,6 +187,7 @@ export function deriveProviderInstanceEntries(
       status: snapshot.status,
       isDefault,
       isAvailable: snapshot.availability !== "unavailable",
+      allowedProjects: null,
       snapshot,
       models: snapshot.models,
     } satisfies ProviderInstanceEntry;
@@ -201,14 +213,66 @@ export function applyProviderInstanceSettings(
   >;
 
   return entries.map((entry) => {
-    const explicitInstance = settings.providerInstances?.[entry.instanceId];
+    const explicitInstance = getProviderInstanceConfig(
+      settings.providerInstances,
+      entry.instanceId,
+    );
     const enabled = explicitInstance
       ? (explicitInstance.enabled ?? true)
       : entry.isDefault
         ? (legacyProviders[entry.driverKind]?.enabled ?? entry.enabled)
         : false;
-    return enabled === entry.enabled ? entry : { ...entry, enabled };
+    const allowedProjects = explicitInstance?.allowedProjects ?? null;
+    return enabled === entry.enabled && allowedProjects === entry.allowedProjects
+      ? entry
+      : { ...entry, enabled, allowedProjects };
   });
+}
+
+/**
+ * The project a picker is filtering for: identity plus its provider
+ * allowlist (`OrchestrationProjectShell.allowedProviderInstances`). `null`
+ * project = no project context (e.g. settings-scoped pickers) = unfiltered.
+ */
+export interface ProviderPickerProjectContext {
+  readonly id: ProjectId;
+  readonly allowedProviderInstances: ProjectAllowedProviderInstances | null | undefined;
+}
+
+/**
+ * Why an entry is excluded from a project's pickers, via the shared
+ * intersection rule in contracts. `null` = usable. Entries must have passed
+ * `applyProviderInstanceSettings` so their `allowedProjects` scope is
+ * populated.
+ */
+export function getProviderInstanceProjectRestrictionForEntry(
+  entry: ProviderInstanceEntry,
+  project: ProviderPickerProjectContext | null | undefined,
+): "project-allowlist" | "instance-scope" | null {
+  if (project == null) return null;
+  return getProviderInstanceProjectRestriction({
+    instanceId: entry.instanceId,
+    instanceAllowedProjects: entry.allowedProjects,
+    projectId: project.id,
+    projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
+  });
+}
+
+/**
+ * Restrict picker entries to the ones usable in a project — the project's
+ * allowlist intersected with each instance's own project scope. `null`
+ * project passes entries through untouched. Allowlisted ids that match no
+ * configured instance are ignored here; the server keeps them verbatim so
+ * they resume working if the instance returns.
+ */
+export function filterProviderInstanceEntriesForProject(
+  entries: ReadonlyArray<ProviderInstanceEntry>,
+  project: ProviderPickerProjectContext | null | undefined,
+): ReadonlyArray<ProviderInstanceEntry> {
+  if (project == null) return entries;
+  return entries.filter(
+    (entry) => getProviderInstanceProjectRestrictionForEntry(entry, project) === null,
+  );
 }
 
 /**

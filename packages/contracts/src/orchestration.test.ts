@@ -23,8 +23,15 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  getProviderInstanceProjectRestriction,
+  isProviderInstanceUsableInProject,
 } from "./orchestration.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import {
+  getProviderInstanceAllowedProjects,
+  ProviderDriverKind,
+  ProviderInstanceId,
+} from "./providerInstance.ts";
+import { ProjectId } from "./baseSchemas.ts";
 
 const decodeTurnDiffInput = Schema.decodeUnknownEffect(OrchestrationGetTurnDiffInput);
 const decodeFullThreadDiffInput = Schema.decodeUnknownEffect(OrchestrationGetFullThreadDiffInput);
@@ -913,3 +920,79 @@ it.effect("ModelSelection rejects malformed instance ids", () =>
     assert.strictEqual(result._tag, "Failure");
   }),
 );
+
+it("getProviderInstanceProjectRestriction applies both rules and attributes the blocker", () => {
+  const workInstance = ProviderInstanceId.make("claudeAgent_work");
+  const workProject = ProjectId.make("project-work");
+  const personalProject = ProjectId.make("project-personal");
+
+  // Unrestricted on both sides.
+  assert.strictEqual(
+    getProviderInstanceProjectRestriction({
+      instanceId: workInstance,
+      instanceAllowedProjects: null,
+      projectId: workProject,
+      projectAllowedProviderInstances: null,
+    }),
+    null,
+  );
+
+  // Project allowlist blocks first and wins attribution even when the
+  // instance scope would also block.
+  assert.strictEqual(
+    getProviderInstanceProjectRestriction({
+      instanceId: workInstance,
+      instanceAllowedProjects: [workProject],
+      projectId: personalProject,
+      projectAllowedProviderInstances: [ProviderInstanceId.make("codex")],
+    }),
+    "project-allowlist",
+  );
+
+  // Instance scope blocks when the project allowlist admits the instance.
+  assert.strictEqual(
+    getProviderInstanceProjectRestriction({
+      instanceId: workInstance,
+      instanceAllowedProjects: [workProject],
+      projectId: personalProject,
+      projectAllowedProviderInstances: [workInstance],
+    }),
+    "instance-scope",
+  );
+
+  // Intersection admits only when both sides admit.
+  assert.strictEqual(
+    isProviderInstanceUsableInProject({
+      instanceId: workInstance,
+      instanceAllowedProjects: [workProject],
+      projectId: workProject,
+      projectAllowedProviderInstances: [workInstance],
+    }),
+    true,
+  );
+});
+
+it("getProviderInstanceAllowedProjects reads the envelope and defaults to unrestricted", () => {
+  const workProject = ProjectId.make("project-work");
+  const map = {
+    [ProviderInstanceId.make("claudeAgent_work")]: {
+      driver: ProviderDriverKind.make("claudeAgent"),
+      allowedProjects: [workProject],
+    },
+    [ProviderInstanceId.make("codex")]: {
+      driver: ProviderDriverKind.make("codex"),
+    },
+  };
+  assert.deepStrictEqual(
+    getProviderInstanceAllowedProjects(map, ProviderInstanceId.make("claudeAgent_work")),
+    [workProject],
+  );
+  assert.strictEqual(
+    getProviderInstanceAllowedProjects(map, ProviderInstanceId.make("codex")),
+    null,
+  );
+  assert.strictEqual(
+    getProviderInstanceAllowedProjects(undefined, ProviderInstanceId.make("codex")),
+    null,
+  );
+});

@@ -1,12 +1,14 @@
 import { isLiquidGlassSupported, LiquidGlassView } from "@callstack/liquid-glass";
-import type {
-  EnvironmentId,
-  MessageId,
-  ModelSelection,
-  OrchestrationThreadShell,
-  ProviderInteractionMode,
-  RuntimeMode,
-  ServerConfig as T3ServerConfig,
+import {
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
+  type EnvironmentId,
+  type MessageId,
+  type ModelSelection,
+  type OrchestrationThreadShell,
+  type ProviderInteractionMode,
+  type RuntimeMode,
+  type ServerConfig as T3ServerConfig,
 } from "@t3tools/contracts";
 import {
   detectComposerTrigger,
@@ -36,6 +38,12 @@ import Animated, {
 import { useThemeColor } from "../../lib/useThemeColor";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import { scopedThreadKey } from "../../lib/scopedEntities";
+import {
+  isQueuedThreadMessageFailed,
+  isQueuedThreadMessagePendingCleanup,
+} from "../../state/thread-outbox";
+import { useThreadOutboxMessages } from "../../state/use-thread-outbox";
+import { FailedQueuedMessages } from "./FailedQueuedMessages";
 
 import { AppText as Text } from "../../components/AppText";
 import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStrip";
@@ -53,7 +61,11 @@ import {
 import { ControlPill, ControlPillMenu } from "../../components/ControlPill";
 import { ProviderIcon } from "../../components/ProviderIcon";
 import type { DraftComposerImageAttachment } from "../../lib/composerImages";
-import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
+import {
+  buildModelOptions,
+  groupByProvider,
+  type ModelOptionsProjectContext,
+} from "../../lib/modelOptions";
 import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
 import type { RemoteClientConnectionState } from "../../lib/connection";
 import {
@@ -103,6 +115,8 @@ export interface ThreadComposerProps {
   readonly activeThreadBusy: boolean;
   readonly environmentId: EnvironmentId;
   readonly projectCwd: string | null;
+  /** Thread's project context for provider-access filtering of the model menu. */
+  readonly project: ModelOptionsProjectContext | null;
   readonly editorRef?: RefObject<ComposerEditorHandle | null>;
   readonly onChangeDraftMessage: (value: string) => void;
   readonly onPickDraftImages: () => Promise<void>;
@@ -279,7 +293,41 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
-  const canSend = hasContent;
+  // Deterministically rejected queued messages hold this thread's queue and
+  // will never send on their own — they get a recovery card (edit / retry /
+  // delete) instead of being counted as "will send automatically".
+  const queuedByThreadKey = useThreadOutboxMessages();
+  const failedQueuedMessages = useMemo(() => {
+    const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
+    return (queuedByThreadKey[threadKey] ?? []).filter(
+      (message) =>
+        isQueuedThreadMessageFailed(message) && !isQueuedThreadMessagePendingCleanup(message),
+    );
+  }, [props.environmentId, props.selectedThread.id, queuedByThreadKey]);
+  const pendingQueueCount = props.queueCount - failedQueuedMessages.length;
+  // A thread whose persisted selection the project's provider access rules
+  // no longer admit must not send (or queue) — the server rejects the turn,
+  // and a queued one would poison the outbox. The model menu only offers
+  // allowed instances, so picking any model clears this.
+  const currentSelectionRestricted = useMemo(() => {
+    if (props.project === null) return false;
+    const instanceId = props.selectedThread.modelSelection.instanceId;
+    // The project's own allowlist is decisive even before serverConfig has
+    // loaded; instance scope additionally applies once settings arrive.
+    const allowlist = props.project.allowedProviderInstances;
+    if (allowlist !== null && !allowlist.includes(instanceId)) return true;
+    if (!props.serverConfig) return false;
+    return !isProviderInstanceUsableInProject({
+      instanceId,
+      instanceAllowedProjects: getProviderInstanceAllowedProjects(
+        props.serverConfig.settings.providerInstances,
+        instanceId,
+      ),
+      projectId: props.project.id,
+      projectAllowedProviderInstances: allowlist,
+    });
+  }, [props.project, props.serverConfig, props.selectedThread.modelSelection.instanceId]);
+  const canSend = hasContent && !currentSelectionRestricted;
 
   const onPressImage = useCallback(
     (uri: string) => {
@@ -515,6 +563,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const { onChangeDraftMessage, onUpdateInteractionMode, draftMessage, onSendMessage } = props;
 
   const handleSend = useCallback(async () => {
+    // Guard the ACTION, not just the button: the editor's submit handler
+    // (hardware keyboard Cmd+Return) calls this directly, bypassing the
+    // disabled Send affordance.
+    if (currentSelectionRestricted) return;
     const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
     if (inFlightThreadIdsRef.current.has(threadKey)) return;
     inFlightThreadIdsRef.current.add(threadKey);
@@ -532,6 +584,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       inFlightThreadIdsRef.current.delete(threadKey);
     }
   }, [
+    currentSelectionRestricted,
     onSendMessage,
     props.environmentId,
     props.environmentLabel,
@@ -583,8 +636,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
 
   // ── Model menu ───────────────────────────────────────────
   const modelOptions = useMemo(
-    () => buildModelOptions(props.serverConfig, currentModelSelection),
-    [props.serverConfig, currentModelSelection],
+    () => buildModelOptions(props.serverConfig, currentModelSelection, props.project),
+    [props.serverConfig, currentModelSelection, props.project],
   );
   const providerGroups = useMemo(() => groupByProvider(modelOptions), [modelOptions]);
   const currentModelOption =
@@ -911,12 +964,31 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           </Animated.View>
         ) : null}
 
-        {/* Queue count */}
-        {props.queueCount > 0 ? (
+        {/* Provider restricted for this project */}
+        {currentSelectionRestricted ? (
           <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
             <Text className="pt-2 text-xs text-foreground-muted">
-              {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
-              automatically.
+              This thread&apos;s provider is not allowed in this project. Pick another model to
+              continue.
+            </Text>
+          </Animated.View>
+        ) : null}
+
+        {/* Failed queued messages need user resolution before the queue moves */}
+        <FailedQueuedMessages
+          failedMessages={failedQueuedMessages}
+          queuedBehindCount={pendingQueueCount}
+        />
+
+        {/* Queue count */}
+        {pendingQueueCount > 0 ? (
+          <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
+            <Text className="pt-2 text-xs text-foreground-muted">
+              {`${pendingQueueCount} queued message${pendingQueueCount === 1 ? "" : "s"} will send ${
+                failedQueuedMessages.length > 0
+                  ? "once the failed message is resolved."
+                  : "automatically."
+              }`}
             </Text>
           </Animated.View>
         ) : null}

@@ -1,10 +1,14 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ServerSettings,
+  ServerSettingsPatch,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 import { resolveServerBackgroundActivitySettings } from "./backgroundActivitySettings.ts";
 import { createModelSelection } from "./model.ts";
@@ -264,6 +268,121 @@ describe("serverSettings helpers", () => {
     expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
   });
 
+  it("merges providerInstancesPatch onto the current map without touching other instances", () => {
+    const codexId = ProviderInstanceId.make("codex");
+    const workId = ProviderInstanceId.make("claudeAgent_work");
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [codexId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled: true,
+          config: { homePath: "~/.codex" },
+        },
+        [workId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: null,
+        },
+      },
+    };
+
+    // Upsert one instance: the sibling — which a stale client map would have
+    // reverted — is untouched, including its full config blob.
+    const narrowed = applyServerSettingsPatch(current, {
+      providerInstancesPatch: {
+        [workId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: [ProjectId.make("project-work")],
+        },
+      },
+    }).providerInstances;
+    expect(narrowed[codexId]).toEqual(current.providerInstances[codexId]);
+    expect(narrowed[workId]?.allowedProjects).toEqual([ProjectId.make("project-work")]);
+
+    // Null deletes exactly that entry.
+    const deleted = applyServerSettingsPatch(current, {
+      providerInstancesPatch: { [codexId]: null },
+    }).providerInstances;
+    expect(deleted[codexId]).toBeUndefined();
+    expect(deleted[workId]).toEqual(current.providerInstances[workId]);
+  });
+
+  it("retains restricted instances a legacy whole-map write omits", () => {
+    const codexId = ProviderInstanceId.make("codex");
+    const workId = ProviderInstanceId.make("claudeAgent_work");
+    const openId = ProviderInstanceId.make("claudeAgent");
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [codexId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled: true,
+        },
+        [workId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: [ProjectId.make("project-work")],
+        },
+        [openId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: null,
+        },
+      },
+    };
+
+    // A pre-capability client re-sends only the entry it knows about. The
+    // RESTRICTED instance it omitted survives (deleting it would let
+    // hydration resynthesize an unscoped default); the unrestricted
+    // (null-scope) and unscoped omissions still delete.
+    const next = applyServerSettingsPatch(current, {
+      providerInstances: {
+        [codexId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled: false,
+        },
+      },
+    }).providerInstances;
+    expect(next[codexId]?.enabled).toBe(false);
+    expect(next[workId]).toEqual(current.providerInstances[workId]);
+    expect(next[openId]).toBeUndefined();
+  });
+
+  it("treats nonexistent prototype-named instances as disabled, not inherited", () => {
+    // A bare indexed read of "constructor" would match Object.prototype and
+    // make the nonexistent instance look configured-and-enabled.
+    expect(
+      isModelSelectionProviderEnabled(DEFAULT_SERVER_SETTINGS, {
+        instanceId: ProviderInstanceId.make("constructor"),
+        model: "some-model",
+      }),
+    ).toBe(false);
+  });
+
+  it("retains restricted instances with prototype-named ids", () => {
+    // Instance ids are user-chosen strings: "constructor" must behave like
+    // any other id, not match Object.prototype via `in`/property reads.
+    const protoId = ProviderInstanceId.make("constructor");
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [protoId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          allowedProjects: [ProjectId.make("project-work")],
+        },
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      providerInstances: {},
+    }).providerInstances;
+    expect(Object.hasOwn(next, protoId)).toBe(true);
+    expect(next[protoId]).toEqual(current.providerInstances[protoId]);
+  });
+
   it("replaces providerInstances maps so omitted instance fields are cleared", () => {
     const codexId = ProviderInstanceId.make("codex");
     const current = {
@@ -511,5 +630,54 @@ describe("serverSettings helpers", () => {
     });
 
     expect(resolved.pauseWhenOnBattery).toBe(false);
+  });
+});
+
+describe("provider instance project scope wire round-trip", () => {
+  it("preserves allowedProjects through patch decode, apply, and settings re-encode", () => {
+    const workProject = ProjectId.make("project-work");
+    const rawPatch = {
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          enabled: true,
+          allowedProjects: [workProject],
+        },
+        claudeAgent: {
+          driver: "claudeAgent",
+        },
+      },
+    };
+    // The exact wire pipeline: client encodes ServerSettingsPatch, server
+    // decodes it, applies it, and persists via the ServerSettings schema.
+    // A stale schema on either side of this pipeline silently drops the
+    // envelope field (Struct decode discards unknown keys), so this test
+    // pins the current schema round-trip end to end.
+    const decodedPatch = Schema.decodeUnknownSync(ServerSettingsPatch)(rawPatch);
+    const next = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, decodedPatch);
+    expect(
+      next.providerInstances[ProviderInstanceId.make("claudeAgent_work")]?.allowedProjects,
+    ).toEqual([workProject]);
+    expect(
+      next.providerInstances[ProviderInstanceId.make("claudeAgent")]?.allowedProjects,
+    ).toBeUndefined();
+
+    const persisted = Schema.encodeUnknownSync(ServerSettings)(next);
+    const reloaded = Schema.decodeUnknownSync(ServerSettings)(persisted);
+    expect(
+      reloaded.providerInstances[ProviderInstanceId.make("claudeAgent_work")]?.allowedProjects,
+    ).toEqual([workProject]);
+  });
+
+  it("rejects an empty allowedProjects list at the schema layer", () => {
+    const result = Schema.decodeUnknownExit(ServerSettingsPatch)({
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          allowedProjects: [],
+        },
+      },
+    });
+    expect(result._tag).toBe("Failure");
   });
 });

@@ -12,8 +12,10 @@ import { AtomRegistry } from "effect/unstable/reactivity";
 import {
   decodeQueuedThreadMessage,
   encodeQueuedThreadMessage,
+  flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   isQueuedThreadCreationSendable,
+  isQueuedThreadMessagePendingCleanup,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
@@ -206,6 +208,518 @@ describe("thread outbox", () => {
     releaseInitialLoad();
     await Promise.all([loading, clearing]);
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
+    registry.dispose();
+  });
+
+  it("marks the CURRENT entry failed and clears the markers on edit or re-enqueue", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const message = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(message);
+
+    // markFailed() applies to the CURRENT stored entry — including edits
+    // made while the rejection round-tripped — so marking can never clobber
+    // concurrently edited content.
+    await manager.update({ ...message, text: "edited while rejection was in flight" });
+    expect(
+      await manager.markFailed(message.messageId, {
+        failedAt: "2026-06-08T10:00:05.000Z",
+        failureReason: "provider access revoked",
+      }),
+    ).toBe("marked");
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "edited while rejection was in flight",
+      failedAt: "2026-06-08T10:00:05.000Z",
+      failureReason: "provider access revoked",
+    });
+
+    // An editor save is the explicit requeue gesture: it reconstructs the
+    // record without the markers and update() lets them clear.
+    expect(await manager.update({ ...message, text: "editor save" })).toBe(true);
+    expect(stored.get(message.messageId)?.failedAt).toBeUndefined();
+    expect(stored.get(message.messageId)?.failureReason).toBeUndefined();
+
+    // Same for a same-id re-enqueue (offline resubmission).
+    await manager.markFailed(message.messageId, { failedAt: "2026-06-08T10:00:06.000Z" });
+    await manager.enqueue({ ...message, text: "resubmitted" });
+    expect(stored.get(message.messageId)).toMatchObject({ text: "resubmitted" });
+    expect(stored.get(message.messageId)?.failedAt).toBeUndefined();
+
+    // The LEGACY restoredAt marker stays monotonic through both paths: its
+    // content already lives in a composer draft, so the entry must never
+    // become deliverable again.
+    stored.set(message.messageId, {
+      ...stored.get(message.messageId)!,
+      restoredAt: "2026-06-08T10:00:07.000Z",
+    });
+    registry.dispose();
+    const registry2 = AtomRegistry.make();
+    const manager2 = createThreadOutboxManager({ registry: registry2, storage });
+    await manager2.load();
+    await manager2.update({ ...message, text: "post-restore editor save" });
+    expect(stored.get(message.messageId)).toMatchObject({
+      text: "post-restore editor save",
+      restoredAt: "2026-06-08T10:00:07.000Z",
+    });
+
+    // Marking an entry deleted concurrently writes nothing and reports it.
+    await manager2.remove(message);
+    expect(
+      await manager2.markFailed(message.messageId, { failedAt: "2026-06-08T10:00:08.000Z" }),
+    ).toBe("missing");
+    expect(stored.size).toBe(0);
+    registry2.dispose();
+  });
+
+  it("restores the displaced entry when a same-id enqueue's durable write fails", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (failNextWrite) {
+          failNextWrite = false;
+          throw new Error("disk full");
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // The replacement's write fails: the durably stored entry it displaced
+    // must come back into the queue — dropping it would leave the atom and
+    // disk divergent until the next full reload.
+    failNextWrite = true;
+    await expect(manager.enqueue({ ...original, text: "replacement" })).rejects.toBeInstanceOf(
+      ThreadOutboxManagerError,
+    );
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toBe(original);
+    expect(stored.get(original.messageId)?.text).toBe("message-1");
+    registry.dispose();
+  });
+
+  it("rolls chained failed re-enqueues back to the durable baseline", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failWrites = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (failWrites) throw new Error("disk full");
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // Both replacements fail durably. The rollback target is the COMMITTED
+    // baseline, not the previous optimistic entry — restoring optimistic B
+    // (whose own write failed) would leave the atom showing content disk
+    // never accepted.
+    failWrites = true;
+    const second = manager.enqueue({ ...original, text: "replacement-b" }).catch((error) => error);
+    const third = manager.enqueue({ ...original, text: "replacement-c" }).catch((error) => error);
+    expect(await second).toBeInstanceOf(ThreadOutboxManagerError);
+    expect(await third).toBeInstanceOf(ThreadOutboxManagerError);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toBe(original);
+    expect(stored.get(original.messageId)?.text).toBe("message-1");
+    registry.dispose();
+  });
+
+  it("keeps the committed baseline usable when load follows an enqueue", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      // Production storage DECODES fresh objects on every load — the same
+      // content under a different identity than what enqueue published.
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+    await manager.load();
+
+    // The freshly decoded load result must not displace the committed
+    // identity of the already-published entry — that would turn every later
+    // update into a no-op and leave remove ghosting the atom.
+    expect(await manager.update({ ...original, text: "edited" })).toBe(true);
+    expect(stored.get(original.messageId)?.text).toBe("edited");
+    const afterUpdate = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(afterUpdate[0]?.text).toBe("edited");
+
+    await manager.remove(original);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
+  it("clears exactly one deleted thread's entries, failed ones included", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const sibling = queuedMessage({
+      threadId: "thread-kept",
+      messageId: "message-2",
+      createdAt: "2026-06-08T10:00:02.000Z",
+    });
+    await manager.enqueue(doomed);
+    await manager.enqueue(sibling);
+    await manager.markFailed(doomed.messageId, { failedAt: "2026-06-08T10:00:03.000Z" });
+
+    // Explicit thread deletion is the lifecycle evidence the drain lacks:
+    // it clears the deleted thread's queue — failed entries included —
+    // while other threads' entries are untouched.
+    await manager.clearThread(doomed.environmentId, doomed.threadId);
+    const remaining = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.messageId).toBe(sibling.messageId);
+    expect(stored.has(doomed.messageId)).toBe(false);
+    expect(stored.has(sibling.messageId)).toBe(true);
+    registry.dispose();
+  });
+
+  it("keeps a durable cleanup intent when a deleted thread's removal fails", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let failRemoval = true;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        if (failRemoval) throw new Error("remove failed");
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+    await manager.markFailed(doomed.messageId, { failedAt: "2026-06-08T10:00:02.000Z" });
+
+    // The removal fails, but the intent was written first: the entry stays
+    // MARKED in both stores rather than silently stranded, so the drain can
+    // resume the deletion — including after a restart.
+    await manager.clearThread(doomed.environmentId, doomed.threadId);
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const marked = flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom));
+    expect(marked).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(marked[0]!)).toBe(true);
+
+    // `threadDeletedAt` is TERMINAL. A trailing editor flush is refused
+    // outright, and a same-id requeue cannot un-delete the thread: the
+    // marker survives in both stores, so the entry stays hidden and on the
+    // cleanup path instead of becoming dispatchable again.
+    expect(await manager.update({ ...doomed, text: "trailing editor flush" })).toBe(false);
+    expect(stored.get(doomed.messageId)?.text).toBe("message-1");
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+
+    await manager.enqueue({ ...doomed, text: "same-id requeue" });
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const afterRequeue = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(afterRequeue).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(afterRequeue[0]!)).toBe(true);
+
+    // A fresh process reloads the marked entry and resumes the removal.
+    registry.dispose();
+    const registry2 = AtomRegistry.make();
+    const manager2 = createThreadOutboxManager({ registry: registry2, storage });
+    await manager2.load();
+    const reloaded = flattenQueuedThreadMessages(
+      registry2.get(manager2.queuedMessagesByThreadKeyAtom),
+    );
+    expect(isQueuedThreadMessagePendingCleanup(reloaded[0]!)).toBe(true);
+
+    failRemoval = false;
+    await manager2.remove(reloaded[0]!);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry2.get(manager2.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry2.dispose();
+  });
+
+  it("applies the terminal marker to an enqueue that raced the cleanup write", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let releaseWrite: () => void = () => {};
+    let gateNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        if (gateNextWrite) {
+          gateNextWrite = false;
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve;
+          });
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        // Removal keeps failing at first, so the marked entry stays queued
+        // for the cleanup retry.
+        if (failRemoval) throw new Error("remove failed");
+        stored.delete(message.messageId);
+      },
+    };
+    let failRemoval = true;
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+
+    // clearThread's marker write is in flight when a same-id enqueue starts:
+    // it snapshots the still-unmarked entry before entering the mutation
+    // queue. Committing that stale snapshot would leave disk unmarked while
+    // the atom shows marked — deleted content dispatchable again.
+    gateNextWrite = true;
+    const clearing = manager.clearThread(doomed.environmentId, doomed.threadId);
+    await Promise.resolve();
+    await Promise.resolve();
+    const requeueing = manager.enqueue({ ...doomed, text: "racing requeue" });
+    releaseWrite();
+    await Promise.all([clearing, requeueing]);
+
+    expect(stored.get(doomed.messageId)?.threadDeletedAt).toBeDefined();
+    const live = flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom));
+    expect(live).toHaveLength(1);
+    expect(isQueuedThreadMessagePendingCleanup(live[0]!)).toBe(true);
+    // Atom and disk agree, so the resumed removal clears BOTH once storage
+    // recovers — the published identity still matches the committed entry,
+    // rather than stranding a ghost the drain can never remove.
+    expect(live[0]?.text).toBe(stored.get(doomed.messageId)?.text);
+    failRemoval = false;
+    await manager.remove(live[0]!);
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
+  it("abandons an enqueue whose entry a completed cleanup already removed", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let releaseWrite: () => void = () => {};
+    let gateNextWrite = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()].map((message) => ({ ...message })),
+      write: async (message) => {
+        if (gateNextWrite) {
+          gateNextWrite = false;
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve;
+          });
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage, warn: () => {} });
+    const doomed = queuedMessage({
+      threadId: "thread-deleted",
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(doomed);
+
+    // Same race as above, but cleanup's removal SUCCEEDS: it drops the
+    // committed marker and the atom entry. The queued enqueue must not then
+    // commit its stale snapshot — that would recreate the deleted content
+    // on disk as a ghost no surface can show or remove.
+    gateNextWrite = true;
+    const clearing = manager.clearThread(doomed.environmentId, doomed.threadId);
+    await Promise.resolve();
+    await Promise.resolve();
+    const requeueing = manager.enqueue({ ...doomed, text: "racing requeue" });
+    releaseWrite();
+    await Promise.all([clearing, requeueing]);
+
+    expect(stored.size).toBe(0);
+    expect(
+      flattenQueuedThreadMessages(registry.get(manager.queuedMessagesByThreadKeyAtom)),
+    ).toHaveLength(0);
+    registry.dispose();
+  });
+
+  it("installs the persisted rollback baseline for an enqueue racing load", async () => {
+    const registry = AtomRegistry.make();
+    const durable = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const stored = new Map<MessageId, QueuedThreadMessage>([[durable.messageId, durable]]);
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    let failWrites = false;
+    const storage: ThreadOutboxStorage = {
+      load: async () => {
+        await loadGate;
+        return [...stored.values()].map((message) => ({ ...message }));
+      },
+      write: async (message) => {
+        if (failWrites) throw new Error("disk full");
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+
+    // A same-id optimistic enqueue lands while load() is still reading. The
+    // persisted entry must still become the committed rollback baseline: if
+    // it were skipped for being "live", this failing write would drop the
+    // atom entry while its durable predecessor stays on disk.
+    const loading = manager.load();
+    await Promise.resolve();
+    failWrites = true;
+    const enqueueing = manager
+      .enqueue({ ...durable, text: "optimistic-replacement" })
+      .catch((error) => error);
+    releaseLoad();
+    await loading;
+    expect(await enqueueing).toBeInstanceOf(ThreadOutboxManagerError);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toBe("message-1");
+    expect(stored.get(durable.messageId)?.text).toBe("message-1");
+    registry.dispose();
+  });
+
+  it("keeps atom and disk aligned when a failure mark races an optimistic re-enqueue", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    let gate: Promise<void> | null = null;
+    let releaseGate!: () => void;
+    const storage: ThreadOutboxStorage = {
+      load: async () => [...stored.values()],
+      write: async (message) => {
+        if (gate !== null) {
+          const pending = gate;
+          gate = null;
+          await pending;
+        }
+        stored.set(message.messageId, message);
+      },
+      remove: async (message) => {
+        stored.delete(message.messageId);
+      },
+    };
+    const manager = createThreadOutboxManager({ registry, storage });
+    const original = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    await manager.enqueue(original);
+
+    // The failure marker's write blocks while an optimistic re-enqueue of
+    // the same id lands. The resubmission postdates the failure, so BOTH
+    // stores must end unfailed with the resubmitted content — never atom
+    // "failed A" over disk "unfailed B".
+    gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const marking = manager.markFailed(original.messageId, {
+      failedAt: "2026-06-08T10:00:05.000Z",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const enqueueing = manager.enqueue({ ...original, text: "resubmitted" });
+    releaseGate();
+    await Promise.all([marking, enqueueing]);
+
+    const messages = flattenQueuedThreadMessages(
+      registry.get(manager.queuedMessagesByThreadKeyAtom),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toBe("resubmitted");
+    expect(messages[0]?.failedAt).toBeUndefined();
+    expect(stored.get(original.messageId)?.text).toBe("resubmitted");
+    expect(stored.get(original.messageId)?.failedAt).toBeUndefined();
     registry.dispose();
   });
 
@@ -581,22 +1095,65 @@ describe("thread outbox", () => {
     expect(shouldRetryThreadOutboxDelivery(new Error("Thread no longer exists"))).toBe(false);
   });
 
-  it("retains queued messages when settings synchronization fails before startTurn", () => {
-    const deterministicFailure = new Error("Thread no longer exists");
+  it("retains queued messages when settings synchronization fails ambiguously", () => {
+    const ambiguousFailure = new Error("Thread no longer exists");
 
     expect(
       resolveThreadOutboxFailureAction({
         stage: "settings-sync",
-        error: deterministicFailure,
+        error: ambiguousFailure,
         interrupted: false,
       }),
     ).toBe("retry");
     expect(
       resolveThreadOutboxFailureAction({
         stage: "start-turn",
-        error: deterministicFailure,
+        error: ambiguousFailure,
         interrupted: false,
       }),
     ).toBe("discard");
+  });
+
+  it("drops typed deterministic rejections in BOTH stages so they cannot pin the FIFO", () => {
+    const accessDenied = {
+      _tag: "OrchestrationDispatchCommandError",
+      message: "Provider instance 'claudeAgent' is not allowed for project 'work'.",
+    };
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: accessDenied,
+        interrupted: false,
+      }),
+    ).toBe("discard");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: { _tag: "OrchestrationCommandInvariantError", detail: "not allowed" },
+        interrupted: false,
+      }),
+    ).toBe("discard");
+  });
+
+  it("retries dispatch rejections marked retryable (verification outages)", () => {
+    const verificationOutage = {
+      _tag: "OrchestrationDispatchCommandError",
+      message: "Provider access could not be verified (server settings unavailable). Try again.",
+      retryable: true,
+    };
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "settings-sync",
+        error: verificationOutage,
+        interrupted: false,
+      }),
+    ).toBe("retry");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: verificationOutage,
+        interrupted: false,
+      }),
+    ).toBe("retry");
   });
 });

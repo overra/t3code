@@ -210,6 +210,25 @@ describe("ProviderSessionReaper", () => {
                 ? Option.some(input.readModel.threads.find((thread) => thread.id === threadId)!)
                 : Option.none(),
             ),
+          getThreadProjectIdById: (threadId) =>
+            Effect.succeed(
+              Option.fromNullishOr(
+                input.readModel.threads.find((thread) => thread.id === threadId)?.projectId,
+              ),
+            ),
+          getProjectAccessById: (projectId) =>
+            Effect.succeed(
+              Option.fromNullishOr(
+                input.readModel.projects.find((project) => project.id === projectId),
+              ).pipe(
+                Option.map((project) => ({
+                  id: project.id,
+                  title: project.title,
+                  workspaceRoot: project.workspaceRoot,
+                  allowedProviderInstances: null,
+                })),
+              ),
+            ),
           getThreadDetailById: () => Effect.die("unused"),
           getThreadDetailSnapshot: () => Effect.die("unused"),
           searchThreads: () => Effect.succeed({ matches: [] }),

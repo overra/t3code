@@ -1,5 +1,6 @@
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
+import * as Option from "effect/Option";
 import {
   canSnooze,
   effectiveSettled,
@@ -12,7 +13,11 @@ import {
   scopeThreadRef,
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, SidebarProjectGroupingMode } from "@t3tools/contracts";
+import type {
+  ProviderInstanceId,
+  ScopedThreadRef,
+  SidebarProjectGroupingMode,
+} from "@t3tools/contracts";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
@@ -93,6 +98,7 @@ import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
+import { environmentShell } from "../state/shell";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
 import { projectEnvironment } from "../state/projects";
@@ -140,11 +146,17 @@ import {
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";
-import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../providerInstances";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  sortProviderInstanceEntries,
+  type ProviderInstanceEntry,
+} from "../providerInstances";
 import { primaryServerProvidersAtom } from "../state/server";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { Button } from "./ui/button";
+import { Checkbox } from "./ui/checkbox";
 import {
   Dialog,
   DialogDescription,
@@ -1064,6 +1076,219 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
 });
 
+/**
+ * Per-project provider allowlist editor in the project settings dialog.
+ * Every checkbox reflects one configured provider instance of the member's
+ * environment. All-checked is stored as `null` (unrestricted, so instances
+ * added later are allowed automatically); any partial selection is stored as
+ * an explicit instance-id list. The last effectively-usable instance cannot
+ * be unchecked — an empty effective set would leave the project unable to
+ * start threads, and the server rejects an empty allowlist.
+ *
+ * Rows for instances whose own project scope (Settings → Providers) excludes
+ * this project render disabled with that verdict, so the dialog always shows
+ * the *effective* policy even though it only edits the project's half.
+ */
+function ProjectAllowedProvidersControl(props: {
+  member: SidebarProjectGroupMember;
+  providerEntries: ReadonlyArray<ProviderInstanceEntry>;
+  /**
+   * Resolves `{ok: false}` when the server rejected the update (optimistic
+   * state rolls back); on success carries the dispatch's event sequence so
+   * the overlay can hold until the shell stream provably reflects it.
+   */
+  onUpdate: (
+    member: SidebarProjectGroupMember,
+    allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
+  ) => Promise<{ readonly ok: boolean; readonly sequence?: number }>;
+}) {
+  const { member, providerEntries, onUpdate } = props;
+  // Optimistic overlay: rapid toggles must chain off the value just written,
+  // not the streamed prop (which lags a round-trip and would resurrect the
+  // previous edit). The overlay resolves against an AUTHORITATIVE
+  // acknowledgment: every dispatch returns the event sequence its write
+  // produced, and the shell stream applies events in sequence order — so
+  // the overlay clears only once the environment's applied snapshot
+  // sequence has caught up to the highest acknowledged write with no write
+  // in flight. Never on value equality (ambiguous under A→B→A) and never on
+  // elapsed time (a delayed or reconnect-replayed echo after a timed clear
+  // would expose stale policy that the next toggle then composes from). A
+  // rejected write rolls back immediately, generation-guarded.
+  const [pendingAllowed, setPendingAllowed] = useState<
+    ReadonlyArray<ProviderInstanceId> | null | undefined
+  >(undefined);
+  const [settledTick, setSettledTick] = useState(0);
+  const generationRef = useRef(0);
+  const inflightRef = useRef(0);
+  const ackSequenceRef = useRef(0);
+  const shellState = useAtomValue(environmentShell.stateValueAtom(member.environmentId));
+  const appliedSequence = Option.match(shellState.snapshot, {
+    onNone: () => 0,
+    onSome: (snapshot) => snapshot.snapshotSequence,
+  });
+  const propAllowed = member.allowedProviderInstances ?? null;
+  useEffect(() => {
+    if (pendingAllowed === undefined) return;
+    if (inflightRef.current !== 0) return;
+    if (appliedSequence >= ackSequenceRef.current) {
+      setPendingAllowed(undefined);
+    }
+  }, [pendingAllowed, settledTick, appliedSequence]);
+  const allowed = pendingAllowed !== undefined ? pendingAllowed : propAllowed;
+  const checkedIds = useMemo(
+    () =>
+      allowed === null
+        ? new Set<ProviderInstanceId>(providerEntries.map((entry) => entry.instanceId))
+        : new Set<ProviderInstanceId>(allowed),
+    [allowed, providerEntries],
+  );
+  const isScopeExcluded = (entry: ProviderInstanceEntry): boolean =>
+    entry.allowedProjects !== null && !entry.allowedProjects.includes(member.id);
+  // "Effectively usable" additionally requires the instance to be enabled
+  // AND available: a checked-but-disabled provider (or an unavailable
+  // shadow for a missing fork driver) cannot start threads, so neither may
+  // satisfy the do-not-strand guard below.
+  const isEffectivelyUsable = (entry: ProviderInstanceEntry): boolean =>
+    entry.enabled && entry.isAvailable && !isScopeExcluded(entry);
+  const effectiveCheckedCount = providerEntries.filter(
+    (entry) => checkedIds.has(entry.instanceId) && isEffectivelyUsable(entry),
+  ).length;
+
+  const submit = (next: ReadonlyArray<ProviderInstanceId> | null) => {
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    inflightRef.current += 1;
+    setPendingAllowed(next);
+    void onUpdate(member, next)
+      .then((outcome) => {
+        if (outcome.ok) {
+          if (outcome.sequence !== undefined) {
+            ackSequenceRef.current = Math.max(ackSequenceRef.current, outcome.sequence);
+          }
+          return;
+        }
+        if (generationRef.current === generation) setPendingAllowed(undefined);
+      })
+      .finally(() => {
+        inflightRef.current -= 1;
+        setSettledTick((tick) => tick + 1);
+      });
+  };
+
+  const toggle = (instanceId: ProviderInstanceId, checked: boolean) => {
+    const next = new Set(checkedIds);
+    if (checked) {
+      next.add(instanceId);
+    } else {
+      next.delete(instanceId);
+    }
+    if (
+      !providerEntries.some((entry) => next.has(entry.instanceId) && isEffectivelyUsable(entry))
+    ) {
+      return;
+    }
+    // Ids in the allowlist without a configured instance survive toggles
+    // verbatim; collapsing to `null` (everything configured is checked)
+    // intentionally drops them, since "all providers" supersedes the list.
+    const coversAllConfigured = providerEntries.every((entry) => next.has(entry.instanceId));
+    submit(coversAllConfigured ? null : [...next]);
+  };
+
+  // Mixer-style solo: one click expresses "this project uses exactly this
+  // provider" without unchecking every other row.
+  const solo = (instanceId: ProviderInstanceId) => {
+    submit([instanceId]);
+  };
+  const isSoloed = (entry: ProviderInstanceEntry): boolean =>
+    allowed !== null && allowed.length === 1 && allowed[0] === entry.instanceId;
+
+  if (providerEntries.length === 0) {
+    return (
+      <div className="grid min-w-0 gap-1.5">
+        <span className="font-medium text-foreground">Allowed providers</span>
+        <p className="text-base text-muted-foreground sm:text-sm">
+          Provider list unavailable for this environment.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid min-w-0 gap-1.5">
+      <span className="font-medium text-foreground">Allowed providers</span>
+      <p className="text-base text-pretty text-muted-foreground sm:text-sm">
+        {allowed === null
+          ? "Threads in this project can use any provider."
+          : "Threads in this project can only use the checked providers. Existing conversations on an unchecked provider pause until it is re-allowed."}
+      </p>
+      <div className="grid gap-1 sm:grid-cols-2">
+        {providerEntries.map((entry) => {
+          const isChecked = checkedIds.has(entry.instanceId);
+          const scopeExcluded = isScopeExcluded(entry);
+          const isLastChecked =
+            isChecked && isEffectivelyUsable(entry) && effectiveCheckedCount === 1;
+          const canSolo = isEffectivelyUsable(entry) && !isSoloed(entry);
+          return (
+            <label
+              key={entry.instanceId}
+              className={cn(
+                "group/provider-row flex min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border/60 px-2.5 py-1.5 transition-colors hover:bg-muted/40",
+                scopeExcluded && "cursor-default opacity-60 hover:bg-transparent",
+              )}
+              title={
+                scopeExcluded
+                  ? `${entry.displayName} is limited to other projects. Change its project scope in Settings → Providers.`
+                  : isLastChecked
+                    ? "At least one provider must stay allowed."
+                    : entry.displayName
+              }
+            >
+              <Checkbox
+                checked={isChecked}
+                disabled={scopeExcluded || isLastChecked}
+                onCheckedChange={(checked) => toggle(entry.instanceId, checked === true)}
+                aria-label={`Allow ${entry.displayName} in this project`}
+              />
+              <ProviderInstanceIcon
+                driverKind={entry.driverKind}
+                displayName={entry.displayName}
+                accentColor={entry.accentColor}
+                className="size-4"
+                iconClassName="size-4"
+              />
+              <span className="grid min-w-0 gap-0">
+                <span className="min-w-0 truncate text-base sm:text-sm">{entry.displayName}</span>
+                {scopeExcluded ? (
+                  <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    Excluded by provider setting
+                  </span>
+                ) : null}
+              </span>
+              {canSolo ? (
+                <button
+                  type="button"
+                  className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-xs text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none group-hover/provider-row:opacity-100"
+                  title={`Allow only ${entry.displayName} in this project`}
+                  aria-label={`Allow only ${entry.displayName} in this project`}
+                  onClick={(event) => {
+                    // Inside the row label: without these, the click also
+                    // activates the label and toggles the checkbox.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    solo(entry.instanceId);
+                  }}
+                >
+                  Only
+                </button>
+              ) : null}
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function latestTurnDiff(
   thread: SidebarThreadSummary,
 ): { insertions: number; deletions: number } | null {
@@ -1529,6 +1754,40 @@ export default function SidebarV2() {
           }),
         );
       }
+    },
+    [updateProject],
+  );
+
+  const updateProjectAllowedProviders = useCallback(
+    async (
+      member: SidebarProjectGroupMember,
+      allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
+    ): Promise<{ readonly ok: boolean; readonly sequence?: number }> => {
+      // The decider auto-clears a default the new allowlist excludes;
+      // deriving that clear here from possibly-stale member state raced the
+      // dialog's own rapid edits.
+      const result = await updateProject({
+        environmentId: member.environmentId,
+        input: {
+          projectId: member.id,
+          allowedProviderInstances,
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Failed to update allowed providers",
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+        );
+      }
+      if (result._tag !== "Success") {
+        return { ok: result._tag !== "Failure" };
+      }
+      const sequence = (result.value as { sequence?: unknown }).sequence;
+      return { ok: true, ...(typeof sequence === "number" ? { sequence } : {}) };
     },
     [updateProject],
   );
@@ -3142,6 +3401,46 @@ export default function SidebarV2() {
                       </Select>
                     </label>
                   </div>
+                  {serverConfigs.get(member.environmentId)?.environment.capabilities
+                    .providerProjectScopes !== true ? (
+                    // Version-skew gate: an older server strips the
+                    // allowlist field from the command and would silently
+                    // acknowledge a no-op — hide the editor rather than
+                    // pretend the policy took effect.
+                    <p className="text-xs text-muted-foreground">
+                      Managing allowed providers requires a newer server on this environment.
+                    </p>
+                  ) : (
+                    <ProjectAllowedProvidersControl
+                      // `projectActionsTarget` is a snapshot from dialog-open;
+                      // overlay the live project record so the allowlist
+                      // checkboxes track the shell stream instead of freezing
+                      // at their open-time state.
+                      member={(() => {
+                        const liveProject = projects.find(
+                          (project) =>
+                            project.environmentId === member.environmentId &&
+                            project.id === member.id,
+                        );
+                        return liveProject ? { ...member, ...liveProject } : member;
+                      })()}
+                      providerEntries={sortProviderInstanceEntries(
+                        (() => {
+                          const memberServerConfig = serverConfigs.get(member.environmentId);
+                          const entries = deriveProviderInstanceEntries(
+                            memberServerConfig?.providers ?? [],
+                          );
+                          // The settings overlay stamps each entry's project
+                          // scope (and authoritative enabled state) so the
+                          // control can render cross-rule verdicts.
+                          return memberServerConfig
+                            ? applyProviderInstanceSettings(entries, memberServerConfig.settings)
+                            : entries;
+                        })(),
+                      )}
+                      onUpdate={updateProjectAllowedProviders}
+                    />
+                  )}
                   {projectActionsTarget.memberProjects.length > 1 ? (
                     <div className="flex justify-end">
                       <Button

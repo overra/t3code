@@ -1,8 +1,8 @@
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import { createThreadOutboxManager } from "./thread-outbox-manager";
-import type { QueuedThreadMessage } from "./thread-outbox-model";
+import type { QueuedThreadMessage, ThreadOutboxFailureMarkers } from "./thread-outbox-model";
 import { expoThreadOutboxStorage } from "./thread-outbox-storage";
 
 export * from "./thread-outbox-model";
@@ -30,8 +30,32 @@ export function updateThreadOutboxMessage(message: QueuedThreadMessage): Promise
   return threadOutboxManager.update(message);
 }
 
+/**
+ * Durably applies failure markers to the CURRENT stored entry (never a
+ * captured snapshot). "missing" = deleted or delivered concurrently;
+ * nothing is written then.
+ */
+export function markThreadOutboxMessageFailed(
+  messageId: MessageId,
+  markers: ThreadOutboxFailureMarkers,
+): Promise<"marked" | "missing"> {
+  return threadOutboxManager.markFailed(messageId, markers);
+}
+
 export function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
   return threadOutboxManager.remove(message);
+}
+
+/**
+ * Clears every queued entry (failed included) for an explicitly DELETED
+ * thread — the drain itself never auto-resolves failed entries, since
+ * shell presence is not lifecycle evidence.
+ */
+export function clearThreadOutboxForDeletedThread(
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+): Promise<void> {
+  return threadOutboxManager.clearThread(environmentId, threadId);
 }
 
 export function clearThreadOutboxEnvironment(environmentId: EnvironmentId): Promise<void> {

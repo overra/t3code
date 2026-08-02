@@ -15,7 +15,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type EnvironmentId,
   ServerSettings,
-  type ServerSettingsPatch,
+  ServerSettingsPatch,
 } from "@t3tools/contracts";
 import {
   type ClientSettingsPatch,
@@ -147,7 +147,12 @@ function persistClientSettings(settings: ClientSettings): void {
 
 // ── Key sets for routing patches ─────────────────────────────────────
 
-const SERVER_SETTINGS_KEYS = new Set<string>(Struct.keys(ServerSettings.fields));
+// Patch-only keys (e.g. `providerInstancesPatch`) are not ServerSettings
+// fields but must still route to the server, so the set unions both shapes.
+const SERVER_SETTINGS_KEYS = new Set<string>([
+  ...Struct.keys(ServerSettings.fields),
+  ...Struct.keys(ServerSettingsPatch.fields),
+]);
 
 function splitPatch(patch: UnifiedSettingsPatch): {
   serverPatch: ServerSettingsPatch;
@@ -294,9 +299,13 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
     (patch: UnifiedSettingsPatch) => {
       const { serverPatch, clientPatch } = splitPatch(patch);
 
+      // Returned so callers with optimistic UI (e.g. the provider project
+      // scope editor) can await the persist outcome and roll back on
+      // rejection. Fire-and-forget callers simply ignore the return value.
+      let serverPersist: Promise<unknown> | undefined;
       if (Object.keys(serverPatch).length > 0) {
         if (environmentId) {
-          void persistServerSettings({
+          serverPersist = persistServerSettings({
             environmentId,
             input: { patch: serverPatch },
           });
@@ -308,6 +317,7 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
           ...clientPatch,
         });
       }
+      return serverPersist;
     },
     [environmentId, persistServerSettings],
   );

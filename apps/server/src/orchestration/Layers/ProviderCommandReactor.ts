@@ -2,6 +2,9 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  getProviderInstanceAllowedProjects,
+  getProviderInstanceProjectRestriction,
+  isProviderInstanceUsableInProject,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -375,10 +378,64 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  // Unfiltered variant for the ACCESS gate: a thread can outlive its
+  // project's soft deletion, and the deleted project's rules must still gate
+  // executing instances — the active-only lookup above would skip the gate
+  // for them entirely.
+  const resolveProjectAccess = Effect.fnUntraced(function* (projectId: ProjectId) {
+    return yield* projectionSnapshotQuery
+      .getProjectAccessById(projectId)
+      .pipe(Effect.map(Option.getOrUndefined));
+  });
+
   const resolveThread = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
       .getThreadDetailById(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
+  });
+
+  /**
+   * Auxiliary text generation (thread titles, branch names) sends project
+   * content to the selected instance, so the globally configured selection
+   * must also pass the thread's project access rules. Falls back through
+   * the turn's explicit selection (already access-checked by the gates),
+   * the thread's own selection, then the project default; returns undefined
+   * when nothing usable remains — callers skip generation entirely (a seed
+   * title or temporary branch name is an acceptable outcome, a restricted
+   * provider receiving the prompt is not). Missing attribution — the thread
+   * or project was deleted between the turn and this forked job — also
+   * skips: without a project there is no rule to check, and captured prompt
+   * data must not default to the unclamped global writer.
+   */
+  const resolveProjectScopedTextGenerationSelection = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly candidate: ModelSelection;
+    readonly turnSelection?: ModelSelection | undefined;
+  }) {
+    const thread = yield* resolveThread(input.threadId);
+    if (!thread) return undefined;
+    const project = yield* resolveProject(thread.projectId);
+    if (project === undefined) return undefined;
+    const providerInstances = (yield* serverSettingsService.getSettings).providerInstances;
+    const usable = (instanceId: ModelSelection["instanceId"]) =>
+      isProviderInstanceUsableInProject({
+        instanceId,
+        instanceAllowedProjects: getProviderInstanceAllowedProjects(providerInstances, instanceId),
+        projectId: thread.projectId,
+        projectAllowedProviderInstances: project.allowedProviderInstances,
+      });
+    if (usable(input.candidate.instanceId)) return input.candidate;
+    if (input.turnSelection !== undefined && usable(input.turnSelection.instanceId)) {
+      return input.turnSelection;
+    }
+    if (usable(thread.modelSelection.instanceId)) return thread.modelSelection;
+    if (
+      project.defaultModelSelection !== null &&
+      usable(project.defaultModelSelection.instanceId)
+    ) {
+      return project.defaultModelSelection;
+    }
+    return undefined;
   });
 
   const rejectStartedThreadModelChangeIfRequired = Effect.fnUntraced(function* (input: {
@@ -547,10 +604,64 @@ const make = Effect.gen(function* () {
       }
     }
     const project = yield* resolveProject(thread.projectId);
+    // Final gate for both provider-access rules. The decider (project
+    // allowlist) and the dispatch path (instance scope) reject commands that
+    // carry an explicit disallowed selection; this covers selections that
+    // arrive from persisted thread or session state (e.g. a thread created
+    // before either restriction existed).
+    //
     const effectiveCwd = resolveThreadWorkspaceCwd({
       thread,
       projects: project ? [project] : [],
     });
+    // Whether an implicit (no explicit selection) turn will restart the
+    // session — mirrored by the restart decision below, which uses the same
+    // two inputs. A restart executes on the persisted `desiredInstanceId`;
+    // otherwise the live session (`currentInstanceId`) serves the turn.
+    const implicitRestartPending =
+      activeThreadSession !== null &&
+      activeSession !== undefined &&
+      (thread.runtimeMode !== thread.session?.runtimeMode || effectiveCwd !== activeSession.cwd);
+    // Gate exactly the instance this turn will execute on. An explicit
+    // request wins (subject to the switch-compatibility checks above) and is
+    // the only instance gated — an explicit switch AWAY from a restricted
+    // session must stay possible. Without an explicit request, the executing
+    // instance depends on whether the restart above will fire; gating only
+    // that one means a revoked-but-unused counterpart never blocks a safe
+    // turn or a safe restart. The project is resolved WITHOUT the deleted
+    // filter — a soft-deleted project's rules still bind its threads.
+    const projectAccess = yield* resolveProjectAccess(thread.projectId);
+    if (projectAccess !== undefined) {
+      const gatedInstanceId =
+        requestedModelSelection !== undefined
+          ? desiredInstanceId
+          : activeThreadSession !== null && activeSession !== undefined && !implicitRestartPending
+            ? currentInstanceId
+            : desiredInstanceId;
+      const restriction = getProviderInstanceProjectRestriction({
+        instanceId: gatedInstanceId,
+        instanceAllowedProjects: getProviderInstanceAllowedProjects(
+          (yield* serverSettingsService.getSettings).providerInstances,
+          gatedInstanceId,
+        ),
+        projectId: thread.projectId,
+        projectAllowedProviderInstances: projectAccess.allowedProviderInstances,
+      });
+      if (restriction === "project-allowlist") {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Provider instance '${gatedInstanceId}' is not allowed for project '${projectAccess.title}'. Update the project's allowed providers in project settings, or start a new thread with an allowed provider.`,
+        });
+      }
+      if (restriction === "instance-scope") {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Provider instance '${gatedInstanceId}' is limited to other projects. Widen its project scope in Settings → Providers, or use another provider.`,
+        });
+      }
+    }
 
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
@@ -735,6 +846,8 @@ const make = Effect.gen(function* () {
     readonly worktreePath: string | null;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
+    readonly turnSelection?: ModelSelection;
+    readonly titleSeed?: string;
   }) {
     if (!input.branch || !input.worktreePath) {
       return;
@@ -748,13 +861,19 @@ const make = Effect.gen(function* () {
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
       const settings = yield* serverSettingsService.getSettings;
-      const modelSelection =
+      const candidate =
         settings.sourceControlWriterModelSelection === null
           ? settings.textGenerationModelSelection
           : resolveSourceControlWriterModelSelection(
               settings,
               yield* providerRegistry.getProviders,
             );
+      const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+        threadId: input.threadId,
+        candidate,
+        ...(input.turnSelection !== undefined ? { turnSelection: input.turnSelection } : {}),
+      });
+      if (modelSelection === undefined) return;
 
       const generated = yield* textGeneration.generateBranchName({
         cwd,
@@ -794,12 +913,18 @@ const make = Effect.gen(function* () {
       readonly cwd: string;
       readonly messageText: string;
       readonly attachments?: ReadonlyArray<ChatAttachment>;
+      readonly turnSelection?: ModelSelection;
       readonly titleSeed?: string;
     }) {
       const attachments = input.attachments ?? [];
       yield* Effect.gen(function* () {
-        const { textGenerationModelSelection: modelSelection } =
-          yield* serverSettingsService.getSettings;
+        const { textGenerationModelSelection } = yield* serverSettingsService.getSettings;
+        const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+          threadId: input.threadId,
+          candidate: textGenerationModelSelection,
+          ...(input.turnSelection !== undefined ? { turnSelection: input.turnSelection } : {}),
+        });
+        if (modelSelection === undefined) return;
 
         const generated = yield* textGeneration.generateThreadTitle({
           cwd: input.cwd,
@@ -861,8 +986,14 @@ const make = Effect.gen(function* () {
         thread,
         projects: project ? [project] : [],
       }) ?? process.cwd();
-    const { textGenerationModelSelection: modelSelection } =
-      yield* serverSettingsService.getSettings;
+    const { textGenerationModelSelection } = yield* serverSettingsService.getSettings;
+    const modelSelection = yield* resolveProjectScopedTextGenerationSelection({
+      threadId: event.payload.threadId,
+      candidate: textGenerationModelSelection,
+    });
+    if (modelSelection === undefined) {
+      return { _tag: "Completed", title: undefined } as const;
+    }
     const generated = yield* textGeneration.generateThreadTitle({
       cwd,
       message,
@@ -1042,6 +1173,9 @@ const make = Effect.gen(function* () {
         messageText: message.text,
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+        ...(event.payload.modelSelection !== undefined
+          ? { turnSelection: event.payload.modelSelection }
+          : {}),
       };
 
       yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({

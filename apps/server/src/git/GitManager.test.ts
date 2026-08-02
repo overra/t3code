@@ -5,6 +5,7 @@ import * as NodeChildProcess from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -16,12 +17,13 @@ import { expect } from "vite-plus/test";
 import type {
   GitActionProgressEvent,
   GitPreparePullRequestThreadInput,
+  OrchestrationShellSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
-
 import {
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   TextGenerationError,
@@ -34,6 +36,7 @@ import * as GitHubSourceControlProvider from "../sourceControl/GitHubSourceContr
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "./GitManager.ts";
@@ -617,6 +620,7 @@ function makeManager(input?: {
   textGeneration?: Partial<FakeGitTextGeneration>;
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
+  shellSnapshot?: OrchestrationShellSnapshot;
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
   const textGeneration = createTextGeneration(input?.textGeneration);
@@ -651,6 +655,19 @@ function makeManager(input?: {
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
     }),
+    // Default empty shell snapshot = no project matches any cwd, so writer
+    // selections pass through unclamped and existing expectations hold.
+    Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+      getShellSnapshot: () =>
+        Effect.succeed(
+          input?.shellSnapshot ?? {
+            snapshotSequence: 0,
+            projects: [],
+            threads: [],
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ),
+    }),
     Layer.succeed(
       ProjectSetupScriptRunner.ProjectSetupScriptRunner,
       input?.setupScriptRunner ?? {
@@ -668,6 +685,40 @@ function makeManager(input?: {
 }
 
 const asThreadId = (threadId: string) => threadId as ThreadId;
+
+it("relates normalized repository paths across separators for the writer clamp", () => {
+  // POSIX containment in both directions, and the classic prefix trap: a
+  // sibling whose name string-prefixes the root must NOT be related.
+  expect(GitManager.areNormalizedPathsRelated("/repo/packages/app", "/repo")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/repo", "/repo/packages/app")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/repo-sibling", "/repo")).toBe(false);
+
+  // Windows drive paths normalize to lowercase backslashes; containment must
+  // use the backslash separator or ownership silently misses.
+  const winRoot = normalizeProjectPathForComparison("C:/Repo");
+  const winNested = normalizeProjectPathForComparison("C:\\Repo\\Packages\\App");
+  const winSibling = normalizeProjectPathForComparison("C:/Repo2");
+  expect(winNested).toBe("c:\\repo\\packages\\app");
+  expect(GitManager.areNormalizedPathsRelated(winNested, winRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winRoot, winNested)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winSibling, winRoot)).toBe(false);
+
+  // UNC shares take the same backslash form.
+  const uncRoot = normalizeProjectPathForComparison("\\\\server\\share\\repo");
+  const uncNested = normalizeProjectPathForComparison("\\\\server\\share\\repo\\sub");
+  expect(GitManager.areNormalizedPathsRelated(uncNested, uncRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(uncRoot, uncNested)).toBe(true);
+
+  // Filesystem roots already end in their separator; a project rooted there
+  // must still own every repository beneath it.
+  expect(normalizeProjectPathForComparison("/")).toBe("/");
+  expect(GitManager.areNormalizedPathsRelated("/repo", "/")).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated("/", "/repo")).toBe(true);
+  const winDriveRoot = normalizeProjectPathForComparison("C:\\");
+  expect(winDriveRoot).toBe("c:\\");
+  expect(GitManager.areNormalizedPathsRelated("c:\\repo", winDriveRoot)).toBe(true);
+  expect(GitManager.areNormalizedPathsRelated(winDriveRoot, winDriveRoot)).toBe(true);
+});
 
 const GitManagerTestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-git-manager-test-" })),
@@ -1589,6 +1640,72 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toBe("Implement stacked git actions");
+    }),
+  );
+
+  it.effect("blocks commit generation when the project's rules exclude the writer", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\nworld\n");
+      const subDir = NodePath.join(repoDir, "sub");
+      NodeFS.mkdirSync(subDir);
+      // The project is rooted at a MONOREPO SUBDIRECTORY and stored with the
+      // unresolved temp path (macOS /var symlinks to /private/var, while git
+      // reports the resolved root) — the clamp must relate the paths through
+      // canonicalization and containment, not exact string equality.
+      const projectRoot = NodePath.join(repoDir, "packages", "app");
+      NodeFS.mkdirSync(projectRoot, { recursive: true });
+      let generateCalls = 0;
+
+      const { manager } = yield* makeManager({
+        textGeneration: {
+          generateCommitMessage: () => {
+            generateCalls += 1;
+            return Effect.succeed({ subject: "Should never be generated", body: "" });
+          },
+        },
+        shellSnapshot: {
+          snapshotSequence: 1,
+          projects: [
+            {
+              id: ProjectId.make("project-writer-restricted"),
+              title: "Writer Restricted",
+              workspaceRoot: projectRoot,
+              defaultModelSelection: null,
+              // The default writer (codex) is not in the allowlist.
+              allowedProviderInstances: [ProviderInstanceId.make("claudeAgent")],
+              scripts: [],
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+          threads: [],
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+
+      // A repository SUBDIRECTORY must resolve to the same project — an
+      // exact-cwd match would silently fall back to the unclamped writer.
+      const error = yield* runStackedAction(manager, {
+        cwd: subDir,
+        action: "commit",
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({ _tag: "GitManagerError" });
+      expect(String((error as { detail?: string }).detail)).toContain(
+        "Commit message generation is unavailable",
+      );
+      expect(generateCalls).toBe(0);
+
+      // An explicit commit message bypasses generation and still works.
+      const result = yield* runStackedAction(manager, {
+        cwd: repoDir,
+        action: "commit",
+        commitMessage: "chore: manual message",
+      });
+      expect(result.commit.status).toBe("created");
+      expect(generateCalls).toBe(0);
     }),
   );
 

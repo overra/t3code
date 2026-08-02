@@ -23,6 +23,7 @@ import {
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
   ModelSelection,
+  ProjectAllowedProviderInstances,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -66,6 +67,7 @@ const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
+    allowedProviderInstances: Schema.NullOr(Schema.fromJsonString(ProjectAllowedProviderInstances)),
     scripts: Schema.fromJsonString(Schema.Array(ProjectScript)),
   }),
 );
@@ -132,6 +134,9 @@ const ThreadIdLookupInput = Schema.Struct({
 const ProjectionProjectLookupRowSchema = ProjectionProjectDbRowSchema;
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
+});
+const ProjectionThreadProjectIdLookupRowSchema = Schema.Struct({
+  projectId: ProjectId,
 });
 const ProjectionThreadCheckpointContextThreadRowSchema = Schema.Struct({
   threadId: ThreadId,
@@ -280,6 +285,7 @@ function mapProjectShellRow(
     workspaceRoot: row.workspaceRoot,
     repositoryIdentity,
     defaultModelSelection: row.defaultModelSelection,
+    allowedProviderInstances: row.allowedProviderInstances,
     scripts: row.scripts,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -353,6 +359,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           title,
           workspace_root AS "workspaceRoot",
           default_model_selection_json AS "defaultModelSelection",
+          allowed_provider_instances_json AS "allowedProviderInstances",
           scripts_json AS "scripts",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
@@ -800,6 +807,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           title,
           workspace_root AS "workspaceRoot",
           default_model_selection_json AS "defaultModelSelection",
+          allowed_provider_instances_json AS "allowedProviderInstances",
           scripts_json AS "scripts",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
@@ -822,6 +830,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           title,
           workspace_root AS "workspaceRoot",
           default_model_selection_json AS "defaultModelSelection",
+          allowed_provider_instances_json AS "allowedProviderInstances",
           scripts_json AS "scripts",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
@@ -829,6 +838,29 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_projects
         WHERE project_id = ${projectId}
           AND deleted_at IS NULL
+        LIMIT 1
+      `,
+  });
+
+  // Deliberately unfiltered: access checks must resolve soft-deleted
+  // projects too (see ProjectionSnapshotQueryShape docs).
+  const getProjectRowByIdAnyState = SqlSchema.findOneOption({
+    Request: ProjectIdLookupInput,
+    Result: ProjectionProjectLookupRowSchema,
+    execute: ({ projectId }) =>
+      sql`
+        SELECT
+          project_id AS "projectId",
+          title,
+          workspace_root AS "workspaceRoot",
+          default_model_selection_json AS "defaultModelSelection",
+          allowed_provider_instances_json AS "allowedProviderInstances",
+          scripts_json AS "scripts",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          deleted_at AS "deletedAt"
+        FROM projection_projects
+        WHERE project_id = ${projectId}
         LIMIT 1
       `,
   });
@@ -864,6 +896,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           ON projects.project_id = threads.project_id
         WHERE threads.thread_id = ${threadId}
           AND threads.deleted_at IS NULL
+        LIMIT 1
+      `,
+  });
+
+  // Deliberately unfiltered: access checks must resolve archived and
+  // soft-deleted threads too (see ProjectionSnapshotQueryShape docs).
+  const getThreadProjectIdRowById = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadProjectIdLookupRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          project_id AS "projectId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
         LIMIT 1
       `,
   });
@@ -1305,6 +1352,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 workspaceRoot: row.workspaceRoot,
                 repositoryIdentity: repositoryIdentities.get(row.projectId) ?? null,
                 defaultModelSelection: row.defaultModelSelection,
+                allowedProviderInstances: row.allowedProviderInstances,
                 scripts: row.scripts,
                 createdAt: row.createdAt,
                 updatedAt: row.updatedAt,
@@ -1432,6 +1480,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   title: row.title,
                   workspaceRoot: row.workspaceRoot,
                   defaultModelSelection: row.defaultModelSelection,
+                  allowedProviderInstances: row.allowedProviderInstances,
                   scripts: row.scripts,
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
@@ -1909,6 +1958,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                     workspaceRoot: option.value.workspaceRoot,
                     repositoryIdentity,
                     defaultModelSelection: option.value.defaultModelSelection,
+                    allowedProviderInstances: option.value.allowedProviderInstances,
                     scripts: option.value.scripts,
                     createdAt: option.value.createdAt,
                     updatedAt: option.value.updatedAt,
@@ -1937,6 +1987,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   Option.some(mapProjectShellRow(option.value, repositoryIdentity)),
                 ),
               ),
+      ),
+    );
+
+  const getProjectAccessById: ProjectionSnapshotQueryShape["getProjectAccessById"] = (projectId) =>
+    getProjectRowByIdAnyState({ projectId }).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getProjectAccessById:query",
+          "ProjectionSnapshotQuery.getProjectAccessById:decodeRow",
+        ),
+      ),
+      Effect.map(
+        Option.map((row) => ({
+          id: row.projectId,
+          title: row.title,
+          workspaceRoot: row.workspaceRoot,
+          allowedProviderInstances: row.allowedProviderInstances ?? null,
+        })),
       ),
     );
 
@@ -2024,6 +2092,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         toCheckpointRef: row.value.toCheckpointRef,
       });
     });
+
+  const getThreadProjectIdById: ProjectionSnapshotQueryShape["getThreadProjectIdById"] = (
+    threadId,
+  ) =>
+    getThreadProjectIdRowById({ threadId }).pipe(
+      Effect.map(Option.map((row) => row.projectId)),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getThreadProjectIdById:query",
+          "ProjectionSnapshotQuery.getThreadProjectIdById:decodeRow",
+        ),
+      ),
+    );
 
   const getThreadShellById: ProjectionSnapshotQueryShape["getThreadShellById"] = (threadId) =>
     Effect.gen(function* () {
@@ -2267,10 +2348,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getCounts,
     getActiveProjectByWorkspaceRoot,
     getProjectShellById,
+    getProjectAccessById,
     getFirstActiveThreadIdByProjectId,
     getThreadCheckpointContext,
     getFullThreadDiffContext,
     getThreadShellById,
+    getThreadProjectIdById,
     getThreadDetailById,
     getThreadDetailSnapshot,
   } satisfies ProjectionSnapshotQueryShape;

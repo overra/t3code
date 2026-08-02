@@ -236,7 +236,11 @@ export const ThreadListV2PendingRow = memo(function ThreadListV2PendingRow(props
         <Text className="flex-1 text-sm font-t3-medium text-foreground-muted" numberOfLines={1}>
           {projectTitle}
         </Text>
-        <Text className="text-xs text-foreground-tertiary">Queued</Text>
+        {pendingTask.failed ? (
+          <Text className="text-xs text-red-600 dark:text-red-400">Failed</Text>
+        ) : (
+          <Text className="text-xs text-foreground-tertiary">Queued</Text>
+        )}
       </View>
       {/* One line, unlike the two an active row allows: a queued title is
           derived from the whole prompt rather than written as a title, so the
@@ -244,6 +248,11 @@ export const ThreadListV2PendingRow = memo(function ThreadListV2PendingRow(props
       <Text className="mt-1 text-base font-t3-medium text-foreground" numberOfLines={1}>
         {pendingTask.title}
       </Text>
+      {pendingTask.failed ? (
+        <Text className="mt-1 text-xs text-red-600 dark:text-red-400" numberOfLines={1}>
+          {pendingTask.message.failureReason ?? "The server rejected this task."}
+        </Text>
+      ) : null}
       {branch || props.environmentLabel ? (
         <Text className="mt-1 text-xs text-foreground-muted" numberOfLines={1}>
           {branch ? (

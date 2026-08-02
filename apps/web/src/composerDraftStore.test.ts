@@ -1231,6 +1231,34 @@ describe("composerDraftStore modelSelection", () => {
     );
   });
 
+  it("treats a prototype-named instance id as an ordinary absent key", () => {
+    const store = useComposerDraftStore.getState();
+    const protoInstance = ProviderInstanceId.make("constructor");
+
+    // A bare `map[instanceId]` read would return Object.prototype's
+    // constructor here, making it the sticky base and yielding a selection
+    // with no `model`.
+    store.setProviderModelOptions(
+      threadRef,
+      CLAUDE_AGENT_DRIVER,
+      toSelections({ thinking: true }),
+      {
+        instanceId: protoInstance,
+        model: "claude-opus-4-6",
+        persistSticky: true,
+      },
+    );
+
+    const draftSelection = draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionByProvider[
+      protoInstance
+    ];
+    expect(draftSelection?.instanceId).toBe(protoInstance);
+    expect(draftSelection?.model).toBe("claude-opus-4-6");
+    expect(
+      useComposerDraftStore.getState().stickyModelSelectionByProvider[protoInstance]?.model,
+    ).toBe("claude-opus-4-6");
+  });
+
   it("keeps explicit default-state overrides on the selection", () => {
     const store = useComposerDraftStore.getState();
 

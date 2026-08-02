@@ -46,7 +46,14 @@ import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { resolveSelectableModelSelection } from "../../lib/modelOptions";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
-import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "../../state/thread-outbox";
+import {
+  enqueueThreadOutboxMessage,
+  flattenQueuedThreadMessages,
+  isQueuedThreadMessageFailed,
+  removeThreadOutboxMessage,
+  threadOutboxManager,
+} from "../../state/thread-outbox";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { branchBadgeLabel, useNewTaskFlow } from "./new-task-flow-provider";
 import { useCreateProjectThread } from "./use-project-actions";
@@ -799,14 +806,19 @@ export function NewTaskDraftScreen(props: {
       return;
     }
     const draft = getComposerDraftSnapshot(draftKey);
-    // Snapshot read keeps just-typed selector state; the availability gate
-    // still applies so a stored selection on a disabled provider falls back
-    // to the flow's resolved model.
+    // Snapshot read keeps just-typed selector state; both gates still apply
+    // so a stored selection on a disabled provider — or one the project's
+    // access rules no longer admit (membership in the already-filtered
+    // options) — falls back to the flow's clamped resolution.
+    const draftSelection = resolveSelectableModelSelection(
+      selectedEnvironmentServerConfig,
+      draft.modelSelection ?? null,
+    );
     const modelSelection =
-      resolveSelectableModelSelection(
-        selectedEnvironmentServerConfig,
-        draft.modelSelection ?? null,
-      ) ?? flow.selectedModel;
+      draftSelection &&
+      flow.modelOptions.some((option) => option.selection.instanceId === draftSelection.instanceId)
+        ? draftSelection
+        : flow.selectedModel;
     const workspaceMode = draft.workspaceSelection?.mode ?? flow.workspaceMode;
     const selectedBranchName = draft.workspaceSelection?.branch ?? flow.selectedBranchName;
     const selectedWorktreePath =
@@ -826,48 +838,87 @@ export function NewTaskDraftScreen(props: {
     }
 
     const editingPendingTask = flow.editingPendingTask;
+    // A FAILED task's identifiers are burned (its bootstrap may have created
+    // the thread before failing, and that soft-deleted id stays occupied
+    // forever). Resubmitting it always mints fresh turn metadata; the failed
+    // record is retired after the fresh submission lands. Failed-ness comes
+    // from the LIVE outbox record, not the snapshot captured when the editor
+    // opened — a bootstrap already in flight at open time may have failed
+    // (and burned these ids) since.
+    const storedEditingTask = editingPendingTask
+      ? flattenQueuedThreadMessages(
+          appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+        ).find((candidate) => candidate.messageId === editingPendingTask.messageId)
+      : undefined;
+    const editingFailed =
+      storedEditingTask !== undefined && isQueuedThreadMessageFailed(storedEditingTask);
 
     if (!environmentConnected) {
       // Offline: park the task in the outbox; the drain sends it when the
       // environment reconnects. Editing an existing pending task re-queues it
-      // under its original identifiers.
-      const metadata = editingPendingTask
-        ? {
-            threadId: editingPendingTask.threadId,
-            commandId: editingPendingTask.commandId,
-            messageId: editingPendingTask.messageId,
-            createdAt: editingPendingTask.createdAt,
-          }
-        : makeTurnCommandMetadata();
+      // under its original identifiers — unless it failed (fresh ids above).
+      const metadata =
+        editingPendingTask && !editingFailed
+          ? {
+              threadId: editingPendingTask.threadId,
+              commandId: editingPendingTask.commandId,
+              messageId: editingPendingTask.messageId,
+              createdAt: editingPendingTask.createdAt,
+            }
+          : makeTurnCommandMetadata();
       const message = flow.buildPendingTaskMessage(metadata);
       if (!message) {
         return;
       }
+      // `submitting` stays true through retirement of the failed original —
+      // clearing it earlier would let a second tap mint yet another fresh
+      // creation from the same editor session — and Start OWNS the editing
+      // session for the duration: a sheet dismissal mid-submission must not
+      // run the flush, which would independently requeue the task.
       flow.setSubmitting(true);
-      try {
-        await enqueueThreadOutboxMessage(message);
-      } catch (error) {
-        Alert.alert(
-          "Could not queue task",
-          error instanceof Error ? error.message : "The task could not be saved to the outbox.",
-        );
-        return;
-      } finally {
-        flow.setSubmitting(false);
-      }
       if (editingPendingTask) {
-        flow.finishEditingPendingTask();
-      } else {
-        // Drop the workspace selection with the content: the next task should
-        // re-resolve mode/branch/origin from the server's configured defaults
-        // instead of resurrecting this task's picks.
-        clearComposerDraftContent(draftKey, { clearWorkspaceSelection: true });
+        flow.setEditingTaskSubmission(editingPendingTask.messageId);
+      }
+      try {
+        try {
+          await enqueueThreadOutboxMessage(message);
+        } catch (error) {
+          Alert.alert(
+            "Could not queue task",
+            error instanceof Error ? error.message : "The task could not be saved to the outbox.",
+          );
+          return;
+        }
+        if (editingPendingTask) {
+          if (editingFailed) {
+            // Enqueued under NEW ids; retire the failed original.
+            try {
+              await removeThreadOutboxMessage(storedEditingTask ?? editingPendingTask);
+            } catch (error) {
+              console.warn("[new-task] failed to retire failed task after fresh requeue", error);
+            }
+          }
+          flow.finishEditingPendingTask();
+        } else {
+          // Drop the workspace selection with the content: the next task should
+          // re-resolve mode/branch/origin from the server's configured defaults
+          // instead of resurrecting this task's picks.
+          clearComposerDraftContent(draftKey, { clearWorkspaceSelection: true });
+        }
+      } finally {
+        flow.setEditingTaskSubmission(null);
+        flow.setSubmitting(false);
       }
       navigation.getParent()?.goBack();
       return;
     }
 
     flow.setSubmitting(true);
+    // Start owns the editing session while the creation is in flight — a
+    // sheet dismissal must not flush-requeue the task it is submitting.
+    if (editingPendingTask) {
+      flow.setEditingTaskSubmission(editingPendingTask.messageId);
+    }
     // Arm the lock-screen card before the async thread creation: backgrounding
     // the app right after tapping submit would otherwise reject the foreground
     // -only Activity start. If creation fails, the token registration's replay
@@ -887,7 +938,9 @@ export function NewTaskDraftScreen(props: {
       interactionMode,
       initialMessageText,
       initialAttachments: draft.attachments,
-      ...(editingPendingTask
+      // A failed task's original identifiers are never reused (see above);
+      // omitting turnMetadata lets the creation mint fresh ones.
+      ...(editingPendingTask && !editingFailed
         ? {
             turnMetadata: {
               threadId: editingPendingTask.threadId,
@@ -898,9 +951,13 @@ export function NewTaskDraftScreen(props: {
           }
         : {}),
     });
-    flow.setSubmitting(false);
 
     if (result._tag === "Failure") {
+      // Ownership ends with the failed attempt: if the sheet was dismissed
+      // meanwhile, the editing session simply stays parked (lock held, draft
+      // kept) until the task is reopened — never independently requeued.
+      flow.setEditingTaskSubmission(null);
+      flow.setSubmitting(false);
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         Alert.alert(
@@ -911,9 +968,11 @@ export function NewTaskDraftScreen(props: {
       return;
     }
 
+    // `submitting` stays true through outbox retirement so a second tap
+    // cannot mint another creation while the old record is being removed.
     if (editingPendingTask) {
       try {
-        await removeThreadOutboxMessage(editingPendingTask);
+        await removeThreadOutboxMessage(storedEditingTask ?? editingPendingTask);
       } catch (error) {
         console.warn("[new-task] failed to remove delivered pending task", error);
       }
@@ -921,6 +980,8 @@ export function NewTaskDraftScreen(props: {
     } else {
       clearComposerDraftContent(draftKey, { clearWorkspaceSelection: true });
     }
+    flow.setEditingTaskSubmission(null);
+    flow.setSubmitting(false);
     navigation.dispatch(
       StackActions.replace("Thread", {
         environmentId: String(result.value.environmentId),

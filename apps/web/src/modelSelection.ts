@@ -2,6 +2,8 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  getInstanceKeyedEntry,
+  getProviderInstanceConfig,
   type ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -50,7 +52,7 @@ function readInstanceCustomModels(
   instanceId: ProviderInstanceId,
   driverKind: ProviderDriverKind,
 ): ReadonlyArray<string> {
-  const instance = settings.providerInstances?.[instanceId];
+  const instance = getProviderInstanceConfig(settings.providerInstances, instanceId);
   const config = instance?.config;
   if (config !== null && typeof config === "object") {
     const value = (config as Record<string, unknown>).customModels;
@@ -95,7 +97,7 @@ function readInstanceModelPreferences(
   instanceId: ProviderInstanceId,
 ): { readonly hiddenModels: ReadonlyArray<string>; readonly modelOrder: ReadonlyArray<string> } {
   return (
-    settings.providerModelPreferences?.[instanceId] ?? {
+    getInstanceKeyedEntry(settings.providerModelPreferences, instanceId) ?? {
       hiddenModels: [],
       modelOrder: [],
     }

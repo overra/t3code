@@ -51,6 +51,26 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
   createdAt: IsoDateTime,
+  // A deterministically rejected entry is kept in the outbox as FAILED: it
+  // stays visible and editable exactly where it already lives, is never
+  // dispatched again, and re-queues when the user edits it (an editor save
+  // clears the markers) or disappears when they delete it. There is no
+  // cross-store draft-restore handoff.
+  failedAt: Schema.optional(IsoDateTime),
+  failureReason: Schema.optional(Schema.String),
+  // Durable cleanup INTENT, written before removing an explicitly deleted
+  // thread's entries. It survives a failed removal (and a restart), so the
+  // drain can resume the deletion — without it, one failed file removal
+  // would strand the entry forever, since its thread has no UI left.
+  threadDeletedAt: Schema.optional(IsoDateTime),
+  // LEGACY (schema v3 recovery phase machine, since removed) — retained so
+  // stored entries decode. `restoredAt` means the old version durably
+  // restored the content into a composer draft: only removal remains. A bare
+  // `recoveryStartedAt` means the old version committed to recovery but the
+  // restore is unconfirmed: the entry is treated as failed (kept visible and
+  // editable) rather than re-delivered or dropped.
+  recoveryStartedAt: Schema.optional(IsoDateTime),
+  restoredAt: Schema.optional(IsoDateTime),
 });
 
 const decodeStoredQueuedThreadMessage = Schema.decodeUnknownSync(QueuedThreadMessageSchema);
@@ -78,6 +98,39 @@ export interface QueuedThreadMessage {
   readonly interactionMode?: ProviderInteractionModeType;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
+  /** See the failure/legacy-recovery markers on `QueuedThreadMessageSchema`. */
+  readonly failedAt?: string;
+  readonly failureReason?: string;
+  readonly threadDeletedAt?: string;
+  readonly recoveryStartedAt?: string;
+  readonly restoredAt?: string;
+}
+
+/** Failure markers applied via the outbox manager's markFailed op. */
+export interface ThreadOutboxFailureMarkers {
+  readonly failedAt: string;
+  readonly failureReason?: string;
+}
+
+/**
+ * A failed entry is skipped by the drain (blocking only its own thread's
+ * queue) until an editor save or re-enqueue clears its markers. Includes
+ * legacy mid-recovery entries (committed by the removed v3 recovery machine,
+ * restore unconfirmed) — kept visible and editable as failed rather than
+ * re-delivered or dropped.
+ */
+export function isQueuedThreadMessageFailed(message: QueuedThreadMessage): boolean {
+  if (message.failedAt !== undefined) return true;
+  return message.recoveryStartedAt !== undefined && message.restoredAt === undefined;
+}
+
+/**
+ * Its thread was explicitly deleted and removal is owed: the entry is
+ * hidden from every surface and the drain retries its removal (resuming
+ * across restarts) until the storage delete finally succeeds.
+ */
+export function isQueuedThreadMessagePendingCleanup(message: QueuedThreadMessage): boolean {
+  return message.threadDeletedAt !== undefined;
 }
 
 export interface ThreadSettingsSnapshot {
@@ -211,17 +264,48 @@ export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
 export type ThreadOutboxCommandStage = "settings-sync" | "start-turn";
 export type ThreadOutboxFailureAction = "retry" | "discard";
 
+function isDispatchRejection(error: unknown): error is { readonly retryable?: boolean } {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    error._tag === "OrchestrationDispatchCommandError"
+  );
+}
+
+/**
+ * A typed command rejection the server will repeat on every retry — e.g. a
+ * provider-access denial for a selection revoked while the entry sat in the
+ * outbox. Dispatch errors explicitly marked `retryable` (verification
+ * outages) are NOT deterministic and are retried in both stages.
+ */
+function isDeterministicCommandRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) {
+    return false;
+  }
+  if (error._tag === "OrchestrationCommandInvariantError") {
+    return true;
+  }
+  return isDispatchRejection(error) && error.retryable !== true;
+}
+
 export function resolveThreadOutboxFailureAction(input: {
   readonly stage: ThreadOutboxCommandStage;
   readonly error: unknown;
   readonly interrupted: boolean;
 }): ThreadOutboxFailureAction {
-  if (
-    input.stage === "settings-sync" ||
-    input.interrupted ||
-    shouldRetryThreadOutboxDelivery(input.error)
-  ) {
+  if (input.interrupted || shouldRetryThreadOutboxDelivery(input.error)) {
     return "retry";
   }
-  return "discard";
+  if (isDispatchRejection(input.error) && input.error.retryable === true) {
+    return "retry";
+  }
+  // Deterministic rejections poison the queue in EITHER stage: a revoked
+  // model selection fails settings-sync forever and would otherwise pin the
+  // FIFO head. Unknown settings-sync failures keep their historical retry
+  // bias; unknown start-turn failures keep their historical discard bias.
+  if (isDeterministicCommandRejection(input.error)) {
+    return "discard";
+  }
+  return input.stage === "settings-sync" ? "retry" : "discard";
 }

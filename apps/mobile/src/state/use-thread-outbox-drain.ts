@@ -24,10 +24,13 @@ import { useProjects, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
+  markThreadOutboxMessageFailed,
   removeThreadOutboxMessage,
 } from "./thread-outbox";
 import {
   isQueuedThreadCreationSendable,
+  isQueuedThreadMessageFailed,
+  isQueuedThreadMessagePendingCleanup,
   modelSelectionsEqual,
   resolveThreadOutboxDeliveryAction,
   resolveThreadOutboxFailureAction,
@@ -36,6 +39,7 @@ import {
   type QueuedThreadCreation,
   type QueuedThreadMessage,
   type ThreadOutboxCommandStage,
+  type ThreadOutboxDeliveryAction,
 } from "./thread-outbox-model";
 import { environmentThreadShells, threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
@@ -83,6 +87,21 @@ function findCreationProject(
 
 function settingsCommandId(message: QueuedThreadMessage, setting: string): CommandId {
   return CommandId.make(`${message.commandId}:${setting}`);
+}
+
+function failureReasonFrom(error: unknown): string | undefined {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return error.message;
+  }
+  return typeof error === "string" ? error : undefined;
 }
 
 export function useThreadOutboxDrain(): void {
@@ -142,11 +161,49 @@ export function useThreadOutboxDrain(): void {
       });
       return retry;
     };
+    /**
+     * A deterministic rejection (e.g. provider access changed while the
+     * entry sat in the outbox) means this entry will never send as-is. It
+     * is kept in the outbox MARKED FAILED on the CURRENT stored entry (so
+     * marking cannot clobber an edit that landed while the rejection
+     * round-tripped): still visible and editable exactly where it already
+     * lives, never dispatched again until an editor save clears the markers
+     * and requeues it, deletable at any time. A failed entry blocks only
+     * its own thread's queue — deliberately, since delivering later
+     * messages around it would reorder the conversation (and they would
+     * usually fail the same way).
+     *
+     * Returns whether the queue slot settled; `false` retries the marking
+     * on a later pass with backoff.
+     */
+    const markEntryFailed = async (reason: string | undefined): Promise<boolean> => {
+      try {
+        // "marked" and "missing" (deleted or delivered concurrently — that
+        // outcome wins) both settle the slot.
+        await markThreadOutboxMessageFailed(queuedMessage.messageId, {
+          failedAt: new Date().toISOString(),
+          ...(reason !== undefined ? { failureReason: reason } : {}),
+        });
+        return true;
+      } catch (error) {
+        console.warn("[thread-outbox] failed to mark rejected queued message", {
+          environmentId: queuedMessage.environmentId,
+          threadId: queuedMessage.threadId,
+          messageId: queuedMessage.messageId,
+          error,
+        });
+        return false;
+      }
+    };
     const completeDelivery = async (
       deliveryResult: AtomCommandResult<unknown, unknown>,
     ): Promise<boolean> => {
-      if (reportFailure(deliveryResult, "start-turn")) {
-        return false;
+      const failed = AsyncResult.isFailure(deliveryResult);
+      if (failed) {
+        if (reportFailure(deliveryResult, "start-turn")) {
+          return false;
+        }
+        return markEntryFailed(failureReasonFrom(Cause.squash(deliveryResult.cause)));
       }
 
       try {
@@ -162,13 +219,25 @@ export function useThreadOutboxDrain(): void {
         return false;
       }
     };
-    return { reportFailure, completeDelivery };
+    return { reportFailure, completeDelivery, markEntryFailed };
   }, []);
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage, thread: EnvironmentThreadShell) => {
       const settings = resolveQueuedThreadSettings(queuedMessage, thread);
-      const { reportFailure, completeDelivery } = makeDeliveryHelpers(queuedMessage);
+      const { reportFailure, completeDelivery, markEntryFailed } =
+        makeDeliveryHelpers(queuedMessage);
+      // A deterministic settings-sync rejection (e.g. the queued selection
+      // is no longer allowed in this project) can never succeed on retry;
+      // mark the entry failed, same as a deterministic start-turn failure.
+      const failSettingsSync = async (
+        result: AtomCommandResult<unknown, unknown>,
+      ): Promise<boolean> => {
+        if (!AsyncResult.isFailure(result) || reportFailure(result, "settings-sync")) {
+          return false;
+        }
+        return markEntryFailed(failureReasonFrom(Cause.squash(result.cause)));
+      };
 
       if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
         const updateResult = await updateThreadMetadata({
@@ -180,8 +249,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(updateResult)) {
-          reportFailure(updateResult, "settings-sync");
-          return false;
+          return failSettingsSync(updateResult);
         }
       }
 
@@ -196,8 +264,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(runtimeResult)) {
-          reportFailure(runtimeResult, "settings-sync");
-          return false;
+          return failSettingsSync(runtimeResult);
         }
       }
 
@@ -212,8 +279,7 @@ export function useThreadOutboxDrain(): void {
           },
         });
         if (AsyncResult.isFailure(interactionResult)) {
-          reportFailure(interactionResult, "settings-sync");
-          return false;
+          return failSettingsSync(interactionResult);
         }
       }
 
@@ -298,6 +364,48 @@ export function useThreadOutboxDrain(): void {
       if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
         continue;
       }
+      // A durable cleanup intent outranks everything else: the thread was
+      // explicitly deleted and only the storage removal is still owed. This
+      // resumes a removal that failed earlier (or before a restart); the
+      // entry is hidden from every surface until it lands.
+      if (isQueuedThreadMessagePendingCleanup(nextQueuedMessage)) {
+        beginDispatchingQueuedMessage(nextQueuedMessage.messageId);
+        void removeThreadOutboxMessage(nextQueuedMessage)
+          .then(
+            () => {
+              retryAttemptRef.current.delete(nextQueuedMessage.messageId);
+              retryNotBeforeRef.current.delete(nextQueuedMessage.messageId);
+            },
+            (error) => {
+              console.warn("[thread-outbox] failed to resume deleted-thread cleanup", {
+                environmentId: nextQueuedMessage.environmentId,
+                threadId: nextQueuedMessage.threadId,
+                messageId: nextQueuedMessage.messageId,
+                error,
+              });
+              const retryAttempt =
+                (retryAttemptRef.current.get(nextQueuedMessage.messageId) ?? 0) + 1;
+              retryAttemptRef.current.set(nextQueuedMessage.messageId, retryAttempt);
+              const retryDelayMs = threadOutboxRetryDelayMs(retryAttempt);
+              retryNotBeforeRef.current.set(nextQueuedMessage.messageId, Date.now() + retryDelayMs);
+              const pendingTimer = retryTimersRef.current.get(nextQueuedMessage.messageId);
+              if (pendingTimer !== undefined) {
+                clearTimeout(pendingTimer);
+              }
+              retryTimersRef.current.set(
+                nextQueuedMessage.messageId,
+                setTimeout(() => {
+                  retryTimersRef.current.delete(nextQueuedMessage.messageId);
+                  setRetryTick((current) => current + 1);
+                }, retryDelayMs),
+              );
+            },
+          )
+          .finally(() => {
+            finishDispatchingQueuedMessage(nextQueuedMessage.messageId);
+          });
+        return;
+      }
 
       const thread = findThread(threads, nextQueuedMessage);
       if (thread && scopedThreadKey(thread.environmentId, thread.id) !== threadKey) {
@@ -309,13 +417,31 @@ export function useThreadOutboxDrain(): void {
         (candidate) => candidate.environmentId === nextQueuedMessage.environmentId,
       );
       const shellStatus = shellStatuses.get(nextQueuedMessage.environmentId) ?? "empty";
-      const deliveryAction = resolveThreadOutboxDeliveryAction({
-        isCreation: creation !== undefined,
-        threadExists: thread !== undefined,
-        shellStatus,
-        environmentConnected: environment?.connectionState === "connected",
-        threadBusy: thread?.session?.status === "running" || thread?.session?.status === "starting",
-      });
+      // Legacy migration: an entry the removed v3 recovery machine already
+      // restored into a composer draft needs only removal — it must never
+      // be delivered (the content would send twice).
+      const deliveryAction: ThreadOutboxDeliveryAction =
+        nextQueuedMessage.restoredAt !== undefined
+          ? "remove"
+          : resolveThreadOutboxDeliveryAction({
+              isCreation: creation !== undefined,
+              threadExists: thread !== undefined,
+              shellStatus,
+              environmentConnected: environment?.connectionState === "connected",
+              threadBusy:
+                thread?.session?.status === "running" || thread?.session?.status === "starting",
+            });
+      // A failed entry is NEVER auto-resolved by the drain: shell presence
+      // is not lifecycle evidence. A thread absent from the shell may be
+      // archived, not deleted (discarding would lose content that returns
+      // on unarchive), and a thread PRESENT may be a failed bootstrap's
+      // transient row awaiting server cleanup (removing would mistake the
+      // doomed attempt for delivery). Explicit user deletion of a thread
+      // clears its outbox queue at delete time; everything else waits for
+      // the user to edit, retry, or delete the entry.
+      if (isQueuedThreadMessageFailed(nextQueuedMessage)) {
+        continue;
+      }
       if (deliveryAction === "wait") {
         continue;
       }
@@ -379,11 +505,20 @@ export function useThreadOutboxDrain(): void {
           return true;
         }
         return deliveryAction === "remove"
-          ? removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
+          ? removeQueuedMessage(
+              nextQueuedMessage.restoredAt !== undefined
+                ? "[thread-outbox] failed to remove already-restored message"
+                : "[thread-outbox] failed to remove message for a missing thread",
+            )
           : creation !== undefined
             ? creationProjectCwd !== null
               ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
-              : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
+              : // No project and no snapshot cwd: the task cannot ever send.
+                // Mark it failed instead of dropping it — the entry is the
+                // only record of the user's content.
+                makeDeliveryHelpers(nextQueuedMessage).markEntryFailed(
+                  "This task's project is no longer available.",
+                )
             : thread !== undefined
               ? sendQueuedMessage(nextQueuedMessage, thread)
               : Promise.resolve(false);

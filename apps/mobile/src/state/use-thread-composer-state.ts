@@ -39,7 +39,7 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
-import { enqueueThreadOutboxMessage } from "./thread-outbox";
+import { enqueueThreadOutboxMessage, isQueuedThreadMessagePendingCleanup } from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
 
 export function appendReviewCommentToDraft(input: {
@@ -87,7 +87,13 @@ export function useThreadComposerState() {
     ? scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id)
     : null;
   const selectedThreadQueuedMessages = useMemo(
-    () => (selectedThreadKey ? (queuedMessagesByThreadKey[selectedThreadKey] ?? []) : []),
+    () =>
+      selectedThreadKey
+        ? // Entries awaiting deleted-thread cleanup are not queued work.
+          (queuedMessagesByThreadKey[selectedThreadKey] ?? []).filter(
+            (message) => !isQueuedThreadMessagePendingCleanup(message),
+          )
+        : [],
     [queuedMessagesByThreadKey, selectedThreadKey],
   );
   const selectedThreadFeed = useMemo(

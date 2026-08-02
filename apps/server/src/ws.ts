@@ -70,7 +70,12 @@ import {
   projectActivityEvent,
   projectThreadDetailSnapshot,
 } from "./orchestration/ActivityPayloadProjection.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationCommandPreviouslyRejectedError,
+} from "./orchestration/Errors.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
+import { validateCommandProviderAccess } from "./orchestration/providerScopeChecks.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
@@ -121,6 +126,19 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
+  OrchestrationCommandPreviouslyRejectedError,
+);
+/**
+ * Rejections that will fail identically on every retry: the decider found the
+ * command invalid, or this command id was already tried and rejected. Client
+ * retry queues must treat these as final (restore + drop) — marking them
+ * retryable would pin an offline queue's FIFO on the poisoned entry forever.
+ */
+const isDeterministicOrchestrationRejection = (error: unknown): boolean =>
+  isOrchestrationCommandInvariantError(error) ||
+  isOrchestrationCommandPreviouslyRejectedError(error);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(5);
@@ -470,6 +488,12 @@ const makeWsRpcLayer = (
           ? cause
           : new OrchestrationDispatchCommandError({
               message: cause instanceof Error ? cause.message : fallbackMessage,
+              // Unknown infrastructure failures (startup, database, engine
+              // plumbing) are retryable, but DETERMINISTIC rejections —
+              // decider invariants, previously rejected command ids — must
+              // stay unmarked or retry queues would repeat them forever.
+              // Policy denials are constructed directly and stay unmarked.
+              ...(isDeterministicOrchestrationRejection(cause) ? {} : { retryable: true }),
               cause,
             });
       const randomUUID = crypto.randomUUIDv4.pipe(
@@ -525,15 +549,31 @@ const makeWsRpcLayer = (
           ),
         );
 
-      const toBootstrapDispatchCommandCauseError = (cause: Cause.Cause<unknown>) => {
+      const toBootstrapDispatchCommandCauseError = (
+        cause: Cause.Cause<unknown>,
+        options: { readonly retryEligible: boolean },
+      ) => {
         const error = Cause.squash(cause);
-        return isOrchestrationDispatchCommandError(error)
-          ? error
-          : new OrchestrationDispatchCommandError({
-              message:
-                error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
-              cause,
-            });
+        if (isOrchestrationDispatchCommandError(error)) {
+          // Once the bootstrap created (and cleaned up) the thread, a retry
+          // of the same queued command is doomed — it pins the thread id and
+          // a deleted id stays occupied — so even an inner retryable error
+          // downgrades to a terminal rejection.
+          return options.retryEligible || error.retryable !== true
+            ? error
+            : new OrchestrationDispatchCommandError({ message: error.message, cause: error });
+        }
+        return new OrchestrationDispatchCommandError({
+          message:
+            error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
+          // A transient git/database/engine failure mid-bootstrap is only
+          // worth retrying while the retry can still succeed (no thread was
+          // created yet); deterministic rejections never are.
+          ...(options.retryEligible && !isDeterministicOrchestrationRejection(error)
+            ? { retryable: true }
+            : {}),
+          cause,
+        });
       };
 
       const toShellStreamEvent = (
@@ -758,6 +798,8 @@ const makeWsRpcLayer = (
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
           let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
 
+          let createdWorktree: { readonly cwd: string; readonly path: string } | null = null;
+
           const cleanupCreatedThread = () =>
             createdThread
               ? serverCommandId("bootstrap-thread-delete").pipe(
@@ -770,6 +812,21 @@ const makeWsRpcLayer = (
                   ),
                   Effect.ignoreCause({ log: true }),
                 )
+              : Effect.void;
+
+          // A worktree created for a bootstrap that then failed must not be
+          // left behind: a later attempt (fresh thread id, possibly the same
+          // requested path) would fail on "worktree already exists", turning
+          // one transient failure into a permanent one.
+          const cleanupCreatedWorktree = () =>
+            createdWorktree !== null
+              ? gitWorkflow
+                  .removeWorktree({
+                    cwd: createdWorktree.cwd,
+                    path: createdWorktree.path,
+                    force: true,
+                  })
+                  .pipe(Effect.ignoreCause({ log: true }))
               : Effect.void;
 
           const recordSetupScriptLaunchFailure = (input: {
@@ -926,6 +983,10 @@ const makeWsRpcLayer = (
                 baseRefName: bootstrap.prepareWorktree.baseBranch,
                 path: null,
               });
+              createdWorktree = {
+                cwd: bootstrap.prepareWorktree.projectCwd,
+                path: worktree.worktree.path,
+              };
               targetWorktreePath = worktree.worktree.path;
               yield* orchestrationEngine.dispatch({
                 type: "thread.meta.update",
@@ -944,11 +1005,16 @@ const makeWsRpcLayer = (
 
           return yield* bootstrapProgram.pipe(
             Effect.catchCause((cause) => {
-              const dispatchError = toBootstrapDispatchCommandCauseError(cause);
+              const dispatchError = toBootstrapDispatchCommandCauseError(cause, {
+                retryEligible: !createdThread,
+              });
               if (Cause.hasInterruptsOnly(cause)) {
                 return Effect.fail(dispatchError);
               }
-              return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
+              return cleanupCreatedWorktree().pipe(
+                Effect.andThen(cleanupCreatedThread()),
+                Effect.flatMap(() => Effect.fail(dispatchError)),
+              );
             }),
           );
         });
@@ -1022,6 +1088,13 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
+              // Before normalization: a denied image turn must not persist
+              // its attachments to the attachment store.
+              yield* validateCommandProviderAccess(command, {
+                getSettings: serverSettings.getSettings,
+                getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
+                getProjectAccess: projectionSnapshotQuery.getProjectAccessById,
+              });
               const normalizedCommand = yield* normalizeDispatchCommand(command);
               const shouldStopSessionAfterArchive =
                 normalizedCommand.type === "thread.archive"

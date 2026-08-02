@@ -2,14 +2,14 @@
 
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { CheckIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ProviderInstanceId,
   ProviderDriverKind,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 
-import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Button } from "../ui/button";
@@ -117,11 +117,28 @@ function validateInstanceId(id: string, existing: ReadonlySet<string>): string |
 interface AddProviderInstanceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /**
+   * Persists the new instance through the settings panel's writer (granular
+   * patch on capable servers). Returns the persist promise; `undefined`
+   * means no primary environment existed to write to.
+   */
+  onCreateInstance: (instanceId: ProviderInstanceId, instance: ProviderInstanceConfig) => unknown;
+  /**
+   * Instance ids that exist beyond the echoed explicit config map: the
+   * synthesized per-driver default ids and every live server-reported
+   * instance. Creation is an upsert, so colliding with any of these would
+   * silently overwrite rather than error.
+   */
+  reservedInstanceIds?: ReadonlyArray<string> | undefined;
 }
 
-export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderInstanceDialogProps) {
+export function AddProviderInstanceDialog({
+  open,
+  onOpenChange,
+  onCreateInstance,
+  reservedInstanceIds,
+}: AddProviderInstanceDialogProps) {
   const settings = usePrimarySettings();
-  const updateSettings = useUpdatePrimarySettings();
 
   const [wizardStep, setWizardStep] = useState(0);
   const [driver, setDriver] = useState<ProviderDriverKind>(DEFAULT_DRIVER_KIND);
@@ -134,10 +151,29 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
   // Errors are suppressed until the user has tried to submit once. After that
   // they update live so fixing the problem clears the message in place.
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  // A save completing after this dialog instance closed (or after an
+  // environment switch remounted it) must not toast or close the CURRENT
+  // dialog on its behalf.
+  const unmountedRef = useRef(false);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
+  const requestOpenChange = (nextOpen: boolean) => {
+    // The write targets whatever this dialog validated against; closing (or
+    // dismissing via Escape/overlay) mid-save would detach that outcome
+    // from any feedback surface.
+    if (isSaving && !nextOpen) return;
+    onOpenChange(nextOpen);
+  };
 
   const existingIds = useMemo(
-    () => new Set(Object.keys(settings.providerInstances ?? {})),
-    [settings.providerInstances],
+    () =>
+      new Set([...Object.keys(settings.providerInstances ?? {}), ...(reservedInstanceIds ?? [])]),
+    [settings.providerInstances, reservedInstanceIds],
   );
 
   const driverOption = DRIVER_OPTION_BY_VALUE[driver] ?? DEFAULT_DRIVER_OPTION;
@@ -179,9 +215,9 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
     );
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     setHasAttemptedSubmit(true);
-    if (instanceIdError !== null) return;
+    if (instanceIdError !== null || isSaving) return;
 
     const config = configByDriver[driver] ?? {};
     const hasConfig = Object.keys(config).length > 0;
@@ -199,12 +235,32 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
     // keeps the type boundary honest and guards against any future drift in
     // the slug rules.
     const brandedId = ProviderInstanceId.make(instanceId);
-    const nextMap = {
-      ...settings.providerInstances,
-      [brandedId]: nextInstance,
-    };
+    setIsSaving(true);
     try {
-      updateSettings({ providerInstances: nextMap });
+      // The persist settles with an AtomCommandResult rather than throwing;
+      // success is only reported (and the dialog only closed) once the
+      // server acknowledged the write. `undefined` means there was no
+      // primary environment to write to — a failure, not a success. Failure
+      // keeps the dialog open with the entered values intact.
+      const settled = await Promise.resolve(onCreateInstance(brandedId, nextInstance));
+      if (unmountedRef.current) return;
+      const failed =
+        settled === undefined ||
+        (typeof settled === "object" &&
+          settled !== null &&
+          "_tag" in settled &&
+          settled._tag === "Failure");
+      if (failed) {
+        toastManager.add({
+          type: "error",
+          title: "Could not add provider instance",
+          description:
+            settled === undefined
+              ? "No connected primary environment to save to."
+              : "The settings update was rejected by the server.",
+        });
+        return;
+      }
       toastManager.add({
         type: "success",
         title: "Provider instance added",
@@ -212,16 +268,19 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
       });
       onOpenChange(false);
     } catch (error) {
+      if (unmountedRef.current) return;
       toastManager.add({
         type: "error",
         title: "Could not add provider instance",
         description: error instanceof Error ? error.message : "Update failed.",
       });
+    } finally {
+      setIsSaving(false);
     }
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={requestOpenChange}>
       <DialogPopup className="max-w-xl overflow-hidden">
         <div className="flex min-h-0 flex-col overflow-hidden">
           <DialogHeader>
@@ -410,9 +469,10 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
             <Button
               variant="outline"
               size="sm"
+              disabled={isSaving}
               onClick={() => {
                 if (wizardStep === 0) {
-                  onOpenChange(false);
+                  requestOpenChange(false);
                   return;
                 }
                 setWizardStep((step) => Math.max(0, step - 1));
@@ -425,8 +485,8 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
                 Next
               </Button>
             ) : (
-              <Button size="sm" onClick={handleSave}>
-                Add instance
+              <Button size="sm" disabled={isSaving} onClick={() => void handleSave()}>
+                {isSaving ? "Adding…" : "Add instance"}
               </Button>
             )}
           </DialogFooter>

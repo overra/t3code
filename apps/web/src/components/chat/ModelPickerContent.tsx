@@ -9,6 +9,7 @@ import { memo, useMemo, useState, useCallback, useEffect, useLayoutEffect, useRe
 import { SearchIcon } from "lucide-react";
 import { ModelListRow } from "./ModelListRow";
 import { ModelPickerSidebar } from "./ModelPickerSidebar";
+import { RestrictedProvidersNotes } from "./RestrictedProvidersNotes";
 import { isModelPickerNewModel } from "./modelPickerModelHighlights";
 import { buildModelPickerSearchText, scoreModelPickerSearch } from "./modelPickerSearch";
 import { Combobox, ComboboxEmpty, ComboboxInput, ComboboxListVirtualized } from "../ui/combobox";
@@ -91,6 +92,17 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   terminalOpen: boolean;
   onRequestClose?: () => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
+  /**
+   * Enabled instances the active project's access rules keep out of this
+   * picker, with the rule that hid each one. Rendered as an explanatory
+   * footer so a restricted provider never reads as silently missing.
+   */
+  restrictedProviderNotes?: ReadonlyArray<{
+    readonly entry: ProviderInstanceEntry;
+    readonly cause: "project-allowlist" | "instance-scope";
+  }>;
+  /** Sidebar gear shortcut to Settings → Providers. */
+  onOpenProviderSettings?: () => void;
   onInstanceModelChange: (instanceId: ProviderInstanceId, model: string) => void;
 }) {
   const {
@@ -542,6 +554,9 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                     `${entry.displayName} is unavailable in this thread. Start a new thread to switch providers.`,
                 }
               : {})}
+            {...(props.onOpenProviderSettings
+              ? { onOpenProviderSettings: props.onOpenProviderSettings }
+              : {})}
           />
         )}
 
@@ -675,6 +690,12 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             <ComboboxEmpty className="not-empty:py-6 empty:h-0 text-xs font-normal leading-snug">
               No models found
             </ComboboxEmpty>
+            {props.restrictedProviderNotes !== undefined &&
+            props.restrictedProviderNotes.length > 0 ? (
+              <div className="border-t border-border/70 px-3 py-2">
+                <RestrictedProvidersNotes notes={props.restrictedProviderNotes} />
+              </div>
+            ) : null}
           </div>
         </Combobox>
       </div>

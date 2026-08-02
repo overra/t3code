@@ -1,4 +1,5 @@
 import {
+  getProviderInstanceConfig,
   isProviderDriverKind,
   isProviderAvailable,
   type ModelSelection,
@@ -34,7 +35,10 @@ export function isModelSelectionProviderEnabled(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
-  const instanceConfig = settings.providerInstances[selection.instanceId];
+  const instanceConfig = getProviderInstanceConfig(
+    settings.providerInstances,
+    selection.instanceId,
+  );
   if (instanceConfig !== undefined) {
     return instanceConfig.enabled ?? true;
   }
@@ -121,6 +125,115 @@ function mergeModelSelectionOptionsById(input: {
   return [...merged.entries()].map(([id, value]) => ({ id, value }));
 }
 
+/**
+ * Preserves an instance's ACCESS SCOPE across writes that do not explicitly
+ * carry one. `allowedProjects` is security policy: an incoming instance
+ * value lacking the key (a stale render capture editing another field, or an
+ * older client whose schema strips the unknown field entirely) must not
+ * silently widen access by dropping the stored scope. Scope changes flow
+ * only through values that INCLUDE the key — the scope editor always sends
+ * it explicitly, `null` included.
+ */
+function withPreservedInstanceScope(
+  currentInstance:
+    | ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+    | undefined,
+  incoming: NonNullable<
+    NonNullable<ServerSettingsPatch["providerInstancesPatch"]>[keyof NonNullable<
+      ServerSettingsPatch["providerInstancesPatch"]
+    >]
+  >,
+) {
+  if ("allowedProjects" in incoming) return incoming;
+  if (currentInstance === undefined || !("allowedProjects" in currentInstance)) return incoming;
+  return { ...incoming, allowedProjects: currentInstance.allowedProjects };
+}
+
+/**
+ * Applies per-instance upserts/deletes onto a provider-instances map. `null`
+ * deletes the entry; a config value replaces that entry whole (except the
+ * preserved scope, above). Runs against the map the SERVER holds at apply
+ * time (under its settings write lock), so two clients editing different
+ * instances can never revert each other.
+ */
+export function applyProviderInstancesPatch(
+  current: ServerSettings["providerInstances"],
+  patches: NonNullable<ServerSettingsPatch["providerInstancesPatch"]>,
+): ServerSettings["providerInstances"] {
+  const next = { ...current } as Record<
+    keyof ServerSettings["providerInstances"],
+    ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+  >;
+  for (const [instanceId, value] of Object.entries(patches) as Array<
+    [keyof typeof next, (typeof patches)[keyof typeof patches]]
+  >) {
+    if (value === null) {
+      delete next[instanceId];
+    } else {
+      next[instanceId] = withPreservedInstanceScope(
+        Object.hasOwn(current, instanceId) ? current[instanceId] : undefined,
+        value,
+      );
+    }
+  }
+  return next;
+}
+
+/**
+ * Whole-map replacement with the same scope preservation per entry: an
+ * older client re-sending the entire map (its schema having stripped the
+ * unknown `allowedProjects` field from every entry) must not erase stored
+ * scopes as a side effect of an ordinary provider edit.
+ *
+ * RESTRICTED entries (non-null scope) absent from the incoming map are
+ * RETAINED, not deleted: a
+ * pre-capability client may simply not carry the entry (or a stale one may
+ * predate it), and deleting it would let provider hydration resynthesize a
+ * driver default with no scope — silently converting a restricted instance
+ * into an unrestricted one. The cost is that scoped instances can only be
+ * deleted through the granular patch channel (capability-aware clients).
+ */
+export function replaceProviderInstancesPreservingScopes(
+  current: ServerSettings["providerInstances"],
+  incoming: ServerSettings["providerInstances"],
+): ServerSettings["providerInstances"] {
+  const next = {} as Record<
+    keyof ServerSettings["providerInstances"],
+    ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]]
+  >;
+  for (const [instanceId, value] of Object.entries(incoming) as Array<
+    [
+      keyof ServerSettings["providerInstances"],
+      ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]],
+    ]
+  >) {
+    next[instanceId] =
+      value === undefined
+        ? value
+        : withPreservedInstanceScope(
+            Object.hasOwn(current, instanceId) ? current[instanceId] : undefined,
+            value,
+          );
+  }
+  for (const [instanceId, value] of Object.entries(current) as Array<
+    [
+      keyof ServerSettings["providerInstances"],
+      ServerSettings["providerInstances"][keyof ServerSettings["providerInstances"]],
+    ]
+  >) {
+    // Object.hasOwn, not `in`: instance ids are user-chosen strings, and a
+    // prototype-named id ("constructor", "toString") would match inherited
+    // properties and skip retention.
+    if (Object.hasOwn(next, instanceId) || value === undefined) continue;
+    // `allowedProjects: null` means "all projects" — deleting such an entry
+    // cannot widen access, so legacy deletes of it still go through.
+    if (value.allowedProjects != null) {
+      next[instanceId] = value;
+    }
+  }
+  return next;
+}
+
 export function applyServerSettingsPatch(
   current: ServerSettings,
   patch: ServerSettingsPatch,
@@ -131,6 +244,7 @@ export function applyServerSettingsPatch(
     providerHealthRefreshInterval,
     backgroundActivityProfile,
     backgroundActivity,
+    providerInstancesPatch,
     ...patchForMerge
   } = patch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
@@ -185,7 +299,27 @@ export function applyServerSettingsPatch(
       ? { backgroundActivity: backgroundActivityPatch }
       : {}),
     ...(patch.providerInstances !== undefined
-      ? { providerInstances: patch.providerInstances }
+      ? {
+          providerInstances: replaceProviderInstancesPreservingScopes(
+            current.providerInstances,
+            patch.providerInstances,
+          ),
+        }
+      : {}),
+    // Applied after (and on top of) any whole-map replacement so per-instance
+    // patches win when a caller inexplicably sends both.
+    ...(providerInstancesPatch !== undefined
+      ? {
+          providerInstances: applyProviderInstancesPatch(
+            patch.providerInstances !== undefined
+              ? replaceProviderInstancesPreservingScopes(
+                  current.providerInstances,
+                  patch.providerInstances,
+                )
+              : current.providerInstances,
+            providerInstancesPatch,
+          ),
+        }
       : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
@@ -205,6 +339,9 @@ export function applyServerSettingsPatch(
     automaticGitFetchInterval: resolvedBackgroundActivity.automaticGitFetchInterval,
     providerHealthRefreshInterval: resolvedBackgroundActivity.providerHealthRefreshInterval,
     backgroundActivityProfile: resolvedBackgroundActivity.profile,
+    // Server-managed monotonic ack counter — every applied patch bumps it,
+    // and patches themselves can never set it (it is not a patch field).
+    settingsRevision: (current.settingsRevision ?? 0) + 1,
   };
   if (!selectionPatch) {
     return nextWithReplacements;

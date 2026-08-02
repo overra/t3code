@@ -43,11 +43,15 @@ import {
 } from "../../state/use-composer-drafts";
 import { useBranches } from "../../state/queries";
 import {
+  enqueueThreadOutboxMessage,
   flattenQueuedThreadMessages,
+  isQueuedThreadMessageFailed,
+  removeThreadOutboxMessage,
   threadOutboxManager,
   updateThreadOutboxMessage,
   type QueuedThreadMessage,
 } from "../../state/thread-outbox";
+import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import {
   holdEditingQueuedMessage,
   releaseEditingQueuedMessage,
@@ -152,6 +156,7 @@ type NewTaskFlowContextValue = {
   readonly beginEditingPendingTask: (messageId: string) => boolean;
   readonly finishEditingPendingTask: () => void;
   readonly cancelEditingPendingTask: () => void;
+  readonly setEditingTaskSubmission: (messageId: string | null) => void;
   readonly buildPendingTaskMessage: (metadata: TurnCommandMetadata) => QueuedThreadMessage | null;
   readonly setPrompt: (value: string) => void;
   readonly replaceAttachments: (attachments: ReadonlyArray<DraftComposerImageAttachment>) => void;
@@ -219,6 +224,13 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   // Mirrors `editingPendingTask` synchronously so the unmount flush cannot act
   // on a task whose editing session already ended this render.
   const editingPendingTaskRef = useRef<QueuedThreadMessage | null>(null);
+  // While Start OWNS the editing session's persistence (its submission is
+  // in flight), the dismissal flush must not independently requeue the
+  // task — that path minted a second fresh creation for failed tasks.
+  const editingSubmissionMessageIdRef = useRef<string | null>(null);
+  const setEditingTaskSubmission = useCallback((messageId: string | null) => {
+    editingSubmissionMessageIdRef.current = messageId;
+  }, []);
 
   const reset = useCallback(() => {
     setSelectedEnvironmentId(null);
@@ -385,13 +397,40 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       buildModelOptions(
         selectedEnvironmentServerConfig,
         draftModelSelection ?? projectDefaultModelSelection,
+        selectedProject
+          ? {
+              id: selectedProject.id,
+              allowedProviderInstances: selectedProject.allowedProviderInstances ?? null,
+            }
+          : null,
       ),
-    [selectedEnvironmentServerConfig, draftModelSelection, projectDefaultModelSelection],
+    [
+      selectedEnvironmentServerConfig,
+      draftModelSelection,
+      projectDefaultModelSelection,
+      selectedProject,
+    ],
   );
 
+  // The draft and project default are only candidates while their instance
+  // survives access filtering — `modelOptions` is already restricted to the
+  // project's rules, so membership is the usability test. Without this, the
+  // menu filter changes what is DISPLAYED but a stale draft would still be
+  // the value dispatched.
+  const usableInstanceIds = useMemo(
+    () => new Set(modelOptions.map((option) => option.selection.instanceId)),
+    [modelOptions],
+  );
   const selectedModel =
-    draftModelSelection ??
-    projectDefaultModelSelection ??
+    // Server usability is already applied above; project access rules are
+    // applied here, since `modelOptions` is restricted to them.
+    (draftModelSelection !== null && usableInstanceIds.has(draftModelSelection.instanceId)
+      ? draftModelSelection
+      : null) ??
+    (projectDefaultModelSelection !== null &&
+    usableInstanceIds.has(projectDefaultModelSelection.instanceId)
+      ? projectDefaultModelSelection
+      : null) ??
     modelOptions.find((option) => option.isDefault)?.selection ??
     modelOptions[0]?.selection ??
     null;
@@ -690,13 +729,19 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
       const draft = getComposerDraftSnapshot(selectedProjectDraftKey);
       const text = draft.text.trim();
-      // Same availability gate the composer display applies: a stored
-      // selection targeting a disabled provider must not ride into the queue.
+      // Both gates the composer display applies: a stored selection must
+      // target a provider that is still usable on the server AND still
+      // permitted by the project's access rules (membership in the
+      // already-filtered options). Otherwise the flow's clamped resolution
+      // queues instead of a disabled or revoked selection.
+      const rawDraftSelection = resolveSelectableModelSelection(
+        selectedEnvironmentServerConfig,
+        draft.modelSelection ?? null,
+      );
       const draftModelSelection =
-        resolveSelectableModelSelection(
-          selectedEnvironmentServerConfig,
-          draft.modelSelection ?? null,
-        ) ?? selectedModel;
+        (rawDraftSelection && usableInstanceIds.has(rawDraftSelection.instanceId)
+          ? rawDraftSelection
+          : null) ?? selectedModel;
       if (text.length === 0 || !draftModelSelection) {
         return null;
       }
@@ -750,6 +795,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       selectedProject,
       selectedProjectDraftKey,
       startFromOrigin,
+      usableInstanceIds,
       workspaceMode,
     ],
   );
@@ -757,6 +803,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const finishEditingPendingTask = useCallback(() => {
     const editing = editingPendingTaskRef.current;
     editingPendingTaskRef.current = null;
+    editingSubmissionMessageIdRef.current = null;
     if (editing) {
       if (activeEditingMessageId === editing.messageId) {
         activeEditingMessageId = null;
@@ -794,18 +841,38 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       if (!editing) {
         return;
       }
+      // Start owns this session: its in-flight submission (and its own
+      // cleanup on success or failure) supersedes the dismissal flush.
+      // Everything — refs, drain lock, pending-task draft — is left intact
+      // for that continuation.
+      if (editingSubmissionMessageIdRef.current === editing.messageId) {
+        return;
+      }
       editingPendingTaskRef.current = null;
       setEditingPendingTask(null);
       if (activeEditingMessageId === editing.messageId) {
         activeEditingMessageId = null;
       }
 
-      const message = buildPendingTaskMessage({
-        threadId: editing.threadId,
-        commandId: editing.commandId,
-        messageId: editing.messageId,
-        createdAt: editing.createdAt,
-      });
+      // A FAILED creation's identifiers are burned: its bootstrap may have
+      // failed after creating the thread, whose (soft-deleted) id stays
+      // occupied forever — requeuing under the same ids would be rejected
+      // on every retry. Requeue it as a NEW entry with fresh turn metadata,
+      // then retire the failed record.
+      const storedEntry = flattenQueuedThreadMessages(
+        appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+      ).find((candidate) => candidate.messageId === editing.messageId);
+      const requeueAsFresh = storedEntry !== undefined && isQueuedThreadMessageFailed(storedEntry);
+      const message = buildPendingTaskMessage(
+        requeueAsFresh
+          ? makeTurnCommandMetadata()
+          : {
+              threadId: editing.threadId,
+              commandId: editing.commandId,
+              messageId: editing.messageId,
+              createdAt: editing.createdAt,
+            },
+      );
 
       if (!message) {
         // The edits are currently unsendable (e.g. the prompt was cleared).
@@ -816,8 +883,18 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
 
       // update() rewrites the task only if it is still queued — a concurrent
-      // delete or delivery wins, so the flush cannot resurrect it.
-      void updateThreadOutboxMessage(message)
+      // delete or delivery wins, so the flush cannot resurrect it. The
+      // fresh-id requeue enqueues the new entry FIRST and only then removes
+      // the failed original: a crash between the two shows a duplicate the
+      // user can delete, never lost content.
+      const persistEdits: Promise<unknown> = requeueAsFresh
+        ? enqueueThreadOutboxMessage(message).then(() =>
+            removeThreadOutboxMessage(storedEntry).catch((error) => {
+              console.warn("[new-task] failed to retire failed task after fresh requeue", error);
+            }),
+          )
+        : updateThreadOutboxMessage(message);
+      void persistEdits
         .then(() => {
           // If this task was reopened (possibly in a fresh provider) while
           // the save was in flight, that session owns the draft and the lock.
@@ -883,6 +960,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       beginEditingPendingTask,
       finishEditingPendingTask,
       cancelEditingPendingTask,
+      setEditingTaskSubmission,
       buildPendingTaskMessage,
       setPrompt,
       replaceAttachments,
@@ -905,6 +983,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       branchesLoading,
       buildPendingTaskMessage,
       cancelEditingPendingTask,
+      setEditingTaskSubmission,
       editingPendingTask,
       environments,
       expandedProvider,

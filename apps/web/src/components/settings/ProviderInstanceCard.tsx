@@ -15,6 +15,7 @@ import * as Result from "effect/Result";
 import { useState, type ReactNode } from "react";
 import {
   isProviderDriverKind,
+  type ProjectId,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   type ProviderInstanceId,
@@ -26,6 +27,11 @@ import {
 import { cn } from "../../lib/utils";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { normalizeProviderAccentColor } from "../../providerInstances";
+import {
+  ProviderProjectScopeSection,
+  type ProviderScopePeerInstance,
+  type ProviderScopeProjectOption,
+} from "./ProviderProjectScopeSection";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
@@ -107,6 +113,20 @@ function nextConfigBlobWithValue(
     config !== null && typeof config === "object" ? { ...(config as Record<string, unknown>) } : {};
   base[key] = value;
   return base;
+}
+
+/**
+ * Shapes a scope write. ALWAYS carries the `allowedProjects` key, `null`
+ * included: the server preserves the stored scope on any write that omits
+ * the key, so clearing to "all projects" must arrive as an explicit
+ * `allowedProjects: null`, never an omission.
+ */
+export function buildAllowedProjectsUpdate(
+  instance: ProviderInstanceConfig,
+  value: ReadonlyArray<ProjectId> | null,
+): ProviderInstanceConfig {
+  const { allowedProjects: _omit, ...rest } = instance;
+  return { ...rest, allowedProjects: value } as ProviderInstanceConfig;
 }
 
 export function deriveProviderModelsForDisplay(input: {
@@ -325,7 +345,15 @@ interface ProviderInstanceCardProps {
   readonly liveProvider: ServerProvider | undefined;
   readonly isExpanded: boolean;
   readonly onExpandedChange: (open: boolean) => void;
-  readonly onUpdate: (nextInstance: ProviderInstanceConfig) => void;
+  /**
+   * May return the settings-persist promise so optimistic controls (the
+   * project scope popover) can roll back on rejection; other callers ignore
+   * the return value.
+   */
+  readonly onUpdate: (
+    nextInstance: ProviderInstanceConfig,
+    options?: { readonly scopeWrite?: boolean },
+  ) => unknown;
   /**
    * Pass `undefined` to hide the delete button entirely. Built-in default
    * instance slots use `undefined` — they can't be deleted without losing
@@ -349,6 +377,20 @@ interface ProviderInstanceCardProps {
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
   readonly onRunUpdate?: (() => void) | undefined;
   readonly isUpdating?: boolean | undefined;
+  /**
+   * Projects of the environment this settings surface edits, for the
+   * per-instance project scope control. Omitted (together with
+   * `peerInstances`) the Projects row is not rendered.
+   */
+  readonly projects?: ReadonlyArray<ProviderScopeProjectOption> | undefined;
+  /** Every configured instance's effective enabled/scope state, this one included. */
+  readonly peerInstances?: ReadonlyArray<ProviderScopePeerInstance> | undefined;
+  /** See `ProviderProjectScopeSection.onPendingScopeChange`. */
+  readonly onPendingScopeChange?:
+    | ((instanceId: ProviderInstanceId, scope: ReadonlyArray<ProjectId> | null | undefined) => void)
+    | undefined;
+  /** See `ProviderProjectScopeSection.settingsRevision`. */
+  readonly settingsRevision?: number | undefined;
 }
 
 /**
@@ -393,6 +435,10 @@ export function ProviderInstanceCard({
   onModelOrderChange,
   onRunUpdate,
   isUpdating = false,
+  projects,
+  peerInstances,
+  onPendingScopeChange,
+  settingsRevision,
 }: ProviderInstanceCardProps) {
   const enabled = instance.enabled ?? true;
   // The server-reported status wins when present; otherwise fall back to
@@ -465,6 +511,11 @@ export function ProviderInstanceCard({
   const updateEnabled = (value: boolean) => {
     onUpdate({ ...instance, enabled: value });
   };
+
+  const updateAllowedProjects = (value: ReadonlyArray<ProjectId> | null) =>
+    // scopeWrite: this write's intent IS the scope — it must never be
+    // stripped, even when it matches the (possibly stale) streamed value.
+    onUpdate(buildAllowedProjectsUpdate(instance, value), { scopeWrite: true });
 
   const updateAccentColor = (value: string) => {
     const normalized = normalizeProviderAccentColor(value);
@@ -756,6 +807,19 @@ export function ProviderInstanceCard({
                 description="Used to distinguish this instance in picker rails and model lists."
               />
             </div>
+
+            {projects !== undefined && peerInstances !== undefined ? (
+              <ProviderProjectScopeSection
+                displayName={displayName}
+                allowedProjects={instance.allowedProjects ?? null}
+                projects={projects}
+                instanceId={instanceId}
+                peerInstances={peerInstances}
+                onChange={updateAllowedProjects}
+                onPendingScopeChange={onPendingScopeChange}
+                settingsRevision={settingsRevision ?? 0}
+              />
+            ) : null}
 
             <div>
               <ProviderEnvironmentSection

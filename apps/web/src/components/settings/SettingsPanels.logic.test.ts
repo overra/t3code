@@ -3,6 +3,7 @@ import {
   DEFAULT_UNIFIED_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 import { getBackgroundActivityPresetSettings } from "@t3tools/shared/backgroundActivitySettings";
@@ -15,6 +16,7 @@ import {
   hasChangedBackgroundActivitySettings,
   isProjectGroupingEnabled,
   projectGroupingModeFromToggle,
+  omitInstanceScope,
   resolveBackgroundActivityProfileOption,
 } from "./SettingsPanels.logic";
 
@@ -175,7 +177,7 @@ describe("formatDiagnosticsDescription", () => {
 });
 
 describe("buildProviderInstanceUpdatePatch", () => {
-  it("promotes an edited default provider into providerInstances and resets the legacy provider", () => {
+  it("emits a single-instance patch and a single-driver legacy reset for defaults", () => {
     const instanceId = ProviderInstanceId.make("codex");
     const nextInstance = {
       driver: ProviderDriverKind.make("codex"),
@@ -185,25 +187,36 @@ describe("buildProviderInstanceUpdatePatch", () => {
       },
     } satisfies ProviderInstanceConfig;
 
-    const patch = buildProviderInstanceUpdatePatch({
-      settings: {
-        ...DEFAULT_SERVER_SETTINGS,
-        providers: {
-          ...DEFAULT_SERVER_SETTINGS.providers,
-          codex: {
-            ...DEFAULT_SERVER_SETTINGS.providers.codex,
-            binaryPath: "/legacy/codex",
-          },
-        },
+    const patch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: true,
       },
-      instanceId,
-      instance: nextInstance,
-      driver: ProviderDriverKind.make("codex"),
-      isDefault: true,
-    });
+      { granular: true },
+    );
 
-    expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
-    expect(patch.providers?.codex).toEqual(DEFAULT_SERVER_SETTINGS.providers.codex);
+    // GRANULAR: exactly one instance entry, no whole-map replacement — the
+    // server merges this onto its own current map, so concurrent edits to
+    // other instances can never be reverted by this write.
+    expect(patch.providerInstances).toBeUndefined();
+    expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
+    expect(patch.providers).toEqual({ codex: DEFAULT_SERVER_SETTINGS.providers.codex });
+
+    // Legacy mode (pre-capability servers, which strip the patch key and
+    // would no-op): the whole-map shape composed from the caller's settings.
+    const legacyPatch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: true,
+      },
+      { granular: false, settings: DEFAULT_SERVER_SETTINGS },
+    );
+    expect(legacyPatch.providerInstancesPatch).toBeUndefined();
+    expect(legacyPatch.providerInstances?.[instanceId]).toEqual(nextInstance);
   });
 
   it("updates custom instances without touching legacy provider settings", () => {
@@ -216,15 +229,37 @@ describe("buildProviderInstanceUpdatePatch", () => {
       },
     } satisfies ProviderInstanceConfig;
 
-    const patch = buildProviderInstanceUpdatePatch({
-      settings: DEFAULT_SERVER_SETTINGS,
-      instanceId,
-      instance: nextInstance,
-      driver: ProviderDriverKind.make("codex"),
-      isDefault: false,
-    });
+    const patch = buildProviderInstanceUpdatePatch(
+      {
+        instanceId,
+        instance: nextInstance,
+        driver: ProviderDriverKind.make("codex"),
+        isDefault: false,
+      },
+      { granular: true },
+    );
 
-    expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
+    expect(patch.providerInstancesPatch).toEqual({ [instanceId]: nextInstance });
     expect(patch.providers).toBeUndefined();
+  });
+});
+
+describe("omitInstanceScope", () => {
+  const driver = ProviderDriverKind.make("claudeAgent");
+  const projectA = ProjectId.make("project-a");
+
+  it("drops the scope key from non-scope writes regardless of its value", () => {
+    // Non-scope edits must NEVER carry the key — the server preserves the
+    // stored scope on omission, and deciding by comparison against the
+    // streamed row would drop the final write of a rapid A→B→A sequence.
+    expect(
+      "allowedProjects" in
+        omitInstanceScope({ driver, enabled: false, allowedProjects: [projectA] }),
+    ).toBe(false);
+    expect(
+      "allowedProjects" in omitInstanceScope({ driver, enabled: false, allowedProjects: null }),
+    ).toBe(false);
+    const withoutKey = { driver, enabled: true };
+    expect(omitInstanceScope(withoutKey)).toBe(withoutKey);
   });
 });

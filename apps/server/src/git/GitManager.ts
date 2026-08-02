@@ -27,9 +27,13 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   VcsStatusResult,
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
   ModelSelection,
+  type ProviderInstanceConfigMap,
   type SourceControlWritingStyleSettings,
 } from "@t3tools/contracts";
+import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import {
   detectSourceControlProviderFromGitRemoteUrl,
   mergeGitStatusParts,
@@ -51,6 +55,7 @@ import {
   repositoryConventionsTextGenerationPolicy,
 } from "../textGeneration/TextGenerationPresets.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -70,7 +75,13 @@ export interface GitRunStackedActionOptions {
 }
 
 interface SourceControlTextGenerationSettings {
-  readonly modelSelection: ModelSelection;
+  /**
+   * Writer selection already clamped to the target repository's project
+   * access rules. `undefined` means no usable instance exists for that
+   * project — generation call sites must fail with guidance rather than
+   * send repository content to a restricted provider.
+   */
+  readonly modelSelection: ModelSelection | undefined;
   readonly style: SourceControlWritingStyleSettings;
 }
 
@@ -115,6 +126,26 @@ const PR_LOOKUP_CACHE_CAPACITY = 2_048;
 type StripProgressContext<T> = T extends any ? Omit<T, "actionId" | "cwd" | "action"> : never;
 type GitActionProgressPayload = StripProgressContext<GitActionProgressEvent>;
 type GitActionProgressEmitter = (event: GitActionProgressPayload) => Effect.Effect<void, never>;
+
+/**
+ * Containment over paths already canonicalized with
+ * `normalizeProjectPathForComparison`: normalized Windows/UNC paths use
+ * backslashes, POSIX paths use slashes, and containment must respect
+ * whichever separator the normalizer produced or Windows ownership silently
+ * misses (`C:\repo` would otherwise not own `C:\repo\packages\app`).
+ * Filesystem roots (`/`, `c:\`) already end in their separator — appending
+ * another would make a root own nothing at all.
+ */
+export const isNormalizedPathWithin = (child: string, parent: string): boolean => {
+  if (parent.endsWith("/") || parent.endsWith("\\")) {
+    return child !== parent && child.startsWith(parent);
+  }
+  return child.startsWith(`${parent}/`) || child.startsWith(`${parent}\\`);
+};
+
+/** Ownership for the writer clamp: equal, or containment in either direction. */
+export const areNormalizedPathsRelated = (a: string, b: string): boolean =>
+  a === b || isNormalizedPathWithin(a, b) || isNormalizedPathWithin(b, a);
 
 function isNotGitRepositoryError(error: GitCommandError): boolean {
   return error.message.toLowerCase().includes("not a git repository");
@@ -584,6 +615,120 @@ export const make = Effect.gen(function* () {
 
   const sourceControlProvider = (cwd: string) => sourceControlProviders.resolve({ cwd });
   const serverSettingsService = yield* ServerSettings.ServerSettingsService;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const fileSystem = yield* FileSystem.FileSystem;
+
+  /**
+   * Commit/PR text generation sends repository content (diffs, commit and
+   * branch summaries) to the selected instance, so the configured writer
+   * must also pass the provider access rules of the project it is writing
+   * about. `cwd` may be the project root or a thread worktree; both resolve
+   * through the shell snapshot. Falls back to the owning thread's selection,
+   * then the project default. Returns undefined when nothing usable remains;
+   * a projection read failure resolves to the unclamped candidate — the
+   * conversation gates stay authoritative, and an infra hiccup must not
+   * block commits.
+   */
+  const clampWriterSelectionToProjectAccess = Effect.fn("clampWriterSelectionToProjectAccess")(
+    function* (input: {
+      readonly cwd: string;
+      readonly candidate: ModelSelection;
+      readonly providerInstances: ProviderInstanceConfigMap;
+    }) {
+      // Git accepts any repository subdirectory as cwd; project and worktree
+      // records store the repository root, so match on the resolved toplevel
+      // rather than the literal cwd. Root resolution FAILS CLOSED: a cwd
+      // whose repository cannot be identified cannot have its ownership
+      // verified, and guessing with the literal cwd can miss a restricted
+      // subproject from a sibling directory.
+      const repositoryRoot = yield* gitCore
+        .execute({
+          operation: "GitManager.resolveWriterRepositoryRoot",
+          cwd: input.cwd,
+          args: ["rev-parse", "--show-toplevel"],
+        })
+        .pipe(
+          Effect.map((result) => {
+            const root = result.stdout.trim();
+            return root.length > 0 ? root : undefined;
+          }),
+          Effect.orElseSucceed(() => undefined),
+        );
+      if (repositoryRoot === undefined) {
+        yield* Effect.logWarning(
+          "git manager could not resolve the repository root for writer clamping",
+          { cwd: input.cwd },
+        );
+        return undefined;
+      }
+      // Fail CLOSED on projection failures: this clamp protects repository
+      // content from restricted providers, so "cannot verify" must block
+      // generation (callers surface guidance; manual messages still work)
+      // rather than fall back to the unclamped global writer.
+      const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("git manager could not resolve project access for writer selection", {
+            cwd: input.cwd,
+            cause,
+          }).pipe(Effect.as(undefined)),
+        ),
+      );
+      if (snapshot === undefined) return undefined;
+      // Compare canonical (symlink-resolved) paths, and treat containment in
+      // EITHER direction as ownership: a project rooted at a monorepo
+      // subdirectory is covered by a git action at the repository root, and
+      // a nested repository under a project directory is that project's
+      // content. Multiple owners (several projects in one monorepo) all
+      // constrain the writer. A repository related to NO project stays
+      // unrestricted on purpose — no project means no project rules.
+      const canonicalize = (value: string) =>
+        fileSystem.realPath(value).pipe(
+          Effect.orElseSucceed(() => value),
+          Effect.map(normalizeProjectPathForComparison),
+        );
+      const canonicalRoot = yield* canonicalize(repositoryRoot);
+      const owningThreads: Array<(typeof snapshot.threads)[number]> = [];
+      for (const thread of snapshot.threads) {
+        if (thread.worktreePath === null) continue;
+        if (areNormalizedPathsRelated(yield* canonicalize(thread.worktreePath), canonicalRoot)) {
+          owningThreads.push(thread);
+        }
+      }
+      const owningProjectIds = new Set(owningThreads.map((thread) => thread.projectId));
+      const owningProjects: Array<(typeof snapshot.projects)[number]> = [];
+      for (const entry of snapshot.projects) {
+        if (
+          owningProjectIds.has(entry.id) ||
+          areNormalizedPathsRelated(yield* canonicalize(entry.workspaceRoot), canonicalRoot)
+        ) {
+          owningProjects.push(entry);
+        }
+      }
+      if (owningProjects.length === 0) return input.candidate;
+      const usable = (selection: ModelSelection) =>
+        owningProjects.every((project) =>
+          isProviderInstanceUsableInProject({
+            instanceId: selection.instanceId,
+            instanceAllowedProjects: getProviderInstanceAllowedProjects(
+              input.providerInstances,
+              selection.instanceId,
+            ),
+            projectId: project.id,
+            projectAllowedProviderInstances: project.allowedProviderInstances ?? null,
+          }),
+        );
+      if (usable(input.candidate)) return input.candidate;
+      for (const owningThread of owningThreads) {
+        if (usable(owningThread.modelSelection)) return owningThread.modelSelection;
+      }
+      for (const project of owningProjects) {
+        if (project.defaultModelSelection !== null && usable(project.defaultModelSelection)) {
+          return project.defaultModelSelection;
+        }
+      }
+      return undefined;
+    },
+  );
 
   const readRecentCommitSubjects = (cwd: string) =>
     gitCore
@@ -823,7 +968,6 @@ export const make = Effect.gen(function* () {
           ),
       ),
     );
-  const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
   const tempDir = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";
@@ -1409,6 +1553,15 @@ export const make = Effect.gen(function* () {
         };
       }
 
+      const modelSelection = input.settings.modelSelection;
+      if (modelSelection === undefined) {
+        return yield* new GitManagerError({
+          operation: "resolveCommitAndBranchSuggestion",
+          cwd: input.cwd,
+          detail:
+            "Commit message generation is unavailable: no provider is allowed for this project. Enter a commit message manually, or update the project's provider access.",
+        });
+      }
       const policy = yield* resolveStylePolicy(input.cwd, input.settings.style);
 
       const generated = yield* textGeneration
@@ -1419,7 +1572,7 @@ export const make = Effect.gen(function* () {
           stagedPatch: limitContext(context.stagedPatch, 50_000),
           ...(input.includeBranch ? { includeBranch: true } : {}),
           ...(policy ? { policy } : {}),
-          modelSelection: input.settings.modelSelection,
+          modelSelection,
         })
         .pipe(Effect.map((result) => sanitizeCommitMessage(result)));
 
@@ -1593,6 +1746,15 @@ export const make = Effect.gen(function* () {
       phase: "pr",
       label: `Generating ${terms.shortLabel} content...`,
     });
+    const modelSelection = settings.modelSelection;
+    if (modelSelection === undefined) {
+      return yield* new GitManagerError({
+        operation: "runPrStep",
+        cwd,
+        detail:
+          "Pull request generation is unavailable: no provider is allowed for this project. Update the project's provider access, or create the pull request manually.",
+      });
+    }
     const baseRangeRef = yield* resolveBaseRangeRef(cwd, baseBranch);
     const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
     const policy = yield* resolveStylePolicy(cwd, settings.style);
@@ -1610,7 +1772,7 @@ export const make = Effect.gen(function* () {
       diffPatch: limitContext(rangeContext.diffPatch, 60_000),
       ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
       ...(policy ? { policy } : {}),
-      modelSelection: settings.modelSelection,
+      modelSelection,
     });
 
     const bodyFile = path.join(
@@ -1991,23 +2153,26 @@ export const make = Effect.gen(function* () {
         let commitMessageForStep = input.commitMessage;
         let preResolvedCommitSuggestion: CommitAndBranchSuggestion | undefined = undefined;
 
-        const textGenerationSettings = yield* serverSettingsService.getSettings.pipe(
-          Effect.flatMap((settings) =>
-            settings.sourceControlWriterModelSelection === null
-              ? Effect.succeed({
-                  modelSelection: settings.textGenerationModelSelection,
-                  style: settings.sourceControlWritingStyle,
-                })
-              : providerRegistry.getProviders.pipe(
-                  Effect.map((providers) => ({
-                    modelSelection: ServerSettings.resolveSourceControlWriterModelSelection(
-                      settings,
-                      providers,
-                    ),
-                    style: settings.sourceControlWritingStyle,
-                  })),
-                ),
-          ),
+        const textGenerationSettings: SourceControlTextGenerationSettings = yield* Effect.gen(
+          function* () {
+            const settings = yield* serverSettingsService.getSettings;
+            const candidate =
+              settings.sourceControlWriterModelSelection === null
+                ? settings.textGenerationModelSelection
+                : ServerSettings.resolveSourceControlWriterModelSelection(
+                    settings,
+                    yield* providerRegistry.getProviders,
+                  );
+            return {
+              modelSelection: yield* clampWriterSelectionToProjectAccess({
+                cwd: input.cwd,
+                candidate,
+                providerInstances: settings.providerInstances,
+              }),
+              style: settings.sourceControlWritingStyle,
+            };
+          },
+        ).pipe(
           Effect.mapError(
             (cause) =>
               new GitManagerError({

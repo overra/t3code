@@ -33,6 +33,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5.4",
         },
+        allowedProviderInstances: null,
         scripts: [],
         createdAt: "2026-03-24T00:00:00.000Z",
         updatedAt: "2026-03-24T00:00:00.000Z",
@@ -67,6 +68,54 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5.4",
       });
+      assert.strictEqual(Option.getOrNull(persisted)?.allowedProviderInstances, null);
+    }),
+  );
+
+  it.effect("round-trips the project provider allowlist", () =>
+    Effect.gen(function* () {
+      const projects = yield* ProjectionProjectRepository;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* projects.upsert({
+        projectId: ProjectId.make("project-allowlist"),
+        title: "Allowlist project",
+        workspaceRoot: "/tmp/project-allowlist",
+        defaultModelSelection: null,
+        allowedProviderInstances: [
+          ProviderInstanceId.make("claudeAgent_work"),
+          ProviderInstanceId.make("codex"),
+        ],
+        scripts: [],
+        createdAt: "2026-03-24T00:00:00.000Z",
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        deletedAt: null,
+      });
+
+      const rows = yield* sql<{
+        readonly allowedProviderInstances: string | null;
+      }>`
+        SELECT allowed_provider_instances_json AS "allowedProviderInstances"
+        FROM projection_projects
+        WHERE project_id = 'project-allowlist'
+      `;
+      const row = rows[0];
+      if (!row) {
+        return yield* Effect.die("Expected projection_projects row to exist.");
+      }
+      assert.strictEqual(
+        row.allowedProviderInstances,
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify(["claudeAgent_work", "codex"]),
+      );
+
+      const persisted = yield* projects.getById({
+        projectId: ProjectId.make("project-allowlist"),
+      });
+      assert.deepStrictEqual(Option.getOrNull(persisted)?.allowedProviderInstances, [
+        ProviderInstanceId.make("claudeAgent_work"),
+        ProviderInstanceId.make("codex"),
+      ]);
     }),
   );
 

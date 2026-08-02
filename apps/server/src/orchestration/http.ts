@@ -9,6 +9,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
 import { normalizeDispatchCommand } from "./Normalizer.ts";
+import { validateCommandProviderAccess } from "./providerScopeChecks.ts";
 import {
   annotateEnvironmentRequest,
   failEnvironmentInternal,
@@ -18,6 +19,7 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -25,6 +27,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const serverSettings = yield* ServerSettingsService;
 
     return handlers
       .handle(
@@ -83,6 +86,31 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.dispatch")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          // Before normalization: a denied image turn must not persist its
+          // attachments, and the typed denial beats a first-turn failure.
+          // The validator's message carries which rule blocked (project
+          // allowlist vs instance scope) and the recovery surface.
+          const providerAccess = yield* Effect.result(
+            validateCommandProviderAccess(args.payload, {
+              getSettings: serverSettings.getSettings,
+              getThreadProjectId: projectionSnapshotQuery.getThreadProjectIdById,
+              getProjectAccess: projectionSnapshotQuery.getProjectAccessById,
+            }),
+          );
+          if (providerAccess._tag === "Failure") {
+            // A verification outage is transient — surface it as a 500 so
+            // clients retry, not as a 400 policy denial they would obey.
+            if (providerAccess.failure.retryable === true) {
+              return yield* failEnvironmentInternal(
+                "orchestration_dispatch_failed",
+                providerAccess.failure,
+              );
+            }
+            return yield* failEnvironmentInvalidRequest(
+              "provider_access_denied",
+              providerAccess.failure.message,
+            );
+          }
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );

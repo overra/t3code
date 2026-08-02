@@ -56,6 +56,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "provider_access_denied",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -93,6 +94,9 @@ export class EnvironmentRequestInvalidError extends Schema.TaggedErrorClass<Envi
   {
     code: Schema.Literal("invalid_request"),
     reason: EnvironmentRequestInvalidReason,
+    // Human-readable elaboration for reasons that need one (e.g. which
+    // provider-access rule denied a dispatch, and where to change it).
+    detail: Schema.optional(TrimmedNonEmptyString),
     traceId: TrimmedNonEmptyString,
   },
   { httpApiStatus: 400 },

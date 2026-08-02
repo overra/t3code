@@ -42,6 +42,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   triggerAriaLabel?: string;
   onOpenChange?: (open: boolean) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
+  /** See `ModelPickerContent.restrictedProviderNotes`. */
+  restrictedProviderNotes?: ReadonlyArray<{
+    readonly entry: ProviderInstanceEntry;
+    readonly cause: "project-allowlist" | "instance-scope";
+  }>;
+  /** Sidebar gear shortcut to Settings → Providers; the picker closes first. */
+  onOpenProviderSettings?: () => void;
   onInstanceModelChange: (instanceId: ProviderInstanceId, model: string) => void;
 }) {
   const [uncontrolledIsMenuOpen, setUncontrolledIsMenuOpen] = useState(false);
@@ -203,6 +210,17 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
           onRequestClose={() => setIsMenuOpen(false)}
           {...(props.getModelDisabledReason
             ? { getModelDisabledReason: props.getModelDisabledReason }
+            : {})}
+          {...(props.restrictedProviderNotes
+            ? { restrictedProviderNotes: props.restrictedProviderNotes }
+            : {})}
+          {...(props.onOpenProviderSettings
+            ? {
+                onOpenProviderSettings: () => {
+                  setIsMenuOpen(false);
+                  props.onOpenProviderSettings?.();
+                },
+              }
             : {})}
           onInstanceModelChange={handleInstanceModelChange}
         />

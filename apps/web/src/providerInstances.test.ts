@@ -1,8 +1,15 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  filterProviderInstanceEntriesForProject,
+  getProviderInstanceProjectRestrictionForEntry,
   getDefaultProviderInstanceModel,
   isProviderInstancePickerReady,
   isProviderInstancePickerVisible,
@@ -81,6 +88,121 @@ describe("isProviderInstancePickerVisible", () => {
 
     expect(enabledEntry && isProviderInstancePickerVisible(enabledEntry)).toBe(true);
     expect(disabledEntry && isProviderInstancePickerVisible(disabledEntry)).toBe(false);
+  });
+});
+
+describe("filterProviderInstanceEntriesForProject", () => {
+  const WORK_PROJECT = ProjectId.make("project-work");
+  const PERSONAL_PROJECT = ProjectId.make("project-personal");
+  const entries = () =>
+    deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent_work",
+      }),
+    ]);
+  const projectContext = (
+    allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null,
+    id: ProjectId = WORK_PROJECT,
+  ) => ({ id, allowedProviderInstances });
+
+  it("passes entries through untouched without project context or restrictions", () => {
+    expect(filterProviderInstanceEntriesForProject(entries(), null)).toHaveLength(3);
+    expect(filterProviderInstanceEntriesForProject(entries(), undefined)).toHaveLength(3);
+    expect(filterProviderInstanceEntriesForProject(entries(), projectContext(null))).toHaveLength(
+      3,
+    );
+  });
+
+  it("keeps only allowlisted instances, distinguishing instances of one driver", () => {
+    const filtered = filterProviderInstanceEntriesForProject(
+      entries(),
+      projectContext([ProviderInstanceId.make("claudeAgent_work")]),
+    );
+    expect(filtered.map((entry) => entry.instanceId)).toEqual([
+      ProviderInstanceId.make("claudeAgent_work"),
+    ]);
+  });
+
+  it("ignores allowlisted ids with no configured instance", () => {
+    const filtered = filterProviderInstanceEntriesForProject(
+      entries(),
+      projectContext([
+        ProviderInstanceId.make("codex"),
+        ProviderInstanceId.make("deleted_instance"),
+      ]),
+    );
+    expect(filtered.map((entry) => entry.instanceId)).toEqual([ProviderInstanceId.make("codex")]);
+  });
+
+  it("drops instances whose own project scope excludes the project", () => {
+    const scoped = applyProviderInstanceSettings(entries(), {
+      providerInstances: {
+        [ProviderInstanceId.make("claudeAgent_work")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          allowedProjects: [WORK_PROJECT],
+        },
+        [ProviderInstanceId.make("claudeAgent")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+        },
+        [ProviderInstanceId.make("codex")]: {
+          driver: ProviderDriverKind.make("codex"),
+        },
+      },
+      providers: {} as never,
+    });
+
+    const inWorkProject = filterProviderInstanceEntriesForProject(
+      scoped,
+      projectContext(null, WORK_PROJECT),
+    );
+    expect(inWorkProject.map((entry) => entry.instanceId)).toEqual([
+      ProviderInstanceId.make("codex"),
+      ProviderInstanceId.make("claudeAgent"),
+      ProviderInstanceId.make("claudeAgent_work"),
+    ]);
+
+    const inPersonalProject = filterProviderInstanceEntriesForProject(
+      scoped,
+      projectContext(null, PERSONAL_PROJECT),
+    );
+    expect(inPersonalProject.map((entry) => entry.instanceId)).toEqual([
+      ProviderInstanceId.make("codex"),
+      ProviderInstanceId.make("claudeAgent"),
+    ]);
+  });
+
+  it("attributes the blocking rule per entry", () => {
+    const scoped = applyProviderInstanceSettings(entries(), {
+      providerInstances: {
+        [ProviderInstanceId.make("claudeAgent_work")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          allowedProjects: [WORK_PROJECT],
+        },
+        [ProviderInstanceId.make("claudeAgent")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+        },
+        [ProviderInstanceId.make("codex")]: {
+          driver: ProviderDriverKind.make("codex"),
+        },
+      },
+      providers: {} as never,
+    });
+    const context = projectContext(
+      [ProviderInstanceId.make("codex"), ProviderInstanceId.make("claudeAgent_work")],
+      PERSONAL_PROJECT,
+    );
+
+    const byId = new Map(scoped.map((entry) => [String(entry.instanceId), entry]));
+    expect(getProviderInstanceProjectRestrictionForEntry(byId.get("codex")!, context)).toBeNull();
+    expect(getProviderInstanceProjectRestrictionForEntry(byId.get("claudeAgent")!, context)).toBe(
+      "project-allowlist",
+    );
+    expect(
+      getProviderInstanceProjectRestrictionForEntry(byId.get("claudeAgent_work")!, context),
+    ).toBe("instance-scope");
   });
 });
 

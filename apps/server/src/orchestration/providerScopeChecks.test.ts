@@ -1,0 +1,225 @@
+import {
+  CommandId,
+  DEFAULT_PROVIDER_INTERACTION_MODE,
+  DEFAULT_SERVER_SETTINGS,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type OrchestrationCommand,
+} from "@t3tools/contracts";
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+
+import {
+  collectProviderScopeChecks,
+  validateCommandProviderAccess,
+  type ProviderScopeProjectAccess,
+} from "./providerScopeChecks.ts";
+
+const NOW = "2026-01-01T00:00:00.000Z";
+const THREAD_ID = ThreadId.make("thread-1");
+const PROJECT_ID = ProjectId.make("project-1");
+const WORK_INSTANCE = ProviderInstanceId.make("claudeAgent_work");
+const CODEX_INSTANCE = ProviderInstanceId.make("codex");
+
+function turnStartCommand(input: {
+  readonly modelSelection?: { instanceId: ProviderInstanceId; model: string };
+  readonly bootstrapModelSelection?: { instanceId: ProviderInstanceId; model: string };
+}): OrchestrationCommand {
+  return {
+    type: "thread.turn.start",
+    commandId: CommandId.make("cmd-turn-start"),
+    threadId: THREAD_ID,
+    message: {
+      messageId: MessageId.make("message-1"),
+      role: "user",
+      text: "hello",
+      attachments: [],
+    },
+    ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+    ...(input.bootstrapModelSelection !== undefined
+      ? {
+          bootstrap: {
+            createThread: {
+              projectId: PROJECT_ID,
+              title: "Thread",
+              modelSelection: input.bootstrapModelSelection,
+              runtimeMode: "full-access",
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              branch: null,
+              worktreePath: null,
+              createdAt: NOW,
+            },
+          },
+        }
+      : {}),
+    runtimeMode: "full-access",
+    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+    createdAt: NOW,
+  };
+}
+
+describe("collectProviderScopeChecks", () => {
+  it("targets the command's project for thread.create", () => {
+    const checks = collectProviderScopeChecks({
+      type: "thread.create",
+      commandId: CommandId.make("cmd-thread-create"),
+      threadId: THREAD_ID,
+      projectId: PROJECT_ID,
+      title: "Thread",
+      modelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+      runtimeMode: "full-access",
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      branch: null,
+      worktreePath: null,
+      createdAt: NOW,
+    });
+    expect(checks).toEqual([
+      { instanceId: WORK_INSTANCE, target: { kind: "project", projectId: PROJECT_ID } },
+    ]);
+  });
+
+  it("targets the thread for thread.meta.update model switches only", () => {
+    expect(
+      collectProviderScopeChecks({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-meta"),
+        threadId: THREAD_ID,
+        modelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+      }),
+    ).toEqual([{ instanceId: WORK_INSTANCE, target: { kind: "thread", threadId: THREAD_ID } }]);
+
+    expect(
+      collectProviderScopeChecks({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-meta-title"),
+        threadId: THREAD_ID,
+        title: "Renamed",
+      }),
+    ).toEqual([]);
+  });
+
+  it("targets thread-first with the bootstrap project as fallback for bootstrap turns", () => {
+    expect(
+      collectProviderScopeChecks(
+        turnStartCommand({
+          modelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+        }),
+      ),
+    ).toEqual([{ instanceId: WORK_INSTANCE, target: { kind: "thread", threadId: THREAD_ID } }]);
+
+    // The thread wins when it exists — a caller must not be able to spoof a
+    // permissive bootstrap project for a turn on an existing thread.
+    expect(
+      collectProviderScopeChecks(
+        turnStartCommand({
+          modelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+          bootstrapModelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+        }),
+      ),
+    ).toEqual([
+      {
+        instanceId: WORK_INSTANCE,
+        target: {
+          kind: "thread-else-project",
+          threadId: THREAD_ID,
+          fallbackProjectId: PROJECT_ID,
+        },
+      },
+    ]);
+  });
+
+  it("checks a bootstrap selection that differs from the turn selection", () => {
+    const checks = collectProviderScopeChecks(
+      turnStartCommand({
+        modelSelection: { instanceId: CODEX_INSTANCE, model: "gpt-5.4-codex" },
+        bootstrapModelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+      }),
+    );
+    const target = {
+      kind: "thread-else-project",
+      threadId: THREAD_ID,
+      fallbackProjectId: PROJECT_ID,
+    };
+    expect(checks).toEqual([
+      { instanceId: CODEX_INSTANCE, target },
+      { instanceId: WORK_INSTANCE, target },
+    ]);
+  });
+
+  it("collects nothing for commands without provider selections", () => {
+    expect(
+      collectProviderScopeChecks({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-archive"),
+        threadId: THREAD_ID,
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("validateCommandProviderAccess", () => {
+  const RESTRICTED_PROJECT_ID = ProjectId.make("project-restricted");
+  // Access rows resolve regardless of deleted/archived state, mirroring
+  // getProjectAccessById — a soft-deleted restricted project must still deny.
+  const projectAccessById = new Map<ProjectId, ProviderScopeProjectAccess>([
+    [RESTRICTED_PROJECT_ID, { title: "Restricted", allowedProviderInstances: [CODEX_INSTANCE] }],
+    // The bootstrap names PROJECT_ID, which allows everything.
+    [PROJECT_ID, { title: "Permissive", allowedProviderInstances: null }],
+  ]);
+  const makeDeps = (threadProjectId: ProjectId | undefined) => ({
+    getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+    // Mirrors getThreadProjectIdById: resolves the owning project for ANY
+    // stored thread, archived or not.
+    getThreadProjectId: (threadId: ThreadId) =>
+      Effect.succeed(
+        threadProjectId !== undefined && threadId === THREAD_ID
+          ? Option.some(threadProjectId)
+          : Option.none(),
+      ),
+    getProjectAccess: (projectId: ProjectId) => {
+      const project = projectAccessById.get(projectId);
+      return Effect.succeed(project === undefined ? Option.none() : Option.some(project));
+    },
+  });
+  const spoofingTurn = turnStartCommand({
+    modelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+    bootstrapModelSelection: { instanceId: WORK_INSTANCE, model: "claude-opus-4-6" },
+  });
+
+  it.effect(
+    "denies via the EXISTING thread's project even when the bootstrap names a permissive one",
+    () =>
+      Effect.gen(function* () {
+        // The same lookup resolves archived/soft-deleted threads: an
+        // inactive-but-stored thread must be validated against ITS project,
+        // never the bootstrap fallback.
+        const failure = yield* Effect.flip(
+          validateCommandProviderAccess(spoofingTurn, makeDeps(RESTRICTED_PROJECT_ID)),
+        );
+        expect(failure.message).toContain("claudeAgent_work");
+        expect(failure.message).toContain("'Restricted'");
+        expect(failure.retryable).not.toBe(true);
+      }),
+  );
+
+  it.effect("falls back to the bootstrap project when the thread is genuinely new", () =>
+    validateCommandProviderAccess(spoofingTurn, makeDeps(undefined)),
+  );
+
+  it.effect("fails closed with a retryable error when settings cannot be read", () =>
+    Effect.gen(function* () {
+      const failure = yield* Effect.flip(
+        validateCommandProviderAccess(spoofingTurn, {
+          ...makeDeps(RESTRICTED_PROJECT_ID),
+          getSettings: Effect.fail("settings store offline" as const),
+        }),
+      );
+      expect(failure._tag).toBe("OrchestrationDispatchCommandError");
+      expect(failure.message).toContain("could not be verified");
+      expect(failure.retryable).toBe(true);
+    }),
+  );
+});

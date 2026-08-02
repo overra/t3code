@@ -10,6 +10,7 @@
 - [Source control integrations](./user/source-control.md)
 - [Background service (Linux)](./user/background-service.md)
 - Providers: [Codex](./user/providers-codex.md) · [Claude](./user/providers-claude.md)
+- [Per-project provider access](./user/provider-access.md)
 
 Mobile app: [apps/mobile/README.md](../apps/mobile/README.md)
 

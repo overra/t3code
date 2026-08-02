@@ -1,12 +1,20 @@
 import {
   CommandId,
   DEFAULT_MODEL,
+  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  defaultInstanceIdForDriver,
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
   type ModelSelection,
+  type OrchestrationProject,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  type ServerSettings as ServerSettingsShape,
   ThreadId,
 } from "@t3tools/contracts";
+import { isModelSelectionProviderEnabled } from "@t3tools/shared/serverSettings";
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -168,6 +176,70 @@ export const getAutoBootstrapDefaultModelSelection = (): ModelSelection => ({
   model: DEFAULT_MODEL,
 });
 
+/**
+ * Bootstrap default that respects provider access rules AND the enabled
+ * state (envelope `enabled` for configured instances, legacy per-driver
+ * `enabled` otherwise). A brand-new project can never appear in an
+ * instance's explicit `allowedProjects` list, so every scoped instance is
+ * unusable there; for an existing project both its allowlist and each
+ * instance's scope apply. Installed/authenticated state is not knowable at
+ * settings time (probes run after startup) — the reactor gate remains the
+ * backstop for that. Order: the caller's preferred selection, the codex
+ * canonical default, configured envelopes, then enabled legacy drivers
+ * without envelopes; `null` when nothing qualifies (project.create accepts
+ * a null default, and callers skip bootstrap thread creation).
+ */
+export const resolveScopedAutoBootstrapModelSelection = (input: {
+  readonly settings: ServerSettingsShape;
+  /** Undefined = the project is being created by this same bootstrap. */
+  readonly project?: OrchestrationProject | undefined;
+  /** Existing project default to revalidate before falling back. */
+  readonly preferred?: ModelSelection | undefined;
+}): ModelSelection | null => {
+  const usable = (instanceId: ProviderInstanceId): boolean => {
+    if (!isModelSelectionProviderEnabled(input.settings, { instanceId, model: DEFAULT_MODEL })) {
+      return false;
+    }
+    const scope = getProviderInstanceAllowedProjects(input.settings.providerInstances, instanceId);
+    if (input.project === undefined) {
+      return scope === null;
+    }
+    return isProviderInstanceUsableInProject({
+      instanceId,
+      instanceAllowedProjects: scope,
+      projectId: input.project.id,
+      projectAllowedProviderInstances: input.project.allowedProviderInstances ?? null,
+    });
+  };
+  if (input.preferred !== undefined && usable(input.preferred.instanceId)) {
+    return input.preferred;
+  }
+  const candidate = getAutoBootstrapDefaultModelSelection();
+  if (usable(candidate.instanceId)) return candidate;
+  for (const [rawInstanceId, envelope] of Object.entries(input.settings.providerInstances)) {
+    const instanceId = rawInstanceId as ProviderInstanceId;
+    if (usable(instanceId)) {
+      return {
+        instanceId,
+        model: DEFAULT_MODEL_BY_PROVIDER[envelope.driver] ?? DEFAULT_MODEL,
+      };
+    }
+  }
+  // Legacy-configured drivers with no envelope (e.g. claudeAgent enabled
+  // through the pre-instance settings shape).
+  for (const driver of Object.keys(input.settings.providers)) {
+    const instanceId = defaultInstanceIdForDriver(ProviderDriverKind.make(driver));
+    if (input.settings.providerInstances[instanceId] !== undefined) continue;
+    if (usable(instanceId)) {
+      return {
+        instanceId,
+        model: DEFAULT_MODEL_BY_PROVIDER[driver as ProviderDriverKind] ?? DEFAULT_MODEL,
+      };
+    }
+  }
+  return null;
+};
+
 export const resolveWelcomeBase = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const segments = serverConfig.cwd.split(/[/\\]/).filter(Boolean);
@@ -185,6 +257,7 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const projectionReadModelQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+  const serverSettingsService = yield* ServerSettings.ServerSettingsService;
   const path = yield* Path.Path;
 
   let bootstrapProjectId: ProjectId | undefined;
@@ -192,17 +265,18 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
 
   if (serverConfig.autoBootstrapProjectFromCwd) {
     yield* Effect.gen(function* () {
+      const settings = yield* serverSettingsService.getSettings;
       const existingProject = yield* projectionReadModelQuery.getActiveProjectByWorkspaceRoot(
         serverConfig.cwd,
       );
       let nextProjectId: ProjectId;
-      let nextProjectDefaultModelSelection: ModelSelection;
+      let nextProjectDefaultModelSelection: ModelSelection | null;
 
       if (Option.isNone(existingProject)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         nextProjectId = ProjectId.make(yield* randomUUID);
         const bootstrapProjectTitle = path.basename(serverConfig.cwd) || "project";
-        nextProjectDefaultModelSelection = getAutoBootstrapDefaultModelSelection();
+        nextProjectDefaultModelSelection = resolveScopedAutoBootstrapModelSelection({ settings });
         yield* orchestrationEngine.dispatch({
           type: "project.create",
           commandId: CommandId.make(yield* randomUUID),
@@ -214,8 +288,27 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         });
       } else {
         nextProjectId = existingProject.value.id;
-        nextProjectDefaultModelSelection =
-          existingProject.value.defaultModelSelection ?? getAutoBootstrapDefaultModelSelection();
+        // The persisted default is revalidated, not trusted: restrictions
+        // or disables applied since it was written must not resurrect it
+        // for the bootstrap thread.
+        nextProjectDefaultModelSelection = resolveScopedAutoBootstrapModelSelection({
+          settings,
+          project: existingProject.value,
+          preferred: existingProject.value.defaultModelSelection ?? undefined,
+        });
+      }
+
+      // No usable provider for this target (every configured instance is
+      // scoped elsewhere or excluded by the project's allowlist): create
+      // the project without a default and skip the bootstrap thread — the
+      // decider would reject its selection anyway.
+      if (nextProjectDefaultModelSelection === null) {
+        yield* Effect.logWarning(
+          "auto-bootstrap skipped thread creation: no provider instance is usable here",
+          { projectId: nextProjectId },
+        );
+        bootstrapProjectId = nextProjectId;
+        return;
       }
 
       const existingThreadId =

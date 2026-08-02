@@ -1,10 +1,12 @@
-import type {
-  OrchestrationCommand,
-  OrchestrationProject,
-  OrchestrationReadModel,
-  OrchestrationThread,
-  ProjectId,
-  ThreadId,
+import {
+  isProviderInstanceAllowedForProject,
+  type OrchestrationCommand,
+  type OrchestrationProject,
+  type OrchestrationReadModel,
+  type OrchestrationThread,
+  type ProjectId,
+  type ProviderInstanceId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
@@ -56,6 +58,32 @@ export function requireProject(input: {
   );
 }
 
+/**
+ * Like `requireProject`, but rejects soft-deleted projects too. Commands
+ * that start NEW work under a project (thread creation, project metadata
+ * edits) must not target a deleted project: the read model retains deleted
+ * entries, and access rules resolved against live projections would
+ * otherwise be skipped for them entirely.
+ */
+export function requireActiveProject(input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly command: OrchestrationCommand;
+  readonly projectId: ProjectId;
+}): Effect.Effect<OrchestrationProject, OrchestrationCommandInvariantError> {
+  return requireProject(input).pipe(
+    Effect.flatMap((project) =>
+      project.deletedAt === null
+        ? Effect.succeed(project)
+        : Effect.fail(
+            invariantError(
+              input.command.type,
+              `Project '${input.projectId}' is deleted and cannot handle command '${input.command.type}'.`,
+            ),
+          ),
+    ),
+  );
+}
+
 export function requireProjectAbsent(input: {
   readonly readModel: OrchestrationReadModel;
   readonly command: OrchestrationCommand;
@@ -92,6 +120,30 @@ export function requireActiveProjectWorkspaceRootAbsent(input: {
     invariantError(
       input.command.type,
       `Active project '${existingProject.id}' already exists for workspace root '${normalizedWorkspaceRoot}'.`,
+    ),
+  );
+}
+
+/**
+ * Reject a provider instance the project's `allowedProviderInstances` list
+ * does not include. Projects without a list (null/undefined) accept every
+ * instance. Callers pass the already-loaded project so a single command
+ * validates against one consistent read-model view.
+ */
+export function requireProviderInstanceAllowedForProject(input: {
+  readonly command: OrchestrationCommand;
+  readonly project: OrchestrationProject;
+  readonly instanceId: ProviderInstanceId;
+}): Effect.Effect<void, OrchestrationCommandInvariantError> {
+  if (
+    isProviderInstanceAllowedForProject(input.project.allowedProviderInstances, input.instanceId)
+  ) {
+    return Effect.void;
+  }
+  return Effect.fail(
+    invariantError(
+      input.command.type,
+      `Provider instance '${input.instanceId}' is not allowed for project '${input.project.id}'.`,
     ),
   );
 }
@@ -156,6 +208,12 @@ export function requireThreadAbsent(input: {
   readonly command: OrchestrationCommand;
   readonly threadId: ThreadId;
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {
+  // A soft-deleted thread STILL occupies its id: child rows — messages,
+  // activities, plans, checkpoints, turns, approvals, provider sessions —
+  // are keyed by thread id and are not purged by soft deletion, so
+  // recreating the id would resurrect the old thread's history (and its
+  // provider session) into the "new" thread, across projects. Callers that
+  // need to retry a creation must use a fresh id.
   if (!findThreadById(input.readModel, input.threadId)) {
     return Effect.void;
   }

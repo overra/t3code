@@ -210,12 +210,87 @@ export const ProjectScript = Schema.Struct({
 });
 export type ProjectScript = typeof ProjectScript.Type;
 
+/**
+ * Per-project provider allowlist. `null` — and absent, on records persisted
+ * before this field existed — means every configured provider instance may be
+ * used. A non-empty array restricts threads in the project to the listed
+ * instance ids. The empty array is rejected at the schema layer: it would
+ * leave the project unable to start any thread.
+ *
+ * Instance ids that no longer resolve to a configured instance are kept
+ * verbatim (same round-trip rule as `ModelSelection.instanceId`); they simply
+ * allow nothing until an instance with that id exists again.
+ */
+export const ProjectAllowedProviderInstances = Schema.Array(ProviderInstanceId).check(
+  Schema.isMinLength(1),
+);
+export type ProjectAllowedProviderInstances = typeof ProjectAllowedProviderInstances.Type;
+
+export function isProviderInstanceAllowedForProject(
+  allowedProviderInstances: ProjectAllowedProviderInstances | null | undefined,
+  instanceId: ProviderInstanceId,
+): boolean {
+  if (allowedProviderInstances == null) return true;
+  return allowedProviderInstances.includes(instanceId);
+}
+
+export interface ProviderInstanceProjectAccessInput {
+  readonly instanceId: ProviderInstanceId;
+  /** Instance scope from its `ProviderInstanceConfig` envelope; null/absent = every project. */
+  readonly instanceAllowedProjects: ReadonlyArray<ProjectId> | null | undefined;
+  readonly projectId: ProjectId;
+  /** Project allowlist from `OrchestrationProject`; null/absent = every instance. */
+  readonly projectAllowedProviderInstances: ProjectAllowedProviderInstances | null | undefined;
+}
+
+/**
+ * Which rule, if any, blocks a provider instance in a project:
+ *
+ *   - `"project-allowlist"` — the project's `allowedProviderInstances`
+ *     excludes the instance (edited in project settings)
+ *   - `"instance-scope"` — the instance's `allowedProjects` excludes the
+ *     project (edited on the provider card in Settings → Providers)
+ *   - `null` — usable
+ *
+ * The single availability rule combining both restriction directions. Both
+ * sides default to unrestricted when null/absent, so intersecting can only
+ * ever narrow. Every enforcement and filtering surface — decider/reactor/
+ * dispatch on the server, model pickers on web and mobile, both settings
+ * editors — must call this (or {@link isProviderInstanceUsableInProject})
+ * rather than reimplementing the intersection, and error/hint copy should
+ * name the returned cause so users always see which editor to open.
+ */
+export function getProviderInstanceProjectRestriction(
+  input: ProviderInstanceProjectAccessInput,
+): "project-allowlist" | "instance-scope" | null {
+  if (
+    !isProviderInstanceAllowedForProject(input.projectAllowedProviderInstances, input.instanceId)
+  ) {
+    return "project-allowlist";
+  }
+  if (
+    input.instanceAllowedProjects != null &&
+    !input.instanceAllowedProjects.includes(input.projectId)
+  ) {
+    return "instance-scope";
+  }
+  return null;
+}
+
+/** Boolean form of {@link getProviderInstanceProjectRestriction}. */
+export function isProviderInstanceUsableInProject(
+  input: ProviderInstanceProjectAccessInput,
+): boolean {
+  return getProviderInstanceProjectRestriction(input) === null;
+}
+
 export const OrchestrationProject = Schema.Struct({
   id: ProjectId,
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   scripts: Schema.Array(ProjectScript),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -401,6 +476,7 @@ export const OrchestrationProjectShell = Schema.Struct({
   workspaceRoot: TrimmedNonEmptyString,
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   scripts: Schema.Array(ProjectScript),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -531,6 +607,7 @@ export const ProjectCreateCommand = Schema.Struct({
   workspaceRoot: TrimmedNonEmptyString,
   createWorkspaceRootIfMissing: Schema.optional(Schema.Boolean),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   createdAt: IsoDateTime,
 });
 
@@ -541,6 +618,8 @@ const ProjectMetaUpdateCommand = Schema.Struct({
   title: Schema.optional(TrimmedNonEmptyString),
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
+  // `undefined` leaves the allowlist untouched; `null` clears the restriction.
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
 });
 
@@ -943,6 +1022,7 @@ export const ProjectCreatedPayload = Schema.Struct({
   workspaceRoot: TrimmedNonEmptyString,
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   scripts: Schema.Array(ProjectScript),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -954,6 +1034,8 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
+  // `undefined` leaves the allowlist untouched; `null` clears the restriction.
+  allowedProviderInstances: Schema.optional(Schema.NullOr(ProjectAllowedProviderInstances)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
   updatedAt: IsoDateTime,
 });
@@ -1464,6 +1546,13 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedErrorClass<O
   "OrchestrationDispatchCommandError",
   {
     message: TrimmedNonEmptyString,
+    /**
+     * True when the rejection reflects a transient condition (e.g. provider
+     * access could not be VERIFIED because a settings/projection read
+     * failed) rather than a policy decision. Clients with retry queues must
+     * not discard commands rejected with `retryable: true`.
+     */
+    retryable: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

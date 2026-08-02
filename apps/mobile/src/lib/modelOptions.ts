@@ -1,12 +1,27 @@
 import type {
   ModelCapabilities,
   ModelSelection,
+  ProjectId,
+  ProviderInstanceId,
   ServerConfig as T3ServerConfig,
+} from "@t3tools/contracts";
+import {
+  getProviderInstanceAllowedProjects,
+  isProviderInstanceUsableInProject,
 } from "@t3tools/contracts";
 import {
   buildProviderOptionSelectionsFromDescriptors,
   getProviderOptionDescriptors,
 } from "@t3tools/shared/model";
+
+/**
+ * Project context for provider-access filtering: identity plus the project's
+ * own allowlist. `null` = no project context = unfiltered.
+ */
+export type ModelOptionsProjectContext = {
+  readonly id: ProjectId;
+  readonly allowedProviderInstances: ReadonlyArray<ProviderInstanceId> | null;
+};
 
 export type ModelOption = {
   readonly key: string;
@@ -86,11 +101,31 @@ export function resolveSelectableModelSelection(
 export function buildModelOptions(
   config: T3ServerConfig | null | undefined,
   fallbackModelSelection: ModelSelection | null,
+  // Filters by the project's provider access rules (project allowlist ∩
+  // per-instance project scope) via the shared contracts predicate. The
+  // fallback selection is filtered by the same rule: a stale draft or a
+  // thread's since-restricted selection must not resurface as a selectable
+  // option the server would reject.
+  project?: ModelOptionsProjectContext | null,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
+  const usableInProject = (instanceId: ModelSelection["instanceId"]): boolean =>
+    project == null ||
+    isProviderInstanceUsableInProject({
+      instanceId,
+      instanceAllowedProjects: getProviderInstanceAllowedProjects(
+        config?.settings.providerInstances,
+        instanceId,
+      ),
+      projectId: project.id,
+      projectAllowedProviderInstances: project.allowedProviderInstances,
+    });
 
   for (const provider of config?.providers ?? []) {
     if (!provider.enabled || !provider.installed || provider.auth.status === "unauthenticated") {
+      continue;
+    }
+    if (!usableInProject(provider.instanceId)) {
       continue;
     }
 
@@ -117,7 +152,7 @@ export function buildModelOptions(
     }
   }
 
-  if (fallbackModelSelection) {
+  if (fallbackModelSelection && usableInProject(fallbackModelSelection.instanceId)) {
     const key = `${fallbackModelSelection.instanceId}:${fallbackModelSelection.model}`;
     const existing = options.get(key);
     if (existing) {

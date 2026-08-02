@@ -5,6 +5,7 @@ import type {
   ProviderInstanceConfig,
   ProviderInstanceId,
   ServerSettings,
+  ServerSettingsPatch,
   SidebarProjectGroupingMode,
   UnifiedSettings,
 } from "@t3tools/contracts";
@@ -156,37 +157,91 @@ export function formatDiagnosticsDescription(input: {
   return `${mode}.`;
 }
 
-export function buildProviderInstanceUpdatePatch(input: {
-  readonly settings: Pick<ServerSettings, "providers" | "providerInstances">;
-  readonly instanceId: ProviderInstanceId;
-  readonly instance: ProviderInstanceConfig;
-  readonly driver: ProviderDriverKind;
-  readonly isDefault: boolean;
-  readonly textGenerationModelSelection?:
-    | ServerSettings["textGenerationModelSelection"]
-    | undefined;
-}): Partial<UnifiedSettings> {
+/**
+ * Access scope is SECURITY POLICY with its own write channel: an instance
+ * value that does not explicitly carry `allowedProjects` leaves the stored
+ * scope untouched server-side. Every NON-scope edit therefore omits the key
+ * unconditionally — deciding by comparison against the streamed row would
+ * race its echo lag (a rapid A→B→A sequence's final write looks "unchanged"
+ * against the stale row and gets dropped). Scope-originated writes bypass
+ * this entirely and always carry the key, explicit `null` included.
+ */
+export function omitInstanceScope(next: ProviderInstanceConfig): ProviderInstanceConfig {
+  if (!("allowedProjects" in next)) return next;
+  const { allowedProjects: _scope, ...rest } = next;
+  return rest;
+}
+
+/**
+ * Builds a settings patch for one provider-instance edit.
+ *
+ * Granular mode (servers advertising `providerProjectScopes`): the instance
+ * goes through `providerInstancesPatch`, which the server merges onto its
+ * own current map under its write lock — no client-side whole-map
+ * composition, so concurrent edits (this panel's or another device's) to
+ * OTHER instances can never be reverted by this write.
+ *
+ * Legacy mode (older servers, which strip the unknown patch key and would
+ * otherwise acknowledge a NO-OP): the pre-scopes whole-map shape, composed
+ * from the caller's settings. Its known whole-map races are accepted on old
+ * servers, which have no scopes to protect.
+ */
+export function buildProviderInstanceUpdatePatch(
+  input: {
+    readonly instanceId: ProviderInstanceId;
+    readonly instance: ProviderInstanceConfig;
+    readonly driver: ProviderDriverKind;
+    readonly isDefault: boolean;
+    readonly textGenerationModelSelection?:
+      | ServerSettings["textGenerationModelSelection"]
+      | undefined;
+  },
+  mode:
+    | { readonly granular: true }
+    | {
+        readonly granular: false;
+        readonly settings: Pick<ServerSettings, "providers" | "providerInstances">;
+      },
+): ServerSettingsPatch {
   type LegacyProviderSettings = ServerSettings["providers"][keyof ServerSettings["providers"]];
   const legacyProviderDefaults = DEFAULT_UNIFIED_SETTINGS.providers as Record<
     string,
     LegacyProviderSettings | undefined
   >;
   const legacyProviderDefault = input.isDefault ? legacyProviderDefaults[input.driver] : undefined;
+  const base = {
+    ...(input.textGenerationModelSelection !== undefined
+      ? { textGenerationModelSelection: input.textGenerationModelSelection }
+      : {}),
+  };
+  if (mode.granular) {
+    return {
+      ...base,
+      ...(legacyProviderDefault !== undefined
+        ? {
+            providers: {
+              [input.driver]: legacyProviderDefault,
+            } as NonNullable<ServerSettingsPatch["providers"]>,
+          }
+        : {}),
+      providerInstancesPatch: {
+        [input.instanceId]: input.instance,
+      },
+    };
+  }
   return {
+    ...base,
     ...(legacyProviderDefault !== undefined
       ? {
           providers: {
-            ...input.settings.providers,
+            ...mode.settings.providers,
             [input.driver]: legacyProviderDefault,
           } as ServerSettings["providers"],
         }
       : {}),
     providerInstances: {
-      ...input.settings.providerInstances,
+      ...mode.settings.providerInstances,
       [input.instanceId]: input.instance,
     },
-    ...(input.textGenerationModelSelection !== undefined
-      ? { textGenerationModelSelection: input.textGenerationModelSelection }
-      : {}),
   };
 }

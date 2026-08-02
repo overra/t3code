@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Layer from "effect/Layer";
 import { DEFAULT_MODEL, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
@@ -15,6 +16,7 @@ import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngi
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+import { layerTest as serverSettingsLayerTest } from "./serverSettings.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -95,6 +97,8 @@ it.effect("launchStartupHeartbeat does not block the caller while counts are loa
           getThreadCheckpointContext: () => Effect.succeed(Option.none()),
           getFullThreadDiffContext: () => Effect.succeed(Option.none()),
           getThreadShellById: () => Effect.succeed(Option.none()),
+          getThreadProjectIdById: () => Effect.succeed(Option.none()),
+          getProjectAccessById: () => Effect.succeed(Option.none()),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           searchThreads: () => Effect.succeed({ matches: [] }),
@@ -159,6 +163,8 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
         getThreadShellById: () => Effect.die("unused"),
+        getThreadProjectIdById: () => Effect.die("unused"),
+        getProjectAccessById: () => Effect.die("unused"),
         getThreadDetailById: () => Effect.die("unused"),
         getThreadDetailSnapshot: () => Effect.die("unused"),
         searchThreads: () => Effect.succeed({ matches: [] }),
@@ -172,7 +178,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-      Effect.provide(NodeServices.layer),
+      Effect.provide(Layer.mergeAll(NodeServices.layer, serverSettingsLayerTest())),
     );
 
     assert.deepStrictEqual(targets, {
@@ -204,6 +210,8 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
         getThreadShellById: () => Effect.die("unused"),
+        getThreadProjectIdById: () => Effect.die("unused"),
+        getProjectAccessById: () => Effect.die("unused"),
         getThreadDetailById: () => Effect.die("unused"),
         getThreadDetailSnapshot: () => Effect.die("unused"),
         searchThreads: () => Effect.succeed({ matches: [] }),
@@ -217,7 +225,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-      Effect.provide(NodeServices.layer),
+      Effect.provide(Layer.mergeAll(NodeServices.layer, serverSettingsLayerTest())),
     );
 
     assert.equal(typeof targets.bootstrapProjectId, "string");
@@ -255,6 +263,8 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
         getThreadCheckpointContext: () => Effect.succeed(Option.none()),
         getFullThreadDiffContext: () => Effect.succeed(Option.none()),
         getThreadShellById: () => Effect.die("unused"),
+        getThreadProjectIdById: () => Effect.die("unused"),
+        getProjectAccessById: () => Effect.die("unused"),
         getThreadDetailById: () => Effect.die("unused"),
         getThreadDetailSnapshot: () => Effect.die("unused"),
         searchThreads: () => Effect.succeed({ matches: [] }),
@@ -277,5 +287,5 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
 
     assert.strictEqual(error, uuidError);
     assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
-  }).pipe(Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, serverSettingsLayerTest()))),
 );
